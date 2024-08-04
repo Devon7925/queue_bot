@@ -1,0 +1,18 @@
+{
+    "configuration": {
+      "team_size": 1,
+      "team_count": 1,
+      "category": "1269161295022919773",
+      "queue_channels": [
+        "1269326057224536115"
+      ],
+      "post_match_channel": "1269122202587103262",
+      "maps": [
+        "Numbani",
+        "Paraiso",
+        "King's Row"
+      ],
+      "map_vote_count": 2
+    },
+    "queue_idx": 5
+  }
