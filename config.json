@@ -12,7 +12,21 @@
         "Paraiso",
         "King's Row"
       ],
-      "map_vote_count": 2
+      "map_vote_count": 2,
+      "default_player_data": {
+        "rating": {
+          "rating": 25.0,
+          "uncertainty": 8.333333333333334
+        },
+        "queue_enter_time": null,
+        "player_queueing_config": {
+          "cost_per_second": 1.0,
+          "cost_per_avg_mmr_differential": 0.04,
+          "acceptable_mmr_differential": 50.0,
+          "cost_per_mmr_range": 0.02,
+          "acceptable_mmr_range": 300.0
+        }
+      }
     },
-    "queue_idx": 5
+    "queue_idx": 0
   }

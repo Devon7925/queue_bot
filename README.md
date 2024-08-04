@@ -8,8 +8,10 @@ This is code for a simple discord bot to matchmake players into games. You can c
 * Maps
 * Number of maps for a map vote
 
-## Future plans
+Other features:
 * Skill tracking
+
+## Future plans
 * Skill based matchmaking
 * Prefered roles
 * Avoided players

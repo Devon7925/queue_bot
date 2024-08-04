@@ -190,8 +190,10 @@ checksum = "a21f936df1771bf62b77f047b726c4625ff2e8aa607c01ec06e5a05bd8463401"
 dependencies = [
  "android-tzdata",
  "iana-time-zone",
+ "js-sys",
  "num-traits",
  "serde",
+ "wasm-bindgen",
  "windows-targets 0.52.6",
 ]
 
@@ -948,11 +950,13 @@ dependencies = [
 name = "queue_bot"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "itertools",
  "poise",
  "rand",
  "serde",
  "serde_json",
+ "skillratings",
  "tokio",
 ]
 
@@ -1333,6 +1337,15 @@ dependencies = [
  "pulldown-cmark",
  "tempfile",
  "walkdir",
+]
+
+[[package]]
+name = "skillratings"
+version = "0.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c6fdddfb9a6fbecfe43d3d26837f364258f089e7e2ba8b90098b0a42d566feb9"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
