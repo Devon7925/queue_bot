@@ -34,6 +34,7 @@ struct QueueConfiguration {
     maps: Vec<String>,
     map_vote_count: u32,
     default_player_data: PlayerData,
+    skill_based_matchmaking: bool, // Indicates if skill-based matchmaking is enabled
 }
 
 impl Default for QueueConfiguration {
@@ -46,17 +47,8 @@ impl Default for QueueConfiguration {
             post_match_channel: None,
             maps: vec![],
             map_vote_count: 0,
-            default_player_data: PlayerData {
-                rating: WengLinRating::default(),
-                queue_enter_time: None,
-                player_queueing_config: PlayerQueueingConfig {
-                    cost_per_second: 1.0,
-                    cost_per_avg_mmr_differential: 0.04,
-                    acceptable_mmr_differential: 50.0,
-                    cost_per_mmr_range: 0.02,
-                    acceptable_mmr_range: 300.0,
-                },
-            },
+            default_player_data: PlayerData::default(), // Use default for PlayerData
+            skill_based_matchmaking: true, // Default value for skill-based matchmaking
         }
     }
 }
@@ -116,6 +108,22 @@ struct PlayerData {
     player_queueing_config: PlayerQueueingConfig,
 }
 
+impl Default for PlayerData {
+    fn default() -> Self {
+        Self {
+            rating: WengLinRating::default(), // Default skill rating and uncertainty
+            queue_enter_time: None,
+            player_queueing_config: PlayerQueueingConfig {
+                cost_per_second: 1.0,
+                cost_per_avg_mmr_differential: 0.04,
+                acceptable_mmr_differential: 50.0,
+                cost_per_mmr_range: 0.02,
+                acceptable_mmr_range: 300.0,
+            },
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct Data {
     configuration: Mutex<QueueConfiguration>,
@@ -157,7 +165,7 @@ async fn handler(
                             let mut player_data = data.player_data.lock().unwrap();
                             player_data
                                 .entry(new.user_id)
-                                .or_insert(config.default_player_data.clone()).queue_enter_time = None;
+                                .or_insert_with(PlayerData::default).queue_enter_time = None;
                         }
                         {
                             let mut queued_players = data.queued_players.lock().unwrap();
@@ -365,13 +373,14 @@ async fn try_matchmaking(
     ctx: &serenity::Context,
     guild_id: GuildId,
 ) -> Result<(), Error> {
-    let (team_count, team_size) = {
+    // Extract team size, team count, and skill-based matchmaking flag from the configuration
+    let (team_count, team_size, skill_based) = {
         let configuration = data.configuration.lock().unwrap();
         let queued_players = data.queued_players.lock().unwrap();
         if (queued_players.len() as u32) < configuration.team_count * configuration.team_size {
             return Ok(());
         }
-        (configuration.team_count, configuration.team_size)
+        (configuration.team_count, configuration.team_size, configuration.skill_based_matchmaking)
     };
     let cache_http = ctx.http.clone();
     let config = {
@@ -382,6 +391,23 @@ async fn try_matchmaking(
         return Err(Error::from("No category"));
     };
     let queued_players = data.queued_players.lock().unwrap().clone();
+    let mut members = queued_players.iter().cloned().collect_vec();
+
+    if skill_based {
+        // Sort players by rating in descending order if skill-based matchmaking is enabled
+        let player_data = data.player_data.lock().unwrap();
+        members.sort_by_key(|id| {
+            let player = player_data.get(id).unwrap_or(&config.default_player_data);
+            player.rating.rating as i32
+        });
+    }
+
+    // Split players into balanced teams using round-robin method
+    let mut teams: Vec<Vec<UserId>> = vec![vec![]; team_count as usize];
+    for (i, player) in members.into_iter().enumerate() {
+        teams[i % team_count as usize].push(player);
+    }
+
     let members = queued_players
         .iter()
         .chunks(team_size as usize)
@@ -503,6 +529,53 @@ async fn try_matchmaking(
             }
         }
     }
+    Ok(())
+}
+
+/// Command to set a players rating (for test)
+#[poise::command(slash_command, prefix_command)]
+async fn set_rating(
+    ctx: Context<'_>,
+    #[description = "User to set rating for"] user: serenity::UserId,
+    #[description = "New rating value"] rating: f64,
+) -> Result<(), Error> {
+    {
+        // Lock player data and set the new rating
+        let mut player_data = ctx.data().player_data.lock().unwrap();
+        let config = ctx.data().configuration.lock().unwrap();
+        let player = player_data
+            .entry(user)
+            .or_insert(config.default_player_data.clone());
+        player.rating.rating = rating;
+    }
+    // Send confirmation message
+    let response = format!("Set rating of {} to {}", user.mention(), rating);
+    ctx.send(CreateReply::default().content(response).ephemeral(true))
+        .await?;
+    Ok(())
+}
+
+/// Command to get a player's rating
+#[poise::command(slash_command, prefix_command)]
+async fn get_rating(
+    ctx: Context<'_>,
+    #[description = "User to get rating for"] user: Option<serenity::UserId>,
+) -> Result<(), Error> {
+    let user = user.unwrap_or(ctx.author().id);
+    let rating = {
+        // Lock player data and retrieve the rating
+        let player_data = ctx.data().player_data.lock().unwrap();
+        let config = ctx.data().configuration.lock().unwrap();
+        player_data
+            .get(&user)
+            .unwrap_or(&config.default_player_data)
+            .rating
+            .rating
+    };
+    // Send message with the rating
+    let response = format!("{}'s rating is {}", user.mention(), rating);
+    ctx.send(CreateReply::default().content(response).ephemeral(true))
+        .await?;
     Ok(())
 }
 
@@ -818,7 +891,7 @@ async fn main() {
             event_handler: |ctx, event, framework, data| {
                 Box::pin(handler(ctx, event, framework, data))
             },
-            commands: vec![register(), configure(), export_config(), list_queued(), stats()],
+            commands: vec![register(), configure(), export_config(), list_queued(), stats(), set_rating(), get_rating()],
             ..Default::default()
         })
         .setup(|_ctx, _ready, _framework| {
