@@ -6,7 +6,7 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use itertools::Itertools;
+use itertools::{Itertools, MinMaxResult};
 use poise::{
     serenity_prelude::{
         self as serenity, Builder, ChannelId, ChannelType, CreateButton, CreateChannel,
@@ -16,7 +16,10 @@ use poise::{
 };
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use skillratings::{weng_lin::{WengLin, WengLinConfig, WengLinRating}, MultiTeamOutcome, MultiTeamRatingSystem, Rating, RatingPeriodSystem};
+use skillratings::{
+    weng_lin::{WengLin, WengLinConfig, WengLinRating},
+    MultiTeamOutcome, MultiTeamRatingSystem,
+};
 
 enum VoteType {
     None,
@@ -34,6 +37,7 @@ struct QueueConfiguration {
     maps: Vec<String>,
     map_vote_count: u32,
     default_player_data: PlayerData,
+    maximum_queue_cost: f32,
 }
 
 impl Default for QueueConfiguration {
@@ -46,17 +50,8 @@ impl Default for QueueConfiguration {
             post_match_channel: None,
             maps: vec![],
             map_vote_count: 0,
-            default_player_data: PlayerData {
-                rating: WengLinRating::default(),
-                queue_enter_time: None,
-                player_queueing_config: PlayerQueueingConfig {
-                    cost_per_second: 1.0,
-                    cost_per_avg_mmr_differential: 0.04,
-                    acceptable_mmr_differential: 50.0,
-                    cost_per_mmr_range: 0.02,
-                    acceptable_mmr_range: 300.0,
-                },
-            },
+            default_player_data: PlayerData::default(),
+            maximum_queue_cost: 50.0,
         }
     }
 }
@@ -102,7 +97,6 @@ impl Default for MatchData {
 
 #[derive(Serialize, Deserialize, Clone)]
 struct PlayerQueueingConfig {
-    cost_per_second: f32,
     cost_per_avg_mmr_differential: f32,
     acceptable_mmr_differential: f32,
     cost_per_mmr_range: f32,
@@ -114,6 +108,21 @@ struct PlayerData {
     rating: WengLinRating,
     queue_enter_time: Option<DateTime<Utc>>,
     player_queueing_config: PlayerQueueingConfig,
+}
+
+impl Default for PlayerData {
+    fn default() -> Self {
+        Self {
+            rating: WengLinRating::default(),
+            queue_enter_time: None,
+            player_queueing_config: PlayerQueueingConfig {
+                cost_per_avg_mmr_differential: 0.04,
+                acceptable_mmr_differential: 50.0,
+                cost_per_mmr_range: 0.02,
+                acceptable_mmr_range: 300.0,
+            },
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -157,7 +166,8 @@ async fn handler(
                             let mut player_data = data.player_data.lock().unwrap();
                             player_data
                                 .entry(new.user_id)
-                                .or_insert(config.default_player_data.clone()).queue_enter_time = None;
+                                .or_insert(config.default_player_data.clone())
+                                .queue_enter_time = None;
                         }
                         {
                             let mut queued_players = data.queued_players.lock().unwrap();
@@ -295,7 +305,7 @@ async fn handler(
                         };
 
                         apply_match_results(data, vote_result, &players);
-                        
+
                         let guild_id = message_component.guild_id.unwrap();
                         if let Some(post_match_channel) = post_match_channel {
                             for player in players.iter().flat_map(|t| t) {
@@ -332,30 +342,46 @@ async fn handler(
     Ok(())
 }
 
-fn apply_match_results(
-    data: &Data,
-    result: MatchResult,
-    players: &Vec<Vec<UserId>>,
-) {
+fn apply_match_results(data: &Data, result: MatchResult, players: &Vec<Vec<UserId>>) {
     let rating_config: WengLinConfig = WengLinConfig::default();
     if matches!(result, MatchResult::Cancel) {
         return;
     }
     let system = <WengLin as MultiTeamRatingSystem>::new(rating_config);
     let mut player_data = data.player_data.lock().unwrap();
-    let outcome = players.iter().enumerate().map(|(team_idx, team)| {
-        (team.iter().map(|id| player_data.get(id).unwrap().rating).collect_vec(), 
-        MultiTeamOutcome::new(match result {
-            MatchResult::Team(idx) if idx == team_idx as u32 => 1,
-            MatchResult::Team(_) => 2,
-            MatchResult::Tie => 1,
-            MatchResult::Cancel => panic!("Invalid state")
-        }))
-    }).collect_vec();
-    let result = MultiTeamRatingSystem::rate(&system, outcome.iter().map(|(t, o)| (t.as_slice(), o.clone())).collect_vec().as_slice());
+    let outcome = players
+        .iter()
+        .enumerate()
+        .map(|(team_idx, team)| {
+            (
+                team.iter()
+                    .map(|id| player_data.get(id).unwrap().rating)
+                    .collect_vec(),
+                MultiTeamOutcome::new(match result {
+                    MatchResult::Team(idx) if idx == team_idx as u32 => 1,
+                    MatchResult::Team(_) => 2,
+                    MatchResult::Tie => 1,
+                    MatchResult::Cancel => panic!("Invalid state"),
+                }),
+            )
+        })
+        .collect_vec();
+    let result = MultiTeamRatingSystem::rate(
+        &system,
+        outcome
+            .iter()
+            .map(|(t, o)| (t.as_slice(), o.clone()))
+            .collect_vec()
+            .as_slice(),
+    );
     for (team_idx, team) in players.iter().enumerate() {
         for (player_idx, player) in team.iter().enumerate() {
-            player_data.get_mut(player).unwrap().rating = result.get(team_idx).unwrap().get(player_idx).unwrap().clone();
+            player_data.get_mut(player).unwrap().rating = result
+                .get(team_idx)
+                .unwrap()
+                .get(player_idx)
+                .unwrap()
+                .clone();
         }
     }
 }
@@ -365,13 +391,13 @@ async fn try_matchmaking(
     ctx: &serenity::Context,
     guild_id: GuildId,
 ) -> Result<(), Error> {
-    let (team_count, team_size) = {
+    let team_count = {
         let configuration = data.configuration.lock().unwrap();
         let queued_players = data.queued_players.lock().unwrap();
         if (queued_players.len() as u32) < configuration.team_count * configuration.team_size {
             return Ok(());
         }
-        (configuration.team_count, configuration.team_size)
+        configuration.team_count
     };
     let cache_http = ctx.http.clone();
     let config = {
@@ -382,12 +408,10 @@ async fn try_matchmaking(
         return Err(Error::from("No category"));
     };
     let queued_players = data.queued_players.lock().unwrap().clone();
-    let members = queued_players
-        .iter()
-        .chunks(team_size as usize)
-        .into_iter()
-        .map(|c| c.cloned().collect_vec())
-        .collect_vec();
+    let members = greedy_matchmaking(data, queued_players.iter().cloned().collect_vec());
+    if evaluate_cost(data, &members) < config.maximum_queue_cost {
+        return Ok(());
+    }
     let new_idx = {
         let mut queue_idx = data.queue_idx.lock().unwrap();
         *queue_idx += 1;
@@ -449,7 +473,7 @@ async fn try_matchmaking(
     for i in 0..team_count {
         result_message = result_message.button(
             CreateButton::new(format!("team_{}", i + 1))
-                .label(format!("Team {}", i+1))
+                .label(format!("Team {}", i + 1))
                 .style(serenity::ButtonStyle::Primary),
         )
     }
@@ -499,11 +523,105 @@ async fn try_matchmaking(
                     )
                     .await?;
                 data.queued_players.lock().unwrap().remove(player);
-                data.player_data.lock().unwrap().get_mut(player).unwrap().queue_enter_time = None;
+                data.player_data
+                    .lock()
+                    .unwrap()
+                    .get_mut(player)
+                    .unwrap()
+                    .queue_enter_time = None;
             }
         }
     }
     Ok(())
+}
+
+fn evaluate_cost(data: &Data, players: &Vec<Vec<UserId>>) -> f32 {
+    let player_game_data = {
+        let player_data = data.player_data.lock().unwrap();
+        players
+            .iter()
+            .map(|team| {
+                team.iter()
+                    .map(|player| player_data.get(player).unwrap().clone())
+                    .collect_vec()
+            })
+            .collect_vec()
+    };
+    let config = data.configuration.lock().unwrap();
+    let team_mmrs = player_game_data.iter().map(|team| {
+        team.iter()
+            .map(|player| player.rating.rating as f32)
+            .sum::<f32>()
+            / config.team_size as f32
+    });
+    let mmr_differential = match team_mmrs.minmax() {
+        MinMaxResult::NoElements => 0.0,
+        MinMaxResult::OneElement(_) => 0.0,
+        MinMaxResult::MinMax(min, max) => max - min,
+    };
+    let mmr_range = player_game_data
+        .iter()
+        .flat_map(|team| team.iter().map(|player| player.rating.rating as f32))
+        .minmax();
+    let mmr_range = match mmr_range {
+        MinMaxResult::NoElements => 0.0,
+        MinMaxResult::OneElement(_) => 0.0,
+        MinMaxResult::MinMax(min, max) => max - min,
+    };
+    let now = chrono::offset::Utc::now();
+    player_game_data
+        .iter()
+        .flat_map(|team| team.iter())
+        .map(|player| {
+            let time_in_queue = (now - player.queue_enter_time.unwrap()).num_seconds();
+            let mut player_cost = 0.0;
+            player_cost += (mmr_differential
+                - player.player_queueing_config.acceptable_mmr_differential)
+                .max(0.0)
+                * player.player_queueing_config.cost_per_avg_mmr_differential;
+            player_cost += (mmr_range - player.player_queueing_config.acceptable_mmr_range)
+                .max(0.0)
+                * player.player_queueing_config.cost_per_mmr_range;
+            player_cost -= time_in_queue as f32;
+            player_cost
+        })
+        .sum()
+}
+
+fn greedy_matchmaking(data: &Data, pool: Vec<UserId>) -> Vec<Vec<UserId>> {
+    let team_size = data.configuration.lock().unwrap().team_size;
+    let team_count = data.configuration.lock().unwrap().team_count;
+    let total_players = team_size * team_count;
+    let mut players = pool.clone();
+    let mut result = vec![vec![]; team_count as usize];
+
+    for _ in 0..total_players {
+        let mut min_cost = f32::MAX;
+        let mut best_player = usize::MAX;
+        let mut best_team = usize::MAX;
+        for possible_addition in 0..players.len() {
+            for team_idx in 0..team_count as usize {
+                if result[team_idx].len() >= team_size as usize {
+                    continue;
+                }
+                let mut result_copy = result.clone();
+                result_copy[team_idx].push(players[possible_addition].clone());
+
+                let cost = evaluate_cost(data, &result_copy);
+                if cost < min_cost {
+                    min_cost = cost;
+                    best_player = possible_addition;
+                    best_team = team_idx;
+                }
+            }
+        }
+
+        if best_player != usize::MAX && best_team != usize::MAX {
+            result[best_team].push(players.remove(best_player));
+        }
+    }
+
+    result
 }
 
 /// Displays or sets team size
@@ -702,6 +820,35 @@ async fn configure_map_vote_count(
     }
 }
 
+/// Displays or sets number of maps for the vote
+#[poise::command(slash_command, prefix_command, rename = "maximum_queue_cost")]
+async fn configure_maximum_queue_cost(
+    ctx: Context<'_>,
+    #[description = "New value"] new_value: Option<f32>,
+) -> Result<(), Error> {
+    if let Some(new_value) = new_value {
+        {
+            let mut data_lock = ctx.data().configuration.lock().unwrap();
+            data_lock.maximum_queue_cost = new_value;
+        }
+        let response = format!("Max queue cost set to {}", new_value);
+        ctx.send(CreateReply::default().content(response).ephemeral(true))
+            .await?;
+        Ok(())
+    } else {
+        let response = {
+            let data_lock = ctx.data().configuration.lock().unwrap();
+            format!(
+                "Max queue cost is currently {}",
+                data_lock.maximum_queue_cost
+            )
+        };
+        ctx.send(CreateReply::default().content(response).ephemeral(true))
+            .await?;
+        Ok(())
+    }
+}
+
 /// Sets the channel to move members to after the end of the game
 #[poise::command(slash_command, prefix_command, rename = "post_match_channel")]
 async fn configure_post_match_channel(
@@ -747,6 +894,21 @@ async fn export_config(ctx: Context<'_>) -> Result<(), Error> {
     Ok(())
 }
 
+/// Imports configuration
+#[poise::command(slash_command, prefix_command)]
+async fn import_config(
+    ctx: Context<'_>,
+    #[description = "New config"] new_config: String,
+) -> Result<(), Error> {
+    let new_config: QueueConfiguration = serde_json::from_str(&new_config.as_str())?;
+    *ctx.data().configuration.lock().unwrap() = new_config;
+    let config = serde_json::to_string_pretty(ctx.data())?;
+    let response = format!("Configuration set to: ```json\n{}\n```", config);
+    ctx.send(CreateReply::default().content(response).ephemeral(true))
+        .await?;
+    Ok(())
+}
+
 /// Displays or sets queue category
 #[poise::command(slash_command, prefix_command)]
 async fn list_queued(ctx: Context<'_>) -> Result<(), Error> {
@@ -774,7 +936,8 @@ async fn list_queued(ctx: Context<'_>) -> Result<(), Error> {
         "configure_team_count",
         "configure_post_match_channel",
         "configure_maps",
-        "configure_map_vote_count"
+        "configure_map_vote_count",
+        "configure_maximum_queue_cost"
     )
 )]
 async fn configure(_: Context<'_>) -> Result<(), Error> {
@@ -796,7 +959,12 @@ async fn stats(
             .or_insert(config.default_player_data.clone())
             .rating
     };
-    let response = format!("{}'s mmr is {}, with uncertainty {}", user.mention(), rating.rating, rating.uncertainty);
+    let response = format!(
+        "{}'s mmr is {}, with uncertainty {}",
+        user.mention(),
+        rating.rating,
+        rating.uncertainty
+    );
     ctx.send(CreateReply::default().content(response).ephemeral(true))
         .await?;
     Ok(())
@@ -818,7 +986,14 @@ async fn main() {
             event_handler: |ctx, event, framework, data| {
                 Box::pin(handler(ctx, event, framework, data))
             },
-            commands: vec![register(), configure(), export_config(), list_queued(), stats()],
+            commands: vec![
+                register(),
+                configure(),
+                export_config(),
+                import_config(),
+                list_queued(),
+                stats(),
+            ],
             ..Default::default()
         })
         .setup(|_ctx, _ready, _framework| {

@@ -7,14 +7,15 @@ This is code for a simple discord bot to matchmake players into games. You can c
 * Voice channel to move players to after game conclusion
 * Maps
 * Number of maps for a map vote
+* Parameters for skill based matchmaking
 
 Other features:
 * Skill tracking
+* Skill based matchmaking
 
 ## Future plans
-* Skill based matchmaking
 * Prefered roles
 * Avoided players
 * Region/platform
 * Ability to mark player as leaver/noshow
-
+* Groups
