@@ -12,7 +12,7 @@ use itertools::{Itertools, MinMaxResult};
 use poise::{
     serenity_prelude::{
         self as serenity,
-        futures::{future, StreamExt},
+        futures::future,
         Builder, ChannelId, ChannelType, CreateAllowedMentions, CreateButton, CreateChannel,
         CreateMessage, EditMember, EditMessage, GuildId, Http, Mentionable, RoleId, UserId,
     },
@@ -111,6 +111,27 @@ struct PlayerQueueingConfig {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
+struct DerivedPlayerQueueingConfig {
+    cost_per_avg_mmr_differential: Option<f32>,
+    acceptable_mmr_differential: Option<f32>,
+    cost_per_mmr_range: Option<f32>,
+    acceptable_mmr_range: Option<f32>,
+    wrong_game_category_cost: Option<HashMap<String, f32>>,
+}
+
+impl DerivedPlayerQueueingConfig {
+    fn derive(&self, base: &PlayerQueueingConfig) -> PlayerQueueingConfig {
+        PlayerQueueingConfig {
+            cost_per_avg_mmr_differential: self.cost_per_avg_mmr_differential.unwrap_or(base.cost_per_avg_mmr_differential),
+            acceptable_mmr_differential: self.acceptable_mmr_differential.unwrap_or(base.acceptable_mmr_differential),
+            cost_per_mmr_range: self.cost_per_mmr_range.unwrap_or(base.cost_per_mmr_range),
+            acceptable_mmr_range: self.acceptable_mmr_range.unwrap_or(base.acceptable_mmr_range),
+            wrong_game_category_cost: self.wrong_game_category_cost.clone().unwrap_or(base.wrong_game_category_cost.clone()),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
 struct PlayerData {
     rating: WengLinRating,
     queue_enter_time: Option<DateTime<Utc>>,
@@ -133,6 +154,29 @@ impl Default for PlayerData {
     }
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+struct DerivedPlayerData {
+    rating: Option<WengLinRating>,
+    queue_enter_time: Option<DateTime<Utc>>,
+    player_queueing_config: DerivedPlayerQueueingConfig,
+}
+
+impl Default for DerivedPlayerData {
+    fn default() -> Self {
+        Self {
+            rating: None,
+            queue_enter_time: None,
+            player_queueing_config: DerivedPlayerQueueingConfig {
+                cost_per_avg_mmr_differential: None,
+                acceptable_mmr_differential: None,
+                cost_per_mmr_range: None,
+                acceptable_mmr_range: None,
+                wrong_game_category_cost: None,
+            },
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct Data {
     configuration: Mutex<QueueConfiguration>,
@@ -141,7 +185,7 @@ struct Data {
     #[serde(default)]
     in_game_players: Mutex<HashSet<UserId>>,
     #[serde(default)]
-    player_data: Mutex<HashMap<UserId, PlayerData>>,
+    player_data: Mutex<HashMap<UserId, DerivedPlayerData>>,
     #[serde(default)]
     match_data: Mutex<HashMap<u32, MatchData>>,
     #[serde(default)]
@@ -161,7 +205,7 @@ fn try_queue_player(data: &Data, user_id: UserId) -> bool {
     }
     player_data
         .entry(user_id)
-        .or_insert(config.default_player_data.clone())
+        .or_insert(DerivedPlayerData::default())
         .queue_enter_time = Some(chrono::offset::Utc::now());
     queued_players.insert(user_id);
     true
@@ -189,7 +233,7 @@ async fn handler(
                                 let mut queued_players = data.queued_players.lock().unwrap();
                                 player_data
                                     .entry(new.user_id)
-                                    .or_insert(config.default_player_data.clone())
+                                    .or_insert(DerivedPlayerData::default())
                                     .queue_enter_time = None;
                                 queued_players.remove(&old.user_id);
                             }
@@ -405,13 +449,14 @@ fn apply_match_results(data: &Data, result: MatchResult, players: &Vec<Vec<UserI
     }
     let system = <WengLin as MultiTeamRatingSystem>::new(rating_config);
     let mut player_data = data.player_data.lock().unwrap();
+    let config = data.configuration.lock().unwrap();
     let outcome = players
         .iter()
         .enumerate()
         .map(|(team_idx, team)| {
             (
                 team.iter()
-                    .map(|id| player_data.get(id).unwrap().rating)
+                    .map(|id| player_data.get(id).unwrap().rating.unwrap_or(config.default_player_data.rating))
                     .collect_vec(),
                 MultiTeamOutcome::new(match result {
                     MatchResult::Team(idx) if idx == team_idx as u32 => 1,
@@ -432,12 +477,12 @@ fn apply_match_results(data: &Data, result: MatchResult, players: &Vec<Vec<UserI
     );
     for (team_idx, team) in players.iter().enumerate() {
         for (player_idx, player) in team.iter().enumerate() {
-            player_data.get_mut(player).unwrap().rating = result
+            player_data.get_mut(player).unwrap().rating = Some(result
                 .get(team_idx)
                 .unwrap()
                 .get(player_idx)
                 .unwrap()
-                .clone();
+                .clone());
         }
     }
 }
@@ -631,13 +676,13 @@ async fn evaluate_cost(
             })
             .collect_vec()
     };
-    let (team_size, game_categories) = {
+    let (team_size, game_categories, default_player_data) = {
         let config = data.configuration.lock().unwrap();
-        (config.team_size, config.game_categories.clone())
+        (config.team_size, config.game_categories.clone(), config.default_player_data.clone())
     };
     let team_mmrs = player_game_data.iter().map(|team| {
         team.iter()
-            .map(|player| player.rating.rating as f32)
+            .map(|player| player.rating.unwrap_or(default_player_data.rating).rating as f32)
             .sum::<f32>()
             / team_size as f32
     });
@@ -648,7 +693,7 @@ async fn evaluate_cost(
     };
     let mmr_range = player_game_data
         .iter()
-        .flat_map(|team| team.iter().map(|player| player.rating.rating as f32))
+        .flat_map(|team| team.iter().map(|player| player.rating.unwrap_or(default_player_data.rating).rating as f32))
         .minmax();
     let mmr_range = match mmr_range {
         MinMaxResult::NoElements => 0.0,
@@ -724,17 +769,16 @@ async fn evaluate_cost(
             .flat_map(|team| team.iter())
             .zip(player_categories.iter())
             .map(|(player, player_categories)| {
+                let queue_config = player.player_queueing_config.derive(&default_player_data.player_queueing_config);
                 let time_in_queue = (now - player.queue_enter_time.unwrap()).num_seconds();
                 let mut player_cost = 0.0;
-                player_cost += (mmr_differential
-                    - player.player_queueing_config.acceptable_mmr_differential)
+                player_cost += (mmr_differential - queue_config.acceptable_mmr_differential)
                     .max(0.0)
-                    * player.player_queueing_config.cost_per_avg_mmr_differential;
-                player_cost += (mmr_range - player.player_queueing_config.acceptable_mmr_range)
+                    * queue_config.cost_per_avg_mmr_differential;
+                player_cost += (mmr_range - queue_config.acceptable_mmr_range)
                     .max(0.0)
-                    * player.player_queueing_config.cost_per_mmr_range;
-                player_cost += player
-                    .player_queueing_config
+                    * queue_config.cost_per_mmr_range;
+                player_cost += queue_config
                     .wrong_game_category_cost
                     .iter()
                     .filter(|(category, _)| {
@@ -1076,7 +1120,7 @@ async fn backup(ctx: Context<'_>) -> Result<(), Error> {
 /// Exports configuration
 #[poise::command(slash_command, prefix_command)]
 async fn export_config(ctx: Context<'_>) -> Result<(), Error> {
-    let config = serde_json::to_string_pretty(ctx.data())?;
+    let config = serde_json::to_string_pretty(&ctx.data().configuration.lock().unwrap().clone())?;
     let response = format!("Configuration: ```json\n{}\n```", config);
     ctx.send(CreateReply::default().content(response).ephemeral(true))
         .await?;
@@ -1194,8 +1238,9 @@ async fn stats(
         let config = ctx.data().configuration.lock().unwrap();
         player_data
             .entry(user)
-            .or_insert(config.default_player_data.clone())
+            .or_insert(DerivedPlayerData::default())
             .rating
+            .unwrap_or(config.default_player_data.rating)
     };
     let response = format!(
         "{}'s mmr is {}, with uncertainty {}",
