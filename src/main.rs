@@ -357,7 +357,7 @@ async fn handler(
                                         ctx.http.clone(),
                                         EditMember::new().voice_channel(post_match_channel),
                                     )
-                                    .await?;
+                                    .await.ok();
                             }
                         }
                         for channel in channels {
@@ -599,7 +599,7 @@ async fn try_matchmaking(
                         cache_http.clone(),
                         EditMember::new().voice_channel(vc_channels.get(team_idx).unwrap().clone()),
                     )
-                    .await?;
+                    .await.ok();
                 data.queued_players.lock().unwrap().remove(player);
                 data.in_game_players.lock().unwrap().insert(player.clone());
                 data.player_data
@@ -1102,59 +1102,52 @@ async fn import_config(
     Ok(())
 }
 
-/// Imports configuration
-#[poise::command(
-    slash_command,
-    prefix_command,
-    default_member_permissions = "MANAGE_CHANNELS"
-)]
-async fn import_mmrs(
-    ctx: Context<'_>,
-    #[description = "New config"] new_mmrs: String,
-) -> Result<(), Error> {
-    let mmr_data: HashMap<&str, f32> = new_mmrs
-        .split("||||")
-        .map(|line| line.split("::::").collect_tuple())
-        .flatten()
-        .filter_map(|(name, mmr)| mmr.parse::<f32>().map(|mmr| (name, mmr)).ok())
-        .collect();
-
-    let mut members = vec![];
-    let mut members_iter = ctx.guild_id().unwrap().members_iter(ctx.http()).boxed();
-    while let Some(member_result) = members_iter.next().await {
-        match member_result {
-            Ok(member) => {
-                members.push(member);
-            }
-            Err(error) => eprintln!("Uh oh!  Error: {}", error),
-        }
+/// Join queue
+#[poise::command(slash_command, prefix_command)]
+async fn queue(ctx: Context<'_>) -> Result<(), Error> {
+    if try_queue_player(ctx.data(), ctx.author().id) {
+        try_matchmaking(ctx.data(), ctx.serenity_context().http.clone(), ctx.guild_id().unwrap()).await?;
+        let response = {
+            let data_lock = ctx.data().queued_players.lock().unwrap();
+            format!(
+                "Queued players: {}",
+                data_lock.iter().map(|c| c.mention()).join(", ")
+            )
+        };
+        ctx.send(CreateReply::default().content(response).ephemeral(true))
+            .await?;
+        Ok(())
+    } else {
+        ctx.send(CreateReply::default().content("Could not queue!").ephemeral(true))
+            .await?;
+        Ok(())
     }
-    let assigned_mmrs: Vec<(UserId, f32)> = members
-        .into_iter()
-        .filter_map(|member| {
-            mmr_data
-                .get(member.display_name())
-                .map(|mmr| (member.user.id, *mmr))
-        })
-        .collect();
-    {
-        let mut player_data = ctx.data().player_data.lock().unwrap();
-        let config = ctx.data().configuration.lock().unwrap();
-        for (id, mmr) in assigned_mmrs.iter() {
-            player_data
-                .entry(*id)
-                .or_insert(config.default_player_data.clone())
-                .rating
-                .rating = *mmr as f64;
-        }
-    }
-    let response = format!("MMRs set to: ```json\n{:?}\n```", assigned_mmrs);
-    ctx.send(CreateReply::default().content(response).ephemeral(true))
-        .await?;
-    Ok(())
 }
 
-/// Displays or sets queue category
+/// Join queue
+#[poise::command(slash_command, prefix_command)]
+async fn leave_queue(ctx: Context<'_>) -> Result<(), Error> {
+    let removed = {
+        let mut queued_players = ctx.data().queued_players.lock().unwrap();
+        let mut player_data = ctx.data().player_data.lock().unwrap();
+        player_data
+            .get_mut(&ctx.author().id)
+            .unwrap()
+            .queue_enter_time = None;
+        queued_players.remove(&ctx.author().id)
+    };
+    if removed {
+        ctx.send(CreateReply::default().content("You are no longer queueing!").ephemeral(true))
+            .await?;
+        Ok(())
+    } else {
+        ctx.send(CreateReply::default().content("You weren't queued!").ephemeral(true))
+            .await?;
+        Ok(())
+    }
+}
+
+/// Lists queued players
 #[poise::command(slash_command, prefix_command)]
 async fn list_queued(ctx: Context<'_>) -> Result<(), Error> {
     let response = {
@@ -1189,7 +1182,7 @@ async fn configure(_: Context<'_>) -> Result<(), Error> {
     Ok(())
 }
 
-/// Sets the channel to move members to after the end of the game
+/// Shows player stats
 #[poise::command(slash_command, prefix_command)]
 async fn stats(
     ctx: Context<'_>,
@@ -1237,7 +1230,8 @@ async fn main() {
                 backup(),
                 export_config(),
                 import_config(),
-                import_mmrs(),
+                queue(),
+                leave_queue(),
                 list_queued(),
                 stats(),
             ],
