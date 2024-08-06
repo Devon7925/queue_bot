@@ -1,15 +1,20 @@
 use std::{
     collections::{HashMap, HashSet},
-    fs,
+    fs::{self, OpenOptions},
     hash::Hash,
-    sync::{Arc, Mutex}, time::Duration,
+    io::prelude::*,
+    sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use chrono::{DateTime, Utc};
 use itertools::{Itertools, MinMaxResult};
 use poise::{
     serenity_prelude::{
-        self as serenity, futures::future, Builder, ChannelId, ChannelType, CreateAllowedMentions, CreateButton, CreateChannel, CreateMessage, EditMember, EditMessage, GuildId, Http, Mentionable, RoleId, UserId
+        self as serenity,
+        futures::{future, StreamExt},
+        Builder, ChannelId, ChannelType, CreateAllowedMentions, CreateButton, CreateChannel,
+        CreateMessage, EditMember, EditMessage, GuildId, Http, Mentionable, RoleId, UserId,
     },
     CreateReply,
 };
@@ -19,7 +24,6 @@ use skillratings::{
     weng_lin::{WengLin, WengLinConfig, WengLinRating},
     MultiTeamOutcome, MultiTeamRatingSystem,
 };
-
 enum VoteType {
     None,
     Map,
@@ -37,7 +41,7 @@ struct QueueConfiguration {
     map_vote_count: u32,
     default_player_data: PlayerData,
     maximum_queue_cost: f32,
-    game_categories: HashMap<String, Vec<RoleId>>
+    game_categories: HashMap<String, Vec<RoleId>>,
 }
 
 impl Default for QueueConfiguration {
@@ -57,7 +61,7 @@ impl Default for QueueConfiguration {
     }
 }
 
-#[derive(Eq, PartialEq, Hash, Clone)]
+#[derive(Eq, PartialEq, Hash, Clone, Debug)]
 enum MatchResult {
     Team(u32),
     Tie,
@@ -78,6 +82,7 @@ impl std::fmt::Display for MatchResult {
     }
 }
 
+#[derive(Debug)]
 struct MatchData {
     result_votes: HashMap<UserId, MatchResult>,
     map_votes: HashMap<UserId, String>,
@@ -151,6 +156,9 @@ async fn handler(
     data: &Data,
 ) -> Result<(), Error> {
     match event {
+        serenity::FullEvent::Ready { .. } => {
+            println!("Ready")
+        }
         serenity::FullEvent::VoiceStateUpdate { old, new } => {
             let mut player_added_to_queue = false;
             {
@@ -159,11 +167,11 @@ async fn handler(
                     if let Some(channel_id) = old.channel_id {
                         if config.queue_channels.contains(&channel_id) {
                             let mut player_data = data.player_data.lock().unwrap();
+                            let mut queued_players = data.queued_players.lock().unwrap();
                             player_data
                                 .entry(new.user_id)
                                 .or_insert(config.default_player_data.clone())
                                 .queue_enter_time = None;
-                            let mut queued_players = data.queued_players.lock().unwrap();
                             queued_players.remove(&old.user_id);
                         }
                     }
@@ -172,13 +180,11 @@ async fn handler(
                     if config.queue_channels.contains(&channel_id) {
                         {
                             let mut player_data = data.player_data.lock().unwrap();
+                            let mut queued_players = data.queued_players.lock().unwrap();
                             player_data
                                 .entry(new.user_id)
                                 .or_insert(config.default_player_data.clone())
                                 .queue_enter_time = Some(chrono::offset::Utc::now());
-                        }
-                        {
-                            let mut queued_players = data.queued_players.lock().unwrap();
                             queued_players.insert(new.user_id);
                             player_added_to_queue = true;
                         }
@@ -186,7 +192,9 @@ async fn handler(
                 }
             }
             if player_added_to_queue {
-                if let Some(delay) = try_matchmaking(data, ctx.http.clone(), new.guild_id.unwrap()).await? {
+                if let Some(delay) =
+                    try_matchmaking(data, ctx.http.clone(), new.guild_id.unwrap()).await?
+                {
                     tokio::time::sleep(Duration::from_secs(delay as u64)).await;
                     try_matchmaking(data, ctx.http.clone(), new.guild_id.unwrap()).await?;
                 }
@@ -312,6 +320,7 @@ async fn handler(
                         let (channels, players) = {
                             let mut match_data = data.match_data.lock().unwrap();
                             let match_data = match_data.remove(&match_number).unwrap();
+                            log_match_results(data, &vote_result, &match_data, match_number);
                             (match_data.channels, match_data.members)
                         };
 
@@ -351,6 +360,21 @@ async fn handler(
         _ => {}
     }
     Ok(())
+}
+
+fn log_match_results(_data: &Data, result: &MatchResult, match_data: &MatchData, number: u32) {
+    let mut file = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open("games.log")
+        .unwrap();
+    if let Err(e) = writeln!(
+        file,
+        "match #{}:{:?}\nresult:{}",
+        number, match_data, result
+    ) {
+        eprintln!("Couldn't write to file: {}", e);
+    }
 }
 
 fn apply_match_results(data: &Data, result: MatchResult, players: &Vec<Vec<UserId>>) {
@@ -419,7 +443,13 @@ async fn try_matchmaking(
         return Err(Error::from("No category"));
     };
     let queued_players = data.queued_players.lock().unwrap().clone();
-    let members = greedy_matchmaking(data, queued_players.iter().cloned().collect_vec(), guild_id, cache_http.clone()).await;
+    let members = greedy_matchmaking(
+        data,
+        queued_players.iter().cloned().collect_vec(),
+        guild_id,
+        cache_http.clone(),
+    )
+    .await;
     let cost_eval = evaluate_cost(data, &members, guild_id, cache_http.clone()).await;
     if cost_eval.0 > config.maximum_queue_cost {
         let delay = (cost_eval.0 - config.maximum_queue_cost) / total_player_count as f32 + 1.0;
@@ -448,7 +478,12 @@ async fn try_matchmaking(
     let mut members_message = String::new();
     members_message += format!("# Queue#{}\n", new_idx).as_str();
     for (category_name, value) in cost_eval.1 {
-        members_message += format!("{}: {}\n", category_name, config.game_categories[&category_name][value].mention()).as_str();
+        members_message += format!(
+            "{}: {}\n",
+            category_name,
+            config.game_categories[&category_name][value].mention()
+        )
+        .as_str();
     }
     for (team_idx, team) in members.iter().enumerate() {
         members_message += format!("## Team {}\n", team_idx + 1).as_str();
@@ -459,7 +494,13 @@ async fn try_matchmaking(
     match_channel
         .send_message(
             cache_http.clone(),
-            CreateMessage::default().allowed_mentions(CreateAllowedMentions::default().all_roles(false).all_users(true)).content(members_message),
+            CreateMessage::default()
+                .allowed_mentions(
+                    CreateAllowedMentions::default()
+                        .all_roles(false)
+                        .all_users(true),
+                )
+                .content(members_message),
         )
         .await?;
     if config.map_vote_count > 0 {
@@ -551,7 +592,12 @@ async fn try_matchmaking(
     Ok(None)
 }
 
-async fn evaluate_cost(data: &Data, players: &Vec<Vec<UserId>>, guild_id: GuildId, cache_http: Arc<Http>) -> (f32, HashMap<String, usize>) {
+async fn evaluate_cost(
+    data: &Data,
+    players: &Vec<Vec<UserId>>,
+    guild_id: GuildId,
+    cache_http: Arc<Http>,
+) -> (f32, HashMap<String, usize>) {
     let player_game_data = {
         let player_data = data.player_data.lock().unwrap();
         players
@@ -587,53 +633,107 @@ async fn evaluate_cost(data: &Data, players: &Vec<Vec<UserId>>, guild_id: GuildI
         MinMaxResult::OneElement(_) => 0.0,
         MinMaxResult::MinMax(min, max) => max - min,
     };
-    let users = future::join_all(players.iter().flat_map(|team| team.iter()).map(|player| async {
-        cache_http.get_user(*player).await.unwrap()
-    })).await;
+    let users = future::join_all(
+        players
+            .iter()
+            .flat_map(|team| team.iter())
+            .map(|player| async { cache_http.get_user(*player).await.unwrap() }),
+    )
+    .await;
 
-    let player_categories: Vec<HashMap<String, Vec<usize>>> = future::join_all(users.iter().map(|user| async {
-        future::join_all(game_categories.iter().map(|(category_name, category_roles)| async {
-            (category_name.clone(), future::join_all(category_roles.iter().map(|role| async {
-                user.has_role(cache_http.clone(), guild_id, *role).await.unwrap()
-            })).await.iter().enumerate().filter(|(_, has_role)| **has_role).map(|(idx, _)| idx).collect_vec())
-        })).await.into_iter().collect()
-    })).await;
-    let game_categories: HashMap<String, usize> = game_categories.iter().map(|(category_name, roles)| {
-        let players_category_values = player_categories.iter().map(|player_categories| player_categories[category_name].clone()).collect_vec();
-        let mut counts = vec![0; roles.len()];
-        for player_category_values in players_category_values {
-            for category_value in player_category_values {
-                counts[category_value] += 1;
-            }
-        }
-        (category_name.clone(), if let Some((category, _count)) = counts.iter().enumerate().max_by_key(|&(_category, count)| count) {
-            category
-        } else {
-            0
-        })
-    }).collect();
-    let now = chrono::offset::Utc::now();
-    (player_game_data
+    let player_categories: Vec<HashMap<String, Vec<usize>>> =
+        future::join_all(users.iter().map(|user| async {
+            future::join_all(
+                game_categories
+                    .iter()
+                    .map(|(category_name, category_roles)| async {
+                        (
+                            category_name.clone(),
+                            future::join_all(category_roles.iter().map(|role| async {
+                                user.has_role(cache_http.clone(), guild_id, *role)
+                                    .await
+                                    .unwrap()
+                            }))
+                            .await
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, has_role)| **has_role)
+                            .map(|(idx, _)| idx)
+                            .collect_vec(),
+                        )
+                    }),
+            )
+            .await
+            .into_iter()
+            .collect()
+        }))
+        .await;
+    let game_categories: HashMap<String, usize> = game_categories
         .iter()
-        .flat_map(|team| team.iter()).zip(player_categories.iter())
-        .map(|(player, player_categories)| {
-            let time_in_queue = (now - player.queue_enter_time.unwrap()).num_seconds();
-            let mut player_cost = 0.0;
-            player_cost += (mmr_differential
-                - player.player_queueing_config.acceptable_mmr_differential)
-                .max(0.0)
-                * player.player_queueing_config.cost_per_avg_mmr_differential;
-            player_cost += (mmr_range - player.player_queueing_config.acceptable_mmr_range)
-                .max(0.0)
-                * player.player_queueing_config.cost_per_mmr_range;
-            player_cost += player.player_queueing_config.wrong_game_category_cost.iter().filter(|(category, _)| !player_categories[*category].contains(&game_categories[*category])).map(|(_, cost)| cost).sum::<f32>();
-            player_cost -= time_in_queue as f32;
-            player_cost
+        .map(|(category_name, roles)| {
+            let players_category_values = player_categories
+                .iter()
+                .map(|player_categories| player_categories[category_name].clone())
+                .collect_vec();
+            let mut counts = vec![0; roles.len()];
+            for player_category_values in players_category_values {
+                for category_value in player_category_values {
+                    counts[category_value] += 1;
+                }
+            }
+            (
+                category_name.clone(),
+                if let Some((category, _count)) = counts
+                    .iter()
+                    .enumerate()
+                    .max_by_key(|&(_category, count)| count)
+                {
+                    category
+                } else {
+                    0
+                },
+            )
         })
-        .sum(), game_categories)
+        .collect();
+    let now = chrono::offset::Utc::now();
+    (
+        player_game_data
+            .iter()
+            .flat_map(|team| team.iter())
+            .zip(player_categories.iter())
+            .map(|(player, player_categories)| {
+                let time_in_queue = (now - player.queue_enter_time.unwrap()).num_seconds();
+                let mut player_cost = 0.0;
+                player_cost += (mmr_differential
+                    - player.player_queueing_config.acceptable_mmr_differential)
+                    .max(0.0)
+                    * player.player_queueing_config.cost_per_avg_mmr_differential;
+                player_cost += (mmr_range - player.player_queueing_config.acceptable_mmr_range)
+                    .max(0.0)
+                    * player.player_queueing_config.cost_per_mmr_range;
+                player_cost += player
+                    .player_queueing_config
+                    .wrong_game_category_cost
+                    .iter()
+                    .filter(|(category, _)| {
+                        !player_categories[*category].contains(&game_categories[*category])
+                    })
+                    .map(|(_, cost)| cost)
+                    .sum::<f32>();
+                player_cost -= time_in_queue as f32;
+                player_cost
+            })
+            .sum(),
+        game_categories,
+    )
 }
 
-async fn greedy_matchmaking(data: &Data, pool: Vec<UserId>, guild_id: GuildId, cache_http: Arc<Http>) -> Vec<Vec<UserId>> {
+async fn greedy_matchmaking(
+    data: &Data,
+    pool: Vec<UserId>,
+    guild_id: GuildId,
+    cache_http: Arc<Http>,
+) -> Vec<Vec<UserId>> {
     let team_size = data.configuration.lock().unwrap().team_size;
     let team_count = data.configuration.lock().unwrap().team_count;
     let total_players = team_size * team_count;
@@ -652,7 +752,9 @@ async fn greedy_matchmaking(data: &Data, pool: Vec<UserId>, guild_id: GuildId, c
                 let mut result_copy = result.clone();
                 result_copy[team_idx].push(players[possible_addition].clone());
 
-                let cost = evaluate_cost(data, &result_copy, guild_id, cache_http.clone()).await.0;
+                let cost = evaluate_cost(data, &result_copy, guild_id, cache_http.clone())
+                    .await
+                    .0;
                 if cost < min_cost {
                     min_cost = cost;
                     best_player = possible_addition;
@@ -940,7 +1042,11 @@ async fn export_config(ctx: Context<'_>) -> Result<(), Error> {
 }
 
 /// Imports configuration
-#[poise::command(slash_command, prefix_command)]
+#[poise::command(
+    slash_command,
+    prefix_command,
+    default_member_permissions = "MANAGE_CHANNELS"
+)]
 async fn import_config(
     ctx: Context<'_>,
     #[description = "New config"] new_config: String,
@@ -949,6 +1055,58 @@ async fn import_config(
     *ctx.data().configuration.lock().unwrap() = new_config;
     let config = serde_json::to_string_pretty(ctx.data())?;
     let response = format!("Configuration set to: ```json\n{}\n```", config);
+    ctx.send(CreateReply::default().content(response).ephemeral(true))
+        .await?;
+    Ok(())
+}
+
+/// Imports configuration
+#[poise::command(
+    slash_command,
+    prefix_command,
+    default_member_permissions = "MANAGE_CHANNELS"
+)]
+async fn import_mmrs(
+    ctx: Context<'_>,
+    #[description = "New config"] new_mmrs: String,
+) -> Result<(), Error> {
+    let mmr_data: HashMap<&str, f32> = new_mmrs
+        .split("|")
+        .map(|line| line.split(":").collect_tuple())
+        .flatten()
+        .filter_map(|(name, mmr)| mmr.parse::<f32>().map(|mmr| (name, mmr)).ok())
+        .collect();
+
+    let mut members = vec![];
+    let mut members_iter = ctx.guild_id().unwrap().members_iter(ctx.http()).boxed();
+    while let Some(member_result) = members_iter.next().await {
+        match member_result {
+            Ok(member) => {
+                members.push(member);
+            }
+            Err(error) => eprintln!("Uh oh!  Error: {}", error),
+        }
+    }
+    let assigned_mmrs: Vec<(UserId, f32)> = members
+        .into_iter()
+        .filter_map(|member| {
+            mmr_data
+                .get(member.display_name())
+                .map(|mmr| (member.user.id, *mmr))
+        })
+        .collect();
+    {
+        let mut player_data = ctx.data().player_data.lock().unwrap();
+        let config = ctx.data().configuration.lock().unwrap();
+        for (id, mmr) in assigned_mmrs.iter() {
+            player_data
+                .entry(*id)
+                .or_insert(config.default_player_data.clone())
+                .rating
+                .rating = *mmr as f64;
+        }
+    }
+    let response = format!("MMRs set to: ```json\n{:?}\n```", assigned_mmrs);
     ctx.send(CreateReply::default().content(response).ephemeral(true))
         .await?;
     Ok(())
@@ -1036,6 +1194,7 @@ async fn main() {
                 configure(),
                 export_config(),
                 import_config(),
+                import_mmrs(),
                 list_queued(),
                 stats(),
             ],
