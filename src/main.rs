@@ -61,7 +61,7 @@ impl Default for QueueConfiguration {
     }
 }
 
-#[derive(Eq, PartialEq, Hash, Clone, Debug)]
+#[derive(Eq, PartialEq, Hash, Clone, Debug, Serialize, Deserialize)]
 enum MatchResult {
     Team(u32),
     Tie,
@@ -82,7 +82,7 @@ impl std::fmt::Display for MatchResult {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 struct MatchData {
     result_votes: HashMap<UserId, MatchResult>,
     map_votes: HashMap<UserId, String>,
@@ -136,18 +136,36 @@ impl Default for PlayerData {
 #[derive(Serialize, Deserialize)]
 struct Data {
     configuration: Mutex<QueueConfiguration>,
-    #[serde(skip)]
+    #[serde(default)]
     queued_players: Mutex<HashSet<UserId>>,
-    #[serde(skip)]
+    #[serde(default)]
+    in_game_players: Mutex<HashSet<UserId>>,
+    #[serde(default)]
     player_data: Mutex<HashMap<UserId, PlayerData>>,
-    #[serde(skip)]
+    #[serde(default)]
     match_data: Mutex<HashMap<u32, MatchData>>,
-    #[serde(skip)]
+    #[serde(default)]
     match_channels: Mutex<HashMap<ChannelId, u32>>,
     queue_idx: Mutex<u32>,
 } // User data, which is stored and accessible in all command invocations
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type Context<'a> = poise::Context<'a, Data, Error>;
+
+fn try_queue_player(data: &Data, user_id: UserId) -> bool {
+    let config = data.configuration.lock().unwrap();
+    let mut player_data = data.player_data.lock().unwrap();
+    let mut queued_players = data.queued_players.lock().unwrap();
+    let in_game_players = data.in_game_players.lock().unwrap();
+    if in_game_players.contains(&user_id) {
+        return false;
+    }
+    player_data
+        .entry(user_id)
+        .or_insert(config.default_player_data.clone())
+        .queue_enter_time = Some(chrono::offset::Utc::now());
+    queued_players.insert(user_id);
+    true
+}
 
 async fn handler(
     ctx: &serenity::Context,
@@ -162,32 +180,34 @@ async fn handler(
         serenity::FullEvent::VoiceStateUpdate { old, new } => {
             let mut player_added_to_queue = false;
             {
-                let config = data.configuration.lock().unwrap();
-                if let Some(old) = old {
-                    if let Some(channel_id) = old.channel_id {
-                        if config.queue_channels.contains(&channel_id) {
-                            let mut player_data = data.player_data.lock().unwrap();
-                            let mut queued_players = data.queued_players.lock().unwrap();
-                            player_data
-                                .entry(new.user_id)
-                                .or_insert(config.default_player_data.clone())
-                                .queue_enter_time = None;
-                            queued_players.remove(&old.user_id);
+                {
+                    let config = data.configuration.lock().unwrap();
+                    if let Some(old) = old {
+                        if let Some(channel_id) = old.channel_id {
+                            if config.queue_channels.contains(&channel_id) {
+                                let mut player_data = data.player_data.lock().unwrap();
+                                let mut queued_players = data.queued_players.lock().unwrap();
+                                player_data
+                                    .entry(new.user_id)
+                                    .or_insert(config.default_player_data.clone())
+                                    .queue_enter_time = None;
+                                queued_players.remove(&old.user_id);
+                            }
                         }
                     }
                 }
-                if let Some(channel_id) = new.channel_id {
-                    if config.queue_channels.contains(&channel_id) {
-                        {
-                            let mut player_data = data.player_data.lock().unwrap();
-                            let mut queued_players = data.queued_players.lock().unwrap();
-                            player_data
-                                .entry(new.user_id)
-                                .or_insert(config.default_player_data.clone())
-                                .queue_enter_time = Some(chrono::offset::Utc::now());
-                            queued_players.insert(new.user_id);
-                            player_added_to_queue = true;
-                        }
+                let try_queueing = {
+                    let config = data.configuration.lock().unwrap();
+                    if let Some(channel_id) = new.channel_id {
+                        config.queue_channels.contains(&channel_id)
+                    } else {
+                        false
+                    }
+                };
+                
+                if try_queueing {
+                    if try_queue_player(data, new.user_id) {
+                        player_added_to_queue = true;
                     }
                 }
             }
@@ -329,6 +349,7 @@ async fn handler(
                         let guild_id = message_component.guild_id.unwrap();
                         if let Some(post_match_channel) = post_match_channel {
                             for player in players.iter().flat_map(|t| t) {
+                                data.in_game_players.lock().unwrap().remove(player);
                                 ctx.http
                                     .get_member(guild_id, *player)
                                     .await?
@@ -580,6 +601,7 @@ async fn try_matchmaking(
                     )
                     .await?;
                 data.queued_players.lock().unwrap().remove(player);
+                data.in_game_players.lock().unwrap().insert(player.clone());
                 data.player_data
                     .lock()
                     .unwrap()
@@ -1216,6 +1238,7 @@ async fn main() {
                     match_channels: Mutex::new(HashMap::new()),
                     player_data: Mutex::new(HashMap::new()),
                     match_data: Mutex::new(HashMap::new()),
+                    in_game_players: Mutex::new(HashSet::new()),
                 })
             })
         })
