@@ -204,7 +204,7 @@ async fn handler(
                         false
                     }
                 };
-                
+
                 if try_queueing {
                     if try_queue_player(data, new.user_id) {
                         player_added_to_queue = true;
@@ -1054,6 +1054,26 @@ async fn configure_post_match_channel(
 }
 
 /// Exports configuration
+#[poise::command(
+    slash_command,
+    prefix_command,
+    default_member_permissions = "MANAGE_CHANNELS"
+)]
+async fn backup(ctx: Context<'_>) -> Result<(), Error> {
+    {
+        let match_idx = ctx.data().queue_idx.lock().unwrap().clone();
+        let config = serde_json::to_string_pretty(ctx.data())?;
+        println!("Starting backup...");
+        fs::write(format!("backups/backup_{}.json", match_idx), config)?;
+        println!("Backup made!");
+    }
+    let response = format!("Backup made.");
+    ctx.send(CreateReply::default().content(response).ephemeral(true))
+        .await?;
+    Ok(())
+}
+
+/// Exports configuration
 #[poise::command(slash_command, prefix_command)]
 async fn export_config(ctx: Context<'_>) -> Result<(), Error> {
     let config = serde_json::to_string_pretty(ctx.data())?;
@@ -1093,8 +1113,8 @@ async fn import_mmrs(
     #[description = "New config"] new_mmrs: String,
 ) -> Result<(), Error> {
     let mmr_data: HashMap<&str, f32> = new_mmrs
-        .split("|")
-        .map(|line| line.split(":").collect_tuple())
+        .split("||||")
+        .map(|line| line.split("::::").collect_tuple())
         .flatten()
         .filter_map(|(name, mmr)| mmr.parse::<f32>().map(|mmr| (name, mmr)).ok())
         .collect();
@@ -1195,7 +1215,7 @@ async fn stats(
     Ok(())
 }
 
-#[poise::command(prefix_command)]
+#[poise::command(prefix_command, required_permissions = "MANAGE_CHANNELS")]
 pub async fn register(ctx: Context<'_>) -> Result<(), Error> {
     poise::builtins::register_application_commands_buttons(ctx).await?;
     Ok(())
@@ -1214,6 +1234,7 @@ async fn main() {
             commands: vec![
                 register(),
                 configure(),
+                backup(),
                 export_config(),
                 import_config(),
                 import_mmrs(),

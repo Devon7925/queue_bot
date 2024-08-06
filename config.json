@@ -1,35 +1,70 @@
 {
-    "configuration": {
-      "team_size": 1,
-      "team_count": 1,
-      "category": "1269161295022919773",
-      "queue_channels": [
-        "1269326057224536115"
-      ],
-      "post_match_channel": "1269122202587103262",
-      "maps": [
-        "Numbani",
-        "Paraiso",
-        "King's Row"
-      ],
-      "map_vote_count": 2,
-      "default_player_data": {
-        "rating": {
-          "rating": 25.0,
-          "uncertainty": 8.333333333333334
-        },
-        "queue_enter_time": null,
-        "player_queueing_config": {
-          "cost_per_second": 1.0,
-          "cost_per_avg_mmr_differential": 4.0,
-          "acceptable_mmr_differential": 1.0,
-          "cost_per_mmr_range": 2.0,
-          "acceptable_mmr_range": 3.0,
-          "wrong_game_category_cost": {}
-        }
+  "configuration": {
+    "team_size": 1,
+    "team_count": 1,
+    "category": "1270231681626017863",
+    "queue_channels": [
+      "1270231132847210547"
+    ],
+    "post_match_channel": "1253881451259367526",
+    "maps": [
+      "Antarctic Peninsula",
+      "Busan",
+      "Ilios",
+      "Lijiang Tower",
+      "Nepal",
+      "Oasis",
+      "Samoa",
+      "Circuit Royal",
+      "Dorado",
+      "Havana",
+      "Junkertown",
+      "Rialto",
+      "Route 66",
+      "Shambali Monastery",
+      "Watchpoint: Gibraltar",
+      "New Junk City",
+      "Suravasa",
+      "Blizzard World",
+      "Eichenwalde",
+      "Hollywood",
+      "King's Row",
+      "Midtown",
+      "Numbani",
+      "Paraíso",
+      "Colosseo",
+      "Esperança",
+      "New Queen Street",
+      "Runasapi"
+    ],
+    "map_vote_count": 2,
+    "default_player_data": {
+      "rating": {
+        "rating": 25.0,
+        "uncertainty": 8.333333333333334
       },
-      "maximum_queue_cost": 50.0,
-      "game_categories": {"Region": [1270128989851091029, 1270129031773294755]}
+      "queue_enter_time": null,
+      "player_queueing_config": {
+        "cost_per_avg_mmr_differential": 4.0,
+        "acceptable_mmr_differential": 1.0,
+        "cost_per_mmr_range": 2.0,
+        "acceptable_mmr_range": 3.0,
+        "wrong_game_category_cost": {}
+      }
     },
-    "queue_idx": 0
-  }
+    "maximum_queue_cost": 50.0,
+    "game_categories": {
+      "Region": [
+        "1193629712879206420",
+        "1193629742449049690",
+        "1193629758999769228"
+      ]
+    }
+  },
+  "queued_players": [],
+  "in_game_players": [],
+  "player_data": {},
+  "match_data": {},
+  "match_channels": {},
+  "queue_idx": 1
+}
