@@ -1558,6 +1558,23 @@ async fn party(_: Context<'_>) -> Result<(), Error> {
     Ok(())
 }
 
+/// Displays a leaderboard
+#[poise::command(slash_command, prefix_command)]
+async fn leaderboard(
+    ctx: Context<'_>
+) -> Result<(), Error> {
+    let default_rating = ctx.data().configuration.lock().unwrap().default_player_data.rating;
+    let mut player_data = ctx.data().player_data.lock().unwrap().iter().map(|(id, data)| (id.mention(), data.rating.unwrap_or(default_rating).rating)).collect_vec();
+    player_data.sort_by(|(_, rating_a), (_, rating_b)| rating_b.partial_cmp(rating_a).unwrap());
+    let mut response = "## Leaderboard\n".to_string();
+    for (player, rating) in player_data.iter().take(10) {
+        response += format!("{}: {}\n", player, rating).as_str();
+    }
+    ctx.send(CreateReply::default().content(response).ephemeral(true).allowed_mentions(CreateAllowedMentions::new().all_users(false)))
+        .await?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
     let token = std::env::var("DISCORD_BOT_TOKEN").expect("missing DISCORD_BOT_TOKEN");
@@ -1580,6 +1597,7 @@ async fn main() {
                 stats(),
                 party(),
                 list_parties(),
+                leaderboard(),
             ],
             ..Default::default()
         })
