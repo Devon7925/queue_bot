@@ -11,10 +11,7 @@ use chrono::{DateTime, Utc};
 use itertools::{Itertools, MinMaxResult};
 use poise::{
     serenity_prelude::{
-        self as serenity,
-        futures::future,
-        Builder, ChannelId, ChannelType, CreateAllowedMentions, CreateButton, CreateChannel,
-        CreateMessage, EditMember, EditMessage, GuildId, Http, Mentionable, RoleId, UserId,
+        self as serenity, futures::future, Builder, CacheHttp, ChannelId, ChannelType, CreateAllowedMentions, CreateButton, CreateChannel, CreateInteractionResponseMessage, CreateMessage, EditMember, EditMessage, GuildId, Http, Mentionable, RoleId, UserId
     },
     CreateReply,
 };
@@ -24,6 +21,33 @@ use skillratings::{
     weng_lin::{WengLin, WengLinConfig, WengLinRating},
     MultiTeamOutcome, MultiTeamRatingSystem,
 };
+use uuid::Uuid;
+
+#[derive(Serialize, Deserialize)]
+struct Data {
+    configuration: Mutex<QueueConfiguration>,
+    #[serde(default)]
+    queued_players: Mutex<HashSet<UserId>>,
+    #[serde(default)]
+    in_game_players: Mutex<HashSet<UserId>>,
+    #[serde(default)]
+    player_data: Mutex<HashMap<UserId, DerivedPlayerData>>,
+    #[serde(default)]
+    match_data: Mutex<HashMap<u32, MatchData>>,
+    #[serde(default)]
+    match_channels: Mutex<HashMap<ChannelId, u32>>,
+    #[serde(default)]
+    group_data: Mutex<HashMap<Uuid, QueueGroup>>,
+    queue_idx: Mutex<u32>,
+} // User data, which is stored and accessible in all command invocations
+type Error = Box<dyn std::error::Error + Send + Sync>;
+type Context<'a> = poise::Context<'a, Data, Error>;
+
+#[derive(Serialize, Deserialize, Clone)]
+struct QueueGroup {
+    players: HashSet<UserId>,
+}
+
 enum VoteType {
     None,
     Map,
@@ -122,11 +146,20 @@ struct DerivedPlayerQueueingConfig {
 impl DerivedPlayerQueueingConfig {
     fn derive(&self, base: &PlayerQueueingConfig) -> PlayerQueueingConfig {
         PlayerQueueingConfig {
-            cost_per_avg_mmr_differential: self.cost_per_avg_mmr_differential.unwrap_or(base.cost_per_avg_mmr_differential),
-            acceptable_mmr_differential: self.acceptable_mmr_differential.unwrap_or(base.acceptable_mmr_differential),
+            cost_per_avg_mmr_differential: self
+                .cost_per_avg_mmr_differential
+                .unwrap_or(base.cost_per_avg_mmr_differential),
+            acceptable_mmr_differential: self
+                .acceptable_mmr_differential
+                .unwrap_or(base.acceptable_mmr_differential),
             cost_per_mmr_range: self.cost_per_mmr_range.unwrap_or(base.cost_per_mmr_range),
-            acceptable_mmr_range: self.acceptable_mmr_range.unwrap_or(base.acceptable_mmr_range),
-            wrong_game_category_cost: self.wrong_game_category_cost.clone().unwrap_or(base.wrong_game_category_cost.clone()),
+            acceptable_mmr_range: self
+                .acceptable_mmr_range
+                .unwrap_or(base.acceptable_mmr_range),
+            wrong_game_category_cost: self
+                .wrong_game_category_cost
+                .clone()
+                .unwrap_or(base.wrong_game_category_cost.clone()),
         }
     }
 }
@@ -134,7 +167,6 @@ impl DerivedPlayerQueueingConfig {
 #[derive(Serialize, Deserialize, Clone)]
 struct PlayerData {
     rating: WengLinRating,
-    queue_enter_time: Option<DateTime<Utc>>,
     player_queueing_config: PlayerQueueingConfig,
 }
 
@@ -142,7 +174,6 @@ impl Default for PlayerData {
     fn default() -> Self {
         Self {
             rating: WengLinRating::default(),
-            queue_enter_time: None,
             player_queueing_config: PlayerQueueingConfig {
                 cost_per_avg_mmr_differential: 0.04,
                 acceptable_mmr_differential: 50.0,
@@ -158,6 +189,7 @@ impl Default for PlayerData {
 struct DerivedPlayerData {
     rating: Option<WengLinRating>,
     queue_enter_time: Option<DateTime<Utc>>,
+    party: Option<Uuid>,
     player_queueing_config: DerivedPlayerQueueingConfig,
 }
 
@@ -166,6 +198,7 @@ impl Default for DerivedPlayerData {
         Self {
             rating: None,
             queue_enter_time: None,
+            party: None,
             player_queueing_config: DerivedPlayerQueueingConfig {
                 cost_per_avg_mmr_differential: None,
                 acceptable_mmr_differential: None,
@@ -177,26 +210,7 @@ impl Default for DerivedPlayerData {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-struct Data {
-    configuration: Mutex<QueueConfiguration>,
-    #[serde(default)]
-    queued_players: Mutex<HashSet<UserId>>,
-    #[serde(default)]
-    in_game_players: Mutex<HashSet<UserId>>,
-    #[serde(default)]
-    player_data: Mutex<HashMap<UserId, DerivedPlayerData>>,
-    #[serde(default)]
-    match_data: Mutex<HashMap<u32, MatchData>>,
-    #[serde(default)]
-    match_channels: Mutex<HashMap<ChannelId, u32>>,
-    queue_idx: Mutex<u32>,
-} // User data, which is stored and accessible in all command invocations
-type Error = Box<dyn std::error::Error + Send + Sync>;
-type Context<'a> = poise::Context<'a, Data, Error>;
-
 fn try_queue_player(data: &Data, user_id: UserId) -> bool {
-    let config = data.configuration.lock().unwrap();
     let mut player_data = data.player_data.lock().unwrap();
     let mut queued_players = data.queued_players.lock().unwrap();
     let in_game_players = data.in_game_players.lock().unwrap();
@@ -274,149 +288,212 @@ async fn handler(
                     let match_channels = data.match_channels.lock().unwrap();
                     match_channels.get(&message_component.channel_id).cloned()
                 };
-                let Some(match_number) = match_number else {
-                    return Ok(());
-                };
-                let mut vote_type = VoteType::None;
-                {
-                    let mut match_data = data.match_data.lock().unwrap();
-                    if let Some(map) = message_component.data.custom_id.strip_prefix("map_") {
-                        match_data
-                            .get_mut(&match_number)
-                            .unwrap()
-                            .map_votes
-                            .insert(message_component.user.id, map.to_string());
-                        vote_type = VoteType::Map;
-                    }
-                    if let Some(team_data) = message_component.data.custom_id.strip_prefix("team_")
+                if let Some(match_number) = match_number {
+                    let mut vote_type = VoteType::None;
                     {
-                        let team_number: u32 = team_data.parse()?;
-                        match_data
-                            .get_mut(&match_number)
-                            .unwrap()
-                            .result_votes
-                            .insert(message_component.user.id, MatchResult::Team(team_number));
-                        vote_type = VoteType::Result;
-                    }
-                    if message_component.data.custom_id.eq_ignore_ascii_case("tie") {
-                        match_data
-                            .get_mut(&match_number)
-                            .unwrap()
-                            .result_votes
-                            .insert(message_component.user.id, MatchResult::Tie);
-                        vote_type = VoteType::Result;
-                    }
-                    if message_component
-                        .data
-                        .custom_id
-                        .eq_ignore_ascii_case("cancel")
-                    {
-                        match_data
-                            .get_mut(&match_number)
-                            .unwrap()
-                            .result_votes
-                            .insert(message_component.user.id, MatchResult::Cancel);
-                        vote_type = VoteType::Result;
-                    }
-                }
-                if matches!(vote_type, VoteType::Map) {
-                    let mut vote_result = None;
-                    let mut content = {
-                        let match_data = data.match_data.lock().unwrap();
-                        let mut votes: HashMap<String, u32> = HashMap::new();
-                        for (_user, vote) in match_data.get(&match_number).unwrap().map_votes.iter()
+                        let mut match_data = data.match_data.lock().unwrap();
+                        if let Some(map) = message_component.data.custom_id.strip_prefix("map_") {
+                            match_data
+                                .get_mut(&match_number)
+                                .unwrap()
+                                .map_votes
+                                .insert(message_component.user.id, map.to_string());
+                            vote_type = VoteType::Map;
+                        }
+                        if let Some(team_data) = message_component.data.custom_id.strip_prefix("team_")
                         {
-                            let current_votes = votes.get(vote).unwrap_or(&0);
-                            votes.insert(vote.clone(), current_votes + 1);
+                            let team_number: u32 = team_data.parse()?;
+                            match_data
+                                .get_mut(&match_number)
+                                .unwrap()
+                                .result_votes
+                                .insert(message_component.user.id, MatchResult::Team(team_number));
+                            vote_type = VoteType::Result;
                         }
-                        let mut content = String::new();
-                        for (vote_type, count) in votes {
-                            content += format!("{}: {}\n", vote_type, count).as_str();
-                            if count > required_votes {
-                                vote_result = Some(vote_type);
+                        if message_component.data.custom_id.eq_ignore_ascii_case("tie") {
+                            match_data
+                                .get_mut(&match_number)
+                                .unwrap()
+                                .result_votes
+                                .insert(message_component.user.id, MatchResult::Tie);
+                            vote_type = VoteType::Result;
+                        }
+                        if message_component
+                            .data
+                            .custom_id
+                            .eq_ignore_ascii_case("cancel")
+                        {
+                            match_data
+                                .get_mut(&match_number)
+                                .unwrap()
+                                .result_votes
+                                .insert(message_component.user.id, MatchResult::Cancel);
+                            vote_type = VoteType::Result;
+                        }
+                    }
+                    if matches!(vote_type, VoteType::Map) {
+                        let mut vote_result = None;
+                        let mut content = {
+                            let match_data = data.match_data.lock().unwrap();
+                            let mut votes: HashMap<String, u32> = HashMap::new();
+                            for (_user, vote) in match_data.get(&match_number).unwrap().map_votes.iter()
+                            {
+                                let current_votes = votes.get(vote).unwrap_or(&0);
+                                votes.insert(vote.clone(), current_votes + 1);
                             }
+                            let mut content = String::new();
+                            for (vote_type, count) in votes {
+                                content += format!("{}: {}\n", vote_type, count).as_str();
+                                if count > required_votes {
+                                    vote_result = Some(vote_type);
+                                }
+                            }
+                            content
+                        };
+                        if let Some(vote_result) = vote_result {
+                            ctx.http
+                                .clone()
+                                .get_message(message_component.channel_id, message_component.message.id)
+                                .await?
+                                .edit(ctx.http.clone(), EditMessage::new().components(vec![]))
+                                .await?;
+                            content = format!("# Map: {}", vote_result);
                         }
-                        content
-                    };
-                    if let Some(vote_result) = vote_result {
                         ctx.http
                             .clone()
                             .get_message(message_component.channel_id, message_component.message.id)
                             .await?
-                            .edit(ctx.http.clone(), EditMessage::new().components(vec![]))
+                            .edit(ctx.http.clone(), EditMessage::new().content(content))
                             .await?;
-                        content = format!("# Map: {}", vote_result);
                     }
-                    ctx.http
-                        .clone()
-                        .get_message(message_component.channel_id, message_component.message.id)
-                        .await?
-                        .edit(ctx.http.clone(), EditMessage::new().content(content))
-                        .await?;
-                }
-                if matches!(vote_type, VoteType::Result) {
-                    let mut vote_result = None;
-                    let content = {
-                        let match_data = data.match_data.lock().unwrap();
-                        let mut votes: HashMap<MatchResult, u32> = HashMap::new();
-                        for (_user, vote) in
-                            match_data.get(&match_number).unwrap().result_votes.iter()
-                        {
-                            let current_votes = votes.get(&vote).unwrap_or(&0);
-                            votes.insert(vote.clone(), current_votes + 1);
-                        }
-                        let mut content = String::new();
-                        for (vote_type, count) in votes {
-                            content += format!("{}: {}\n", vote_type, count).as_str();
-                            if count > required_votes {
-                                vote_result = Some(vote_type);
+                    if matches!(vote_type, VoteType::Result) {
+                        let mut vote_result = None;
+                        let content = {
+                            let match_data = data.match_data.lock().unwrap();
+                            let mut votes: HashMap<MatchResult, u32> = HashMap::new();
+                            for (_user, vote) in
+                                match_data.get(&match_number).unwrap().result_votes.iter()
+                            {
+                                let current_votes = votes.get(&vote).unwrap_or(&0);
+                                votes.insert(vote.clone(), current_votes + 1);
                             }
-                        }
-                        content
-                    };
-                    if let Some(vote_result) = vote_result {
-                        let post_match_channel = data
-                            .configuration
-                            .lock()
-                            .unwrap()
-                            .post_match_channel
-                            .clone();
-                        let (channels, players) = {
-                            let mut match_data = data.match_data.lock().unwrap();
-                            let match_data = match_data.remove(&match_number).unwrap();
-                            log_match_results(data, &vote_result, &match_data, match_number);
-                            (match_data.channels, match_data.members)
+                            let mut content = String::new();
+                            for (vote_type, count) in votes {
+                                content += format!("{}: {}\n", vote_type, count).as_str();
+                                if count > required_votes {
+                                    vote_result = Some(vote_type);
+                                }
+                            }
+                            content
                         };
+                        if let Some(vote_result) = vote_result {
+                            let post_match_channel = data
+                                .configuration
+                                .lock()
+                                .unwrap()
+                                .post_match_channel
+                                .clone();
+                            let (channels, players) = {
+                                let mut match_data = data.match_data.lock().unwrap();
+                                let match_data = match_data.remove(&match_number).unwrap();
+                                log_match_results(data, &vote_result, &match_data, match_number);
+                                (match_data.channels, match_data.members)
+                            };
 
-                        apply_match_results(data, vote_result, &players);
+                            apply_match_results(data, vote_result, &players);
 
-                        let guild_id = message_component.guild_id.unwrap();
-                        if let Some(post_match_channel) = post_match_channel {
-                            for player in players.iter().flat_map(|t| t) {
-                                data.in_game_players.lock().unwrap().remove(player);
-                                ctx.http
-                                    .get_member(guild_id, *player)
-                                    .await?
-                                    .edit(
-                                        ctx.http.clone(),
-                                        EditMember::new().voice_channel(post_match_channel),
-                                    )
-                                    .await.ok();
+                            let guild_id = message_component.guild_id.unwrap();
+                            if let Some(post_match_channel) = post_match_channel {
+                                for player in players.iter().flat_map(|t| t) {
+                                    data.in_game_players.lock().unwrap().remove(player);
+                                    ctx.http
+                                        .get_member(guild_id, *player)
+                                        .await?
+                                        .edit(
+                                            ctx.http.clone(),
+                                            EditMember::new().voice_channel(post_match_channel),
+                                        )
+                                        .await
+                                        .ok();
+                                }
+                            }
+                            for channel in channels {
+                                data.match_channels.lock().unwrap().remove(&channel);
+                                ctx.http.delete_channel(channel, None).await?;
                             }
                         }
-                        for channel in channels {
-                            data.match_channels.lock().unwrap().remove(&channel);
-                            ctx.http.delete_channel(channel, None).await?;
+                        ctx.http
+                            .clone()
+                            .get_message(message_component.channel_id, message_component.message.id)
+                            .await?
+                            .edit(ctx.http.clone(), EditMessage::new().content(content))
+                            .await?;
+                    }
+                    message_component.defer(ctx.http.clone()).await?;
+                }
+                if let Some(party_id) = message_component.data.custom_id.strip_prefix("join_party_") {
+                    let party_uuid = serde_json::from_str::<Uuid>(party_id).unwrap();
+                    let group_members = {
+                        let mut group_data = data.group_data.lock().unwrap();
+                        let party = group_data.get_mut(&party_uuid);
+                        if let Some(party) = party {
+                            party.players.insert(message_component.user.id);
+                            Some(party.players.clone())
+                        } else {
+                            None
+                        }
+                    };
+                    let Some(group_members) = group_members else {
+                        message_component.create_response(ctx, serenity::CreateInteractionResponse::Message(CreateInteractionResponseMessage::new().content(format!("Party no longer exists.")))).await?;
+                        return Ok(())
+                    };
+                    let old_party = {
+                        let mut player_data = data.player_data.lock().unwrap();
+                        let player_data = player_data.entry(message_component.user.id).or_insert(DerivedPlayerData::default());
+                        let old_party = player_data.party;
+                        player_data.party = Some(party_uuid);
+                        old_party
+                    };
+                    if let Some(old_party) = old_party {
+                        if old_party != party_uuid {
+                            leave_party(data, &message_component.user.id, Arc::new(ctx.http()), old_party).await?;
                         }
                     }
-                    ctx.http
-                        .clone()
-                        .get_message(message_component.channel_id, message_component.message.id)
-                        .await?
-                        .edit(ctx.http.clone(), EditMessage::new().content(content))
-                        .await?;
+
+                    for group_member in group_members {
+                        if group_member == message_component.user.id {
+                            continue;
+                        }
+                        group_member.direct_message(ctx, CreateMessage::new().content(format!("{} joined your party!", message_component.user.id.mention()))).await?;
+                    }
+                    message_component.message.delete(ctx).await?;
+                    message_component.create_response(ctx, serenity::CreateInteractionResponse::Message(CreateInteractionResponseMessage::new().content(format!("Joined party!")).ephemeral(true))).await?;
+                    return Ok(())
                 }
-                message_component.defer(ctx.http.clone()).await?;
+                if let Some(party_id) = message_component.data.custom_id.strip_prefix("reject_party_") {
+                    let group_members = {
+                        let group_data = data.group_data.lock().unwrap();
+                        let party = group_data.get(&serde_json::from_str::<Uuid>(party_id).unwrap());
+                        if let Some(party) = party {
+                            Some(party.players.clone())
+                        } else {
+                            None
+                        }
+                    };
+                    let Some(group_members) = group_members else {
+                        message_component.create_response(ctx, serenity::CreateInteractionResponse::Message(CreateInteractionResponseMessage::new().content(format!("Party no longer exists.")))).await?;
+                        return Ok(())
+                    };
+                    for group_member in group_members {
+                        if group_member == message_component.user.id {
+                            continue;
+                        }
+                        group_member.direct_message(ctx, CreateMessage::new().content(format!("{} rejected your party invite", message_component.user.id.mention()))).await?;
+                    }
+                    message_component.message.delete(ctx).await?;
+                    message_component.create_response(ctx, serenity::CreateInteractionResponse::Message(CreateInteractionResponseMessage::new().content(format!("Rejected party invite.")).ephemeral(true))).await?;
+                    return Ok(())
+                }
             }
         }
         serenity::FullEvent::Ratelimit { .. } => {
@@ -456,7 +533,13 @@ fn apply_match_results(data: &Data, result: MatchResult, players: &Vec<Vec<UserI
         .map(|(team_idx, team)| {
             (
                 team.iter()
-                    .map(|id| player_data.get(id).unwrap().rating.unwrap_or(config.default_player_data.rating))
+                    .map(|id| {
+                        player_data
+                            .get(id)
+                            .unwrap()
+                            .rating
+                            .unwrap_or(config.default_player_data.rating)
+                    })
                     .collect_vec(),
                 MultiTeamOutcome::new(match result {
                     MatchResult::Team(idx) if idx == team_idx as u32 => 1,
@@ -477,12 +560,14 @@ fn apply_match_results(data: &Data, result: MatchResult, players: &Vec<Vec<UserI
     );
     for (team_idx, team) in players.iter().enumerate() {
         for (player_idx, player) in team.iter().enumerate() {
-            player_data.get_mut(player).unwrap().rating = Some(result
-                .get(team_idx)
-                .unwrap()
-                .get(player_idx)
-                .unwrap()
-                .clone());
+            player_data.get_mut(player).unwrap().rating = Some(
+                result
+                    .get(team_idx)
+                    .unwrap()
+                    .get(player_idx)
+                    .unwrap()
+                    .clone(),
+            );
         }
     }
 }
@@ -511,11 +596,15 @@ async fn try_matchmaking(
     let queued_players = data.queued_players.lock().unwrap().clone();
     let members = greedy_matchmaking(
         data,
-        queued_players.iter().cloned().collect_vec(),
+        queued_players,
         guild_id,
         cache_http.clone(),
     )
     .await;
+    let Some(members) = members else {
+        let delay = 10.0;
+        return Ok(Some(delay));
+    };
     let cost_eval = evaluate_cost(data, &members, guild_id, cache_http.clone()).await;
     if cost_eval.0 > config.maximum_queue_cost {
         let delay = (cost_eval.0 - config.maximum_queue_cost) / total_player_count as f32 + 1.0;
@@ -644,7 +733,8 @@ async fn try_matchmaking(
                         cache_http.clone(),
                         EditMember::new().voice_channel(vc_channels.get(team_idx).unwrap().clone()),
                     )
-                    .await.ok();
+                    .await
+                    .ok();
                 data.queued_players.lock().unwrap().remove(player);
                 data.in_game_players.lock().unwrap().insert(player.clone());
                 data.player_data
@@ -678,7 +768,11 @@ async fn evaluate_cost(
     };
     let (team_size, game_categories, default_player_data) = {
         let config = data.configuration.lock().unwrap();
-        (config.team_size, config.game_categories.clone(), config.default_player_data.clone())
+        (
+            config.team_size,
+            config.game_categories.clone(),
+            config.default_player_data.clone(),
+        )
     };
     let team_mmrs = player_game_data.iter().map(|team| {
         team.iter()
@@ -693,7 +787,10 @@ async fn evaluate_cost(
     };
     let mmr_range = player_game_data
         .iter()
-        .flat_map(|team| team.iter().map(|player| player.rating.unwrap_or(default_player_data.rating).rating as f32))
+        .flat_map(|team| {
+            team.iter()
+                .map(|player| player.rating.unwrap_or(default_player_data.rating).rating as f32)
+        })
         .minmax();
     let mmr_range = match mmr_range {
         MinMaxResult::NoElements => 0.0,
@@ -769,14 +866,15 @@ async fn evaluate_cost(
             .flat_map(|team| team.iter())
             .zip(player_categories.iter())
             .map(|(player, player_categories)| {
-                let queue_config = player.player_queueing_config.derive(&default_player_data.player_queueing_config);
+                let queue_config = player
+                    .player_queueing_config
+                    .derive(&default_player_data.player_queueing_config);
                 let time_in_queue = (now - player.queue_enter_time.unwrap()).num_seconds();
                 let mut player_cost = 0.0;
                 player_cost += (mmr_differential - queue_config.acceptable_mmr_differential)
                     .max(0.0)
                     * queue_config.cost_per_avg_mmr_differential;
-                player_cost += (mmr_range - queue_config.acceptable_mmr_range)
-                    .max(0.0)
+                player_cost += (mmr_range - queue_config.acceptable_mmr_range).max(0.0)
                     * queue_config.cost_per_mmr_range;
                 player_cost += queue_config
                     .wrong_game_category_cost
@@ -796,45 +894,60 @@ async fn evaluate_cost(
 
 async fn greedy_matchmaking(
     data: &Data,
-    pool: Vec<UserId>,
+    pool: HashSet<UserId>,
     guild_id: GuildId,
     cache_http: Arc<Http>,
-) -> Vec<Vec<UserId>> {
+) -> Option<Vec<Vec<UserId>>> {
     let team_size = data.configuration.lock().unwrap().team_size;
     let team_count = data.configuration.lock().unwrap().team_count;
     let total_players = team_size * team_count;
     let mut players = pool.clone();
     let mut result = vec![vec![]; team_count as usize];
+    let mut player_count = 0;
 
-    for _ in 0..total_players {
+    while player_count < total_players {
         let mut min_cost = f32::MAX;
-        let mut best_player = usize::MAX;
-        let mut best_team = usize::MAX;
-        for possible_addition in 0..players.len() {
+        let mut best_next_result = vec![];
+        let mut best_added_players = vec![];
+        for possible_addition in players.iter() {
             for team_idx in 0..team_count as usize {
                 if result[team_idx].len() >= team_size as usize {
                     continue;
                 }
                 let mut result_copy = result.clone();
-                result_copy[team_idx].push(players[possible_addition].clone());
+                let mut added_players = vec![];
+                if let Some(party) = data.player_data.lock().unwrap().get(possible_addition).unwrap().party {
+                    for player in data.group_data.lock().unwrap().get(&party).unwrap().players.iter() {
+                        added_players.push(player.clone());
+                        result_copy[team_idx].push(player.clone());
+                    }
+                } else {
+                    added_players.push(possible_addition.clone());
+                    result_copy[team_idx].push(possible_addition.clone());
+                }
 
                 let cost = evaluate_cost(data, &result_copy, guild_id, cache_http.clone())
                     .await
                     .0;
                 if cost < min_cost {
                     min_cost = cost;
-                    best_player = possible_addition;
-                    best_team = team_idx;
+                    best_next_result = result_copy;
+                    best_added_players = added_players;
                 }
             }
         }
 
-        if best_player != usize::MAX && best_team != usize::MAX {
-            result[best_team].push(players.remove(best_player));
+        if min_cost == f32::MAX {
+            return None
+        }
+        result = best_next_result;
+        player_count += best_added_players.len() as u32;
+        for added_player in best_added_players {
+            players.remove(&added_player);
         }
     }
 
-    result
+    Some(result)
 }
 
 /// Displays or sets team size
@@ -1150,7 +1263,6 @@ async fn import_config(
 #[poise::command(slash_command, prefix_command)]
 async fn queue(ctx: Context<'_>) -> Result<(), Error> {
     if try_queue_player(ctx.data(), ctx.author().id) {
-        try_matchmaking(ctx.data(), ctx.serenity_context().http.clone(), ctx.guild_id().unwrap()).await?;
         let response = {
             let data_lock = ctx.data().queued_players.lock().unwrap();
             format!(
@@ -1160,10 +1272,20 @@ async fn queue(ctx: Context<'_>) -> Result<(), Error> {
         };
         ctx.send(CreateReply::default().content(response).ephemeral(true))
             .await?;
+        try_matchmaking(
+            ctx.data(),
+            ctx.serenity_context().http.clone(),
+            ctx.guild_id().unwrap(),
+        )
+        .await?;
         Ok(())
     } else {
-        ctx.send(CreateReply::default().content("Could not queue!").ephemeral(true))
-            .await?;
+        ctx.send(
+            CreateReply::default()
+                .content("Could not queue!")
+                .ephemeral(true),
+        )
+        .await?;
         Ok(())
     }
 }
@@ -1181,12 +1303,20 @@ async fn leave_queue(ctx: Context<'_>) -> Result<(), Error> {
         queued_players.remove(&ctx.author().id)
     };
     if removed {
-        ctx.send(CreateReply::default().content("You are no longer queueing!").ephemeral(true))
-            .await?;
+        ctx.send(
+            CreateReply::default()
+                .content("You are no longer queueing!")
+                .ephemeral(true),
+        )
+        .await?;
         Ok(())
     } else {
-        ctx.send(CreateReply::default().content("You weren't queued!").ephemeral(true))
-            .await?;
+        ctx.send(
+            CreateReply::default()
+                .content("You weren't queued!")
+                .ephemeral(true),
+        )
+        .await?;
         Ok(())
     }
 }
@@ -1199,6 +1329,21 @@ async fn list_queued(ctx: Context<'_>) -> Result<(), Error> {
         format!(
             "Queued players: {}",
             data_lock.iter().map(|c| c.mention()).join(", ")
+        )
+    };
+    ctx.send(CreateReply::default().content(response).ephemeral(true))
+        .await?;
+    Ok(())
+}
+
+/// Lists parties
+#[poise::command(slash_command, prefix_command)]
+async fn list_parties(ctx: Context<'_>) -> Result<(), Error> {
+    let response = {
+        let groups = ctx.data().group_data.lock().unwrap().clone();
+        format!(
+            "Groups: {}",
+            serde_json::to_string(&groups).unwrap()
         )
     };
     ctx.send(CreateReply::default().content(response).ephemeral(true))
@@ -1259,6 +1404,160 @@ pub async fn register(ctx: Context<'_>) -> Result<(), Error> {
     Ok(())
 }
 
+/// Invites player to party
+#[poise::command(slash_command, prefix_command, rename = "invite")]
+async fn party_invite(
+    ctx: Context<'_>,
+    #[description = "Invite player to party"] user: UserId,
+) -> Result<(), Error> {
+    let party = {
+        let mut user_data = ctx
+            .data()
+            .player_data
+            .lock()
+            .unwrap();
+        let user_data = user_data
+            .entry(ctx.author().id)
+            .or_insert(DerivedPlayerData::default());
+        if user_data.party.is_none() {
+            user_data.party = Some(Uuid::new_v4());
+        }
+        user_data.party.unwrap()
+    };
+    let user_party = ctx
+        .data()
+        .group_data
+        .lock()
+        .unwrap()
+        .entry(party)
+        .or_insert(QueueGroup {
+            players: HashSet::from([ctx.author().id]),
+        }).clone();
+    user.create_dm_channel(ctx)
+        .await?
+        .send_message(
+            ctx,
+            CreateMessage::default()
+                .content(format!(
+                    "{} invited you to their group.\nCurrent members: {}",
+                    ctx.author().mention(),
+                    user_party.players.iter().map(|p| format!("{}", p.mention())).join(", ")
+                ))
+                .button(CreateButton::new(format!(
+                    "join_party_{}",
+                    serde_json::to_string(&party).unwrap())
+                ).label("Join party").style(serenity::ButtonStyle::Success))
+                .button(CreateButton::new(format!(
+                    "reject_party_{}",
+                    serde_json::to_string(&party).unwrap())
+                ).label("Reject invite").style(serenity::ButtonStyle::Danger))
+        )
+        .await?;
+    ctx.send(CreateReply::default().content(format!("Invited {} to your party", user.mention())).ephemeral(true))
+        .await?;
+    Ok(())
+}
+
+async fn leave_party(data: &Data, user: &UserId, http: Arc<impl CacheHttp>, old_party: Uuid) -> Result<(), Error> {
+    let remaining_party_members = {
+        let mut group_data = data
+            .group_data
+            .lock()
+            .unwrap();
+        let user_party = group_data
+            .get_mut(&old_party)
+            .unwrap();
+        user_party.players.remove(user);
+        if user_party.players.len() == 0 {
+            group_data.remove(&old_party);
+            HashSet::new()
+        } else {
+            user_party.players.clone()
+        }
+    };
+    for remaining_party_member in remaining_party_members {
+        remaining_party_member.direct_message(http.clone(), CreateMessage::new().content(format!("{} left your group", user.mention()))).await?;
+    }
+    Ok(())
+}
+
+/// Leave party
+#[poise::command(slash_command, prefix_command, rename = "leave")]
+async fn party_leave(
+    ctx: Context<'_>
+) -> Result<(), Error> {
+    let old_party = {
+        let mut user_data = ctx
+            .data()
+            .player_data
+            .lock()
+            .unwrap();
+        let user_data = user_data
+            .entry(ctx.author().id)
+            .or_insert(DerivedPlayerData::default());
+        let old_party = user_data.party.clone();
+        user_data.party = None;
+        old_party
+    };
+    let Some(old_party) = old_party else {
+        ctx.send(CreateReply::default().content(format!("You weren't in a party")).ephemeral(true))
+            .await?;
+        return Ok(())
+    };
+    leave_party(ctx.data(), &ctx.author().id, Arc::new(ctx.http()), old_party).await?;
+    ctx.send(CreateReply::default().content(format!("Left party")).ephemeral(true))
+        .await?;
+    Ok(())
+}
+
+
+/// List party members
+#[poise::command(slash_command, prefix_command, rename = "list")]
+async fn party_list(
+    ctx: Context<'_>
+) -> Result<(), Error> {
+    let party = {
+        let mut user_data = ctx
+            .data()
+            .player_data
+            .lock()
+            .unwrap();
+        let user_data = user_data
+            .entry(ctx.author().id)
+            .or_insert(DerivedPlayerData::default());
+        user_data.party.clone()
+    };
+    let Some(party) = party else {
+        ctx.send(CreateReply::default().content(format!("You aren't in a party")).ephemeral(true))
+            .await?;
+        return Ok(())
+    };
+    let party_members = {
+        let mut group_data = ctx
+            .data()
+            .group_data
+            .lock()
+            .unwrap();
+        let user_party = group_data
+            .get_mut(&party)
+            .unwrap();
+        user_party.players.clone()
+    };
+    ctx.send(CreateReply::default().content(format!("Party members: {}", party_members.iter().map(|p| p.mention()).join(", "))).ephemeral(true))
+        .await?;
+    Ok(())
+}
+
+/// Displays your or another user's account creation date
+#[poise::command(
+    slash_command,
+    prefix_command,
+    subcommands("party_invite", "party_leave", "party_list")
+)]
+async fn party(_: Context<'_>) -> Result<(), Error> {
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
     let token = std::env::var("DISCORD_BOT_TOKEN").expect("missing DISCORD_BOT_TOKEN");
@@ -1279,6 +1578,8 @@ async fn main() {
                 leave_queue(),
                 list_queued(),
                 stats(),
+                party(),
+                list_parties(),
             ],
             ..Default::default()
         })
@@ -1299,6 +1600,7 @@ async fn main() {
                     player_data: Mutex::new(HashMap::new()),
                     match_data: Mutex::new(HashMap::new()),
                     in_game_players: Mutex::new(HashSet::new()),
+                    group_data: Mutex::new(HashMap::new()),
                 })
             })
         })
