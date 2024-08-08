@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use itertools::{Itertools, MinMaxResult};
 use poise::{
     serenity_prelude::{
@@ -38,10 +38,34 @@ struct Data {
     match_channels: Mutex<HashMap<ChannelId, u32>>,
     #[serde(default)]
     group_data: Mutex<HashMap<Uuid, QueueGroup>>,
+    #[serde(default)]
+    player_bans: Mutex<HashMap<UserId, BanData>>,
     queue_idx: Mutex<u32>,
 } // User data, which is stored and accessible in all command invocations
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type Context<'a> = poise::Context<'a, Arc<Data>, Error>;
+
+impl Default for Data {
+    fn default() -> Self {
+        Self {
+            configuration: Mutex::new(QueueConfiguration::default()),
+            queue_idx: Mutex::new(0),
+            queued_players: Mutex::new(HashSet::new()),
+            match_channels: Mutex::new(HashMap::new()),
+            player_data: Mutex::new(HashMap::new()),
+            match_data: Mutex::new(HashMap::new()),
+            in_game_players: Mutex::new(HashSet::new()),
+            group_data: Mutex::new(HashMap::new()),
+            player_bans: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct BanData {
+    end_time: Option<DateTime<Utc>>,
+    reason: Option<String>,
+}
 
 #[derive(Serialize, Deserialize, Clone)]
 struct QueueGroup {
@@ -212,19 +236,25 @@ impl Default for DerivedPlayerData {
     }
 }
 
-fn try_queue_player(data: Arc<Data>, user_id: UserId) -> bool {
+fn try_queue_player(data: Arc<Data>, user_id: UserId) -> Result<(), String> {
+    update_bans(data.clone());
     let mut player_data = data.player_data.lock().unwrap();
     let mut queued_players = data.queued_players.lock().unwrap();
-    let in_game_players = data.in_game_players.lock().unwrap();
-    if in_game_players.contains(&user_id) {
-        return false;
+    if let Some(player_ban) = data.player_bans.lock().unwrap().get(&user_id) {
+        if let Some(ban_reason) = player_ban.reason.clone() {
+            return Err(format!("Cannot queue because you're banned for {}", ban_reason));
+        }
+        return Err("Cannot queue because you're banned".to_string());
+    }
+    if data.in_game_players.lock().unwrap().contains(&user_id) {
+        return Err("Cannot queue while in game!".to_string());
     }
     player_data
         .entry(user_id)
         .or_insert(DerivedPlayerData::default())
         .queue_enter_time = Some(chrono::offset::Utc::now());
     queued_players.insert(user_id);
-    true
+    Ok(())
 }
 
 async fn handler(
@@ -266,8 +296,13 @@ async fn handler(
                 };
 
                 if try_queueing {
-                    if try_queue_player(data.clone(), new.user_id) {
-                        player_added_to_queue = true;
+                    match try_queue_player(data.clone(), new.user_id) {
+                        Ok(()) => {
+                            player_added_to_queue = true;
+                        }
+                        Err(reason) => {
+                            new.user_id.direct_message(ctx, CreateMessage::new().content(reason)).await?;
+                        }
                     }
                 }
             }
@@ -286,7 +321,6 @@ async fn handler(
                     let config = data.configuration.lock().unwrap();
                     config.team_count * config.team_size / 2 + 1
                 };
-                println!("required_votes: {}", required_votes);
                 let match_number = {
                     let match_channels = data.match_channels.lock().unwrap();
                     match_channels.get(&message_component.channel_id).cloned()
@@ -1327,31 +1361,34 @@ async fn import_config(
 /// Join queue
 #[poise::command(slash_command, prefix_command)]
 async fn queue(ctx: Context<'_>) -> Result<(), Error> {
-    if try_queue_player(ctx.data().clone(), ctx.author().id) {
-        let response = {
-            let data_lock = ctx.data().queued_players.lock().unwrap();
-            format!(
-                "Queued players: {}",
-                data_lock.iter().map(|c| c.mention()).join(", ")
+    match try_queue_player(ctx.data().clone(), ctx.author().id) {
+        Ok(()) => {
+            let response = {
+                let data_lock = ctx.data().queued_players.lock().unwrap();
+                format!(
+                    "Queued players: {}",
+                    data_lock.iter().map(|c| c.mention()).join(", ")
+                )
+            };
+            ctx.send(CreateReply::default().content(response).ephemeral(true))
+                .await?;
+            try_matchmaking(
+                ctx.data().clone(),
+                ctx.serenity_context().http.clone(),
+                ctx.guild_id().unwrap(),
             )
-        };
-        ctx.send(CreateReply::default().content(response).ephemeral(true))
             .await?;
-        try_matchmaking(
-            ctx.data().clone(),
-            ctx.serenity_context().http.clone(),
-            ctx.guild_id().unwrap(),
-        )
-        .await?;
-        Ok(())
-    } else {
-        ctx.send(
-            CreateReply::default()
-                .content("Could not queue!")
-                .ephemeral(true),
-        )
-        .await?;
-        Ok(())
+            Ok(())
+        } 
+        Err(reason) => {
+            ctx.send(
+                CreateReply::default()
+                    .content(reason)
+                    .ephemeral(true),
+            )
+            .await?;
+            Ok(())
+        }
     }
 }
 
@@ -1641,6 +1678,122 @@ async fn leaderboard(
     Ok(())
 }
 
+fn update_bans(data: Arc<Data>) {
+    let now = chrono::offset::Utc::now();
+    data.player_bans.lock().unwrap().retain(|_, BanData { end_time, reason: _ }| {
+        if let Some(end_time) = end_time {
+            *end_time > now
+        } else {
+            true
+        }
+    })
+}
+
+/// Bans a player from queueing
+#[poise::command(slash_command, prefix_command, rename = "ban")]
+async fn ban_player(
+    ctx: Context<'_>,
+    #[description = "Player"]
+    player: UserId,
+    #[description = "Reason"]
+    reason: Option<String>,
+    #[description = "Days"]
+    days: Option<u32>,
+) -> Result<(), Error> {
+    update_bans(ctx.data().clone());
+    let end_time = days.map(|days| {
+        chrono::offset::Utc::now() + TimeDelta::new(60*60*24*days as i64,0).unwrap()
+    });
+    let ban_data: BanData = BanData {
+        end_time,
+        reason,
+    };
+    let was_previously_banned = ctx.data().player_bans.lock().unwrap().insert(player, ban_data).is_some();
+
+    let response = if was_previously_banned {
+        format!("{}'s ban was updated.", player.mention())
+    } else {
+        format!("{} banned", player.mention())
+    };
+    ctx.send(CreateReply::default().content(response).ephemeral(true))
+        .await?;
+    Ok(())
+}
+
+/// Unbans a player from queueing
+#[poise::command(slash_command, prefix_command, rename = "unban")]
+async fn unban_player(
+    ctx: Context<'_>,
+    #[description = "Player"]
+    player: UserId,
+) -> Result<(), Error> {
+    update_bans(ctx.data().clone());
+    let was_banned = ctx.data().player_bans.lock().unwrap().remove(&player).is_some();
+
+    let response = if was_banned {
+        format!("Unbanned {}.", player.mention())
+    } else {
+        format!("{} was not banned.", player.mention())
+    };
+    ctx.send(CreateReply::default().content(response).ephemeral(true))
+        .await?;
+    Ok(())
+}
+
+/// Lists players banned from queueing
+#[poise::command(slash_command, prefix_command)]
+async fn list_bans(
+    ctx: Context<'_>,
+) -> Result<(), Error> {
+    update_bans(ctx.data().clone());
+    let ban_data = ctx.data().player_bans.lock().unwrap().iter().map(|(id, ban_data)| {
+        let mut ban = format!("{} banned", id.mention());
+        if let Some(reason) = ban_data.reason.clone() {
+            ban += format!(" for {}", reason).as_str();
+        }
+        if let Some(end_time) = ban_data.end_time {
+            ban += format!(" until <t:{}:f>", end_time.timestamp()).as_str();
+        }
+        ban
+    }).join("\n");
+
+    let response = format!("# Player Bans\n{}", ban_data);
+    ctx.send(CreateReply::default().content(response).ephemeral(true))
+        .await?;
+    Ok(())
+}
+
+/// Gets player info
+#[poise::command(slash_command, prefix_command)]
+async fn get_player(
+    ctx: Context<'_>,
+    #[description = "Player"]
+    player: UserId,
+) -> Result<(), Error> {
+    let player_data = ctx.data().player_data.lock().unwrap().get(&player).unwrap_or(&DerivedPlayerData::default()).clone();
+
+    let response = format!("{}'s data```json\n{}\n```", player.mention(), serde_json::to_string_pretty(&player_data).unwrap());
+    ctx.send(CreateReply::default().content(response).ephemeral(true))
+        .await?;
+    Ok(())
+}
+
+/// Manage a user
+#[poise::command(
+    slash_command,
+    prefix_command,
+    default_member_permissions = "BAN_MEMBERS",
+    subcommands(
+        "ban_player",
+        "unban_player",
+        "list_bans",
+        "get_player"
+    )
+)]
+async fn manage_player(_: Context<'_>) -> Result<(), Error> {
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
     let token = std::env::var("DISCORD_BOT_TOKEN").expect("missing DISCORD_BOT_TOKEN");
@@ -1664,6 +1817,7 @@ async fn main() {
                 party(),
                 list_parties(),
                 leaderboard(),
+                manage_player(),
             ],
             ..Default::default()
         })
@@ -1676,16 +1830,7 @@ async fn main() {
                 if let Some(data) = config_data {
                     return Ok(data);
                 }
-                Ok(Arc::new(Data {
-                    configuration: Mutex::new(QueueConfiguration::default()),
-                    queue_idx: Mutex::new(0),
-                    queued_players: Mutex::new(HashSet::new()),
-                    match_channels: Mutex::new(HashMap::new()),
-                    player_data: Mutex::new(HashMap::new()),
-                    match_data: Mutex::new(HashMap::new()),
-                    in_game_players: Mutex::new(HashSet::new()),
-                    group_data: Mutex::new(HashMap::new()),
-                }))
+                Ok(Arc::new(Data::default()))
             })
         })
         .build();
