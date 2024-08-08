@@ -11,7 +11,9 @@ use chrono::{DateTime, TimeDelta, Utc};
 use itertools::{Itertools, MinMaxResult};
 use poise::{
     serenity_prelude::{
-        self as serenity, futures::future, Builder, CacheHttp, ChannelId, ChannelType, CreateAllowedMentions, CreateButton, CreateChannel, CreateInteractionResponseMessage, CreateMessage, EditMember, EditMessage, GuildId, Http, Mentionable, RoleId, UserId
+        self as serenity, futures::future, Builder, CacheHttp, ChannelId, ChannelType,
+        CreateAllowedMentions, CreateButton, CreateChannel, CreateInteractionResponseMessage,
+        CreateMessage, EditMember, EditMessage, GuildId, Http, Mentionable, RoleId, UserId,
     },
     CreateReply,
 };
@@ -217,6 +219,7 @@ struct DerivedPlayerData {
     queue_enter_time: Option<DateTime<Utc>>,
     party: Option<Uuid>,
     player_queueing_config: DerivedPlayerQueueingConfig,
+    game_categories: HashMap<String, Vec<usize>>,
 }
 
 impl Default for DerivedPlayerData {
@@ -232,17 +235,57 @@ impl Default for DerivedPlayerData {
                 acceptable_mmr_range: None,
                 wrong_game_category_cost: None,
             },
+            game_categories: HashMap::new(),
         }
     }
 }
 
-fn try_queue_player(data: Arc<Data>, user_id: UserId) -> Result<(), String> {
+async fn try_queue_player(
+    data: Arc<Data>,
+    user_id: UserId,
+    http: impl CacheHttp + Clone,
+    guild_id: GuildId,
+) -> Result<(), String> {
     update_bans(data.clone());
+    let game_categories = {
+        let config = data.configuration.lock().unwrap();
+        config.game_categories.clone()
+    };
+    let user = user_id.to_user(http.clone()).await.unwrap();
+
+    let player_categories: HashMap<String, Vec<usize>> = future::join_all(
+        game_categories
+            .iter()
+            .map(|(category_name, category_roles)| async {
+                (
+                    category_name.clone(),
+                    future::join_all(category_roles.iter().map(|role| async {
+                        user.has_role(http.clone(), guild_id, *role).await.unwrap()
+                    }))
+                    .await
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, has_role)| **has_role)
+                    .map(|(idx, _)| idx)
+                    .collect_vec(),
+                )
+            }),
+    )
+    .await
+    .into_iter()
+    .collect();
     let mut player_data = data.player_data.lock().unwrap();
+    player_data
+        .entry(user_id)
+        .or_insert(DerivedPlayerData::default())
+        .game_categories = player_categories;
     let mut queued_players = data.queued_players.lock().unwrap();
     if let Some(player_ban) = data.player_bans.lock().unwrap().get(&user_id) {
         if let Some(ban_reason) = player_ban.reason.clone() {
-            return Err(format!("Cannot queue because you're banned for {}", ban_reason));
+            return Err(format!(
+                "Cannot queue because you're banned for {}",
+                ban_reason
+            ));
         }
         return Err("Cannot queue because you're banned".to_string());
     }
@@ -296,12 +339,21 @@ async fn handler(
                 };
 
                 if try_queueing {
-                    match try_queue_player(data.clone(), new.user_id) {
+                    match try_queue_player(
+                        data.clone(),
+                        new.user_id,
+                        ctx.http.clone(),
+                        new.guild_id.unwrap(),
+                    )
+                    .await
+                    {
                         Ok(()) => {
                             player_added_to_queue = true;
                         }
                         Err(reason) => {
-                            new.user_id.direct_message(ctx, CreateMessage::new().content(reason)).await?;
+                            new.user_id
+                                .direct_message(ctx, CreateMessage::new().content(reason))
+                                .await?;
                         }
                     }
                 }
@@ -337,7 +389,8 @@ async fn handler(
                                 .insert(message_component.user.id, map.to_string());
                             vote_type = VoteType::Map;
                         }
-                        if let Some(team_data) = message_component.data.custom_id.strip_prefix("team_")
+                        if let Some(team_data) =
+                            message_component.data.custom_id.strip_prefix("team_")
                         {
                             let team_number: u32 = team_data.parse()?;
                             match_data
@@ -373,7 +426,8 @@ async fn handler(
                         let mut content = {
                             let match_data = data.match_data.lock().unwrap();
                             let mut votes: HashMap<String, u32> = HashMap::new();
-                            for (_user, vote) in match_data.get(&match_number).unwrap().map_votes.iter()
+                            for (_user, vote) in
+                                match_data.get(&match_number).unwrap().map_votes.iter()
                             {
                                 let current_votes = votes.get(vote).unwrap_or(&0);
                                 votes.insert(vote.clone(), current_votes + 1);
@@ -390,7 +444,10 @@ async fn handler(
                         if let Some(vote_result) = vote_result {
                             ctx.http
                                 .clone()
-                                .get_message(message_component.channel_id, message_component.message.id)
+                                .get_message(
+                                    message_component.channel_id,
+                                    message_component.message.id,
+                                )
                                 .await?
                                 .edit(ctx.http.clone(), EditMessage::new().components(vec![]))
                                 .await?;
@@ -433,7 +490,12 @@ async fn handler(
                             let (channels, players) = {
                                 let mut match_data = data.match_data.lock().unwrap();
                                 let match_data = match_data.remove(&match_number).unwrap();
-                                log_match_results(data.clone(), &vote_result, &match_data, match_number);
+                                log_match_results(
+                                    data.clone(),
+                                    &vote_result,
+                                    &match_data,
+                                    match_number,
+                                );
                                 (match_data.channels, match_data.members)
                             };
 
@@ -468,7 +530,8 @@ async fn handler(
                     }
                     message_component.defer(ctx.http.clone()).await?;
                 }
-                if let Some(party_id) = message_component.data.custom_id.strip_prefix("join_party_") {
+                if let Some(party_id) = message_component.data.custom_id.strip_prefix("join_party_")
+                {
                     let party_uuid = serde_json::from_str::<Uuid>(party_id).unwrap();
                     let group_members = {
                         let mut group_data = data.group_data.lock().unwrap();
@@ -481,19 +544,35 @@ async fn handler(
                         }
                     };
                     let Some(group_members) = group_members else {
-                        message_component.create_response(ctx, serenity::CreateInteractionResponse::Message(CreateInteractionResponseMessage::new().content(format!("Party no longer exists.")))).await?;
-                        return Ok(())
+                        message_component
+                            .create_response(
+                                ctx,
+                                serenity::CreateInteractionResponse::Message(
+                                    CreateInteractionResponseMessage::new()
+                                        .content(format!("Party no longer exists.")),
+                                ),
+                            )
+                            .await?;
+                        return Ok(());
                     };
                     let old_party = {
                         let mut player_data = data.player_data.lock().unwrap();
-                        let player_data = player_data.entry(message_component.user.id).or_insert(DerivedPlayerData::default());
+                        let player_data = player_data
+                            .entry(message_component.user.id)
+                            .or_insert(DerivedPlayerData::default());
                         let old_party = player_data.party;
                         player_data.party = Some(party_uuid);
                         old_party
                     };
                     if let Some(old_party) = old_party {
                         if old_party != party_uuid {
-                            leave_party(data, &message_component.user.id, Arc::new(ctx.http()), old_party).await?;
+                            leave_party(
+                                data,
+                                &message_component.user.id,
+                                Arc::new(ctx.http()),
+                                old_party,
+                            )
+                            .await?;
                         }
                     }
 
@@ -501,16 +580,38 @@ async fn handler(
                         if group_member == message_component.user.id {
                             continue;
                         }
-                        group_member.direct_message(ctx, CreateMessage::new().content(format!("{} joined your party!", message_component.user.id.mention()))).await?;
+                        group_member
+                            .direct_message(
+                                ctx,
+                                CreateMessage::new().content(format!(
+                                    "{} joined your party!",
+                                    message_component.user.id.mention()
+                                )),
+                            )
+                            .await?;
                     }
                     message_component.message.delete(ctx).await?;
-                    message_component.create_response(ctx, serenity::CreateInteractionResponse::Message(CreateInteractionResponseMessage::new().content(format!("Joined party!")).ephemeral(true))).await?;
-                    return Ok(())
+                    message_component
+                        .create_response(
+                            ctx,
+                            serenity::CreateInteractionResponse::Message(
+                                CreateInteractionResponseMessage::new()
+                                    .content(format!("Joined party!"))
+                                    .ephemeral(true),
+                            ),
+                        )
+                        .await?;
+                    return Ok(());
                 }
-                if let Some(party_id) = message_component.data.custom_id.strip_prefix("reject_party_") {
+                if let Some(party_id) = message_component
+                    .data
+                    .custom_id
+                    .strip_prefix("reject_party_")
+                {
                     let group_members = {
                         let group_data = data.group_data.lock().unwrap();
-                        let party = group_data.get(&serde_json::from_str::<Uuid>(party_id).unwrap());
+                        let party =
+                            group_data.get(&serde_json::from_str::<Uuid>(party_id).unwrap());
                         if let Some(party) = party {
                             Some(party.players.clone())
                         } else {
@@ -518,18 +619,43 @@ async fn handler(
                         }
                     };
                     let Some(group_members) = group_members else {
-                        message_component.create_response(ctx, serenity::CreateInteractionResponse::Message(CreateInteractionResponseMessage::new().content(format!("Party no longer exists.")))).await?;
-                        return Ok(())
+                        message_component
+                            .create_response(
+                                ctx,
+                                serenity::CreateInteractionResponse::Message(
+                                    CreateInteractionResponseMessage::new()
+                                        .content(format!("Party no longer exists.")),
+                                ),
+                            )
+                            .await?;
+                        return Ok(());
                     };
                     for group_member in group_members {
                         if group_member == message_component.user.id {
                             continue;
                         }
-                        group_member.direct_message(ctx, CreateMessage::new().content(format!("{} rejected your party invite", message_component.user.id.mention()))).await?;
+                        group_member
+                            .direct_message(
+                                ctx,
+                                CreateMessage::new().content(format!(
+                                    "{} rejected your party invite",
+                                    message_component.user.id.mention()
+                                )),
+                            )
+                            .await?;
                     }
                     message_component.message.delete(ctx).await?;
-                    message_component.create_response(ctx, serenity::CreateInteractionResponse::Message(CreateInteractionResponseMessage::new().content(format!("Rejected party invite.")).ephemeral(true))).await?;
-                    return Ok(())
+                    message_component
+                        .create_response(
+                            ctx,
+                            serenity::CreateInteractionResponse::Message(
+                                CreateInteractionResponseMessage::new()
+                                    .content(format!("Rejected party invite."))
+                                    .ephemeral(true),
+                            ),
+                        )
+                        .await?;
+                    return Ok(());
                 }
             }
         }
@@ -631,19 +757,17 @@ async fn try_matchmaking(
         return Err(Error::from("No category"));
     };
     let queued_players = data.queued_players.lock().unwrap().clone();
-    let members = greedy_matchmaking(
-        data.clone(),
-        queued_players,
-        guild_id,
-        cache_http.clone(),
-    )
-    .await;
+    println!("Trying matchmaking");
+    let members =
+        greedy_matchmaking(data.clone(), queued_players).await;
     let Some(members) = members else {
+        println!("Could not find valid matchmaking");
         let delay = 10.0;
         return Ok(Some(delay));
     };
-    let cost_eval = evaluate_cost(data.clone(), &members, guild_id, cache_http.clone()).await;
+    let cost_eval = evaluate_cost(data.clone(), &members).await;
     if cost_eval.0 > config.maximum_queue_cost {
+        println!("Best option has cost of {}", cost_eval.0);
         let delay = (cost_eval.0 - config.maximum_queue_cost) / total_player_count as f32 + 1.0;
         return Ok(Some(delay));
     }
@@ -698,7 +822,11 @@ async fn try_matchmaking(
     if config.map_vote_count > 0 {
         let mut map_vote_message_content = "# Map Vote".to_string();
         if config.map_vote_time > 0 {
-            map_vote_message_content += format!("\nEnds <t:{}:R>", std::time::UNIX_EPOCH.elapsed().unwrap().as_secs()+config.map_vote_time as u64).as_str();
+            map_vote_message_content += format!(
+                "\nEnds <t:{}:R>",
+                std::time::UNIX_EPOCH.elapsed().unwrap().as_secs() + config.map_vote_time as u64
+            )
+            .as_str();
         }
         let mut map_vote_message = CreateMessage::default().content(map_vote_message_content);
         let mut map_pool = config.maps.clone();
@@ -726,22 +854,31 @@ async fn try_matchmaking(
                     let match_data = data.match_data.lock().unwrap();
                     let match_number = new_idx;
                     let mut votes: HashMap<String, u32> = HashMap::new();
-                    for (_user, vote) in match_data.get(&match_number).unwrap().map_votes.iter()
-                    {
+                    let Some(match_data) = match_data.get(&match_number) else {
+                        return;
+                    };
+                    for (_user, vote) in match_data.map_votes.iter() {
                         let current_votes = votes.get(vote).unwrap_or(&0);
                         votes.insert(vote.clone(), current_votes + 1);
                     }
-                    votes.iter().max_by_key(|(_category, vote_count)| *vote_count).map(|(category, vote_count)| (category.clone(), vote_count.clone())).unwrap().clone()
+                    votes
+                        .iter()
+                        .max_by_key(|(_category, vote_count)| *vote_count)
+                        .map(|(category, vote_count)| (category.clone(), vote_count.clone()))
+                        .unwrap()
+                        .clone()
                 };
-                
+
                 map_message
                     .edit(ctx1.clone(), EditMessage::new().components(vec![]))
-                    .await.ok();
+                    .await
+                    .ok();
                 let content = format!("# Map: {}", vote_result.0);
-                
+
                 map_message
                     .edit(ctx1.clone(), EditMessage::new().content(content))
-                    .await.ok();
+                    .await
+                    .ok();
             });
         }
     } else if config.maps.len() > 0 {
@@ -823,8 +960,6 @@ async fn try_matchmaking(
 async fn evaluate_cost(
     data: Arc<Data>,
     players: &Vec<Vec<UserId>>,
-    guild_id: GuildId,
-    cache_http: Arc<Http>,
 ) -> (f32, HashMap<String, usize>) {
     let player_game_data = {
         let player_data = data.player_data.lock().unwrap();
@@ -868,41 +1003,11 @@ async fn evaluate_cost(
         MinMaxResult::OneElement(_) => 0.0,
         MinMaxResult::MinMax(min, max) => max - min,
     };
-    let users = future::join_all(
-        players
-            .iter()
-            .flat_map(|team| team.iter())
-            .map(|player| async { cache_http.get_user(*player).await.unwrap() }),
-    )
-    .await;
 
-    let player_categories: Vec<HashMap<String, Vec<usize>>> =
-        future::join_all(users.iter().map(|user| async {
-            future::join_all(
-                game_categories
-                    .iter()
-                    .map(|(category_name, category_roles)| async {
-                        (
-                            category_name.clone(),
-                            future::join_all(category_roles.iter().map(|role| async {
-                                user.has_role(cache_http.clone(), guild_id, *role)
-                                    .await
-                                    .unwrap()
-                            }))
-                            .await
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, has_role)| **has_role)
-                            .map(|(idx, _)| idx)
-                            .collect_vec(),
-                        )
-                    }),
-            )
-            .await
-            .into_iter()
-            .collect()
-        }))
-        .await;
+    let player_categories: Vec<HashMap<String, Vec<usize>>> = player_game_data
+        .iter()
+        .flat_map(|team| team.iter().map(|player| player.game_categories.clone()))
+        .collect_vec();
     let game_categories: HashMap<String, usize> = game_categories
         .iter()
         .map(|(category_name, roles)| {
@@ -966,8 +1071,6 @@ async fn evaluate_cost(
 async fn greedy_matchmaking(
     data: Arc<Data>,
     pool: HashSet<UserId>,
-    guild_id: GuildId,
-    cache_http: Arc<Http>,
 ) -> Option<Vec<Vec<UserId>>> {
     let team_size = data.configuration.lock().unwrap().team_size;
     let team_count = data.configuration.lock().unwrap().team_count;
@@ -977,6 +1080,7 @@ async fn greedy_matchmaking(
     let mut player_count = 0;
 
     while player_count < total_players {
+        println!("Player count: {}", player_count);
         let mut min_cost = f32::MAX;
         let mut best_next_result = vec![];
         let mut best_added_players = vec![];
@@ -987,8 +1091,23 @@ async fn greedy_matchmaking(
                 }
                 let mut result_copy = result.clone();
                 let mut added_players = vec![];
-                if let Some(party) = data.player_data.lock().unwrap().get(possible_addition).unwrap().party {
-                    for player in data.group_data.lock().unwrap().get(&party).unwrap().players.iter() {
+                if let Some(party) = data
+                    .player_data
+                    .lock()
+                    .unwrap()
+                    .get(possible_addition)
+                    .unwrap()
+                    .party
+                {
+                    for player in data
+                        .group_data
+                        .lock()
+                        .unwrap()
+                        .get(&party)
+                        .unwrap()
+                        .players
+                        .iter()
+                    {
                         added_players.push(player.clone());
                         result_copy[team_idx].push(player.clone());
                     }
@@ -997,7 +1116,7 @@ async fn greedy_matchmaking(
                     result_copy[team_idx].push(possible_addition.clone());
                 }
 
-                let cost = evaluate_cost(data.clone(), &result_copy, guild_id, cache_http.clone())
+                let cost = evaluate_cost(data.clone(), &result_copy)
                     .await
                     .0;
                 if cost < min_cost {
@@ -1009,7 +1128,7 @@ async fn greedy_matchmaking(
         }
 
         if min_cost == f32::MAX {
-            return None
+            return None;
         }
         result = best_next_result;
         player_count += best_added_players.len() as u32;
@@ -1361,7 +1480,14 @@ async fn import_config(
 /// Join queue
 #[poise::command(slash_command, prefix_command)]
 async fn queue(ctx: Context<'_>) -> Result<(), Error> {
-    match try_queue_player(ctx.data().clone(), ctx.author().id) {
+    match try_queue_player(
+        ctx.data().clone(),
+        ctx.author().id,
+        ctx.http(),
+        ctx.guild_id().unwrap(),
+    )
+    .await
+    {
         Ok(()) => {
             let response = {
                 let data_lock = ctx.data().queued_players.lock().unwrap();
@@ -1379,14 +1505,10 @@ async fn queue(ctx: Context<'_>) -> Result<(), Error> {
             )
             .await?;
             Ok(())
-        } 
+        }
         Err(reason) => {
-            ctx.send(
-                CreateReply::default()
-                    .content(reason)
-                    .ephemeral(true),
-            )
-            .await?;
+            ctx.send(CreateReply::default().content(reason).ephemeral(true))
+                .await?;
             Ok(())
         }
     }
@@ -1443,10 +1565,7 @@ async fn list_queued(ctx: Context<'_>) -> Result<(), Error> {
 async fn list_parties(ctx: Context<'_>) -> Result<(), Error> {
     let response = {
         let groups = ctx.data().group_data.lock().unwrap().clone();
-        format!(
-            "Groups: {}",
-            serde_json::to_string(&groups).unwrap()
-        )
+        format!("Groups: {}", serde_json::to_string(&groups).unwrap())
     };
     ctx.send(CreateReply::default().content(response).ephemeral(true))
         .await?;
@@ -1514,11 +1633,7 @@ async fn party_invite(
     #[description = "Invite player to party"] user: UserId,
 ) -> Result<(), Error> {
     let party = {
-        let mut user_data = ctx
-            .data()
-            .player_data
-            .lock()
-            .unwrap();
+        let mut user_data = ctx.data().player_data.lock().unwrap();
         let user_data = user_data
             .entry(ctx.author().id)
             .or_insert(DerivedPlayerData::default());
@@ -1535,7 +1650,8 @@ async fn party_invite(
         .entry(party)
         .or_insert(QueueGroup {
             players: HashSet::from([ctx.author().id]),
-        }).clone();
+        })
+        .clone();
     user.create_dm_channel(ctx)
         .await?
         .send_message(
@@ -1544,32 +1660,48 @@ async fn party_invite(
                 .content(format!(
                     "{} invited you to their group.\nCurrent members: {}",
                     ctx.author().mention(),
-                    user_party.players.iter().map(|p| format!("{}", p.mention())).join(", ")
+                    user_party
+                        .players
+                        .iter()
+                        .map(|p| format!("{}", p.mention()))
+                        .join(", ")
                 ))
-                .button(CreateButton::new(format!(
-                    "join_party_{}",
-                    serde_json::to_string(&party).unwrap())
-                ).label("Join party").style(serenity::ButtonStyle::Success))
-                .button(CreateButton::new(format!(
-                    "reject_party_{}",
-                    serde_json::to_string(&party).unwrap())
-                ).label("Reject invite").style(serenity::ButtonStyle::Danger))
+                .button(
+                    CreateButton::new(format!(
+                        "join_party_{}",
+                        serde_json::to_string(&party).unwrap()
+                    ))
+                    .label("Join party")
+                    .style(serenity::ButtonStyle::Success),
+                )
+                .button(
+                    CreateButton::new(format!(
+                        "reject_party_{}",
+                        serde_json::to_string(&party).unwrap()
+                    ))
+                    .label("Reject invite")
+                    .style(serenity::ButtonStyle::Danger),
+                ),
         )
         .await?;
-    ctx.send(CreateReply::default().content(format!("Invited {} to your party", user.mention())).ephemeral(true))
-        .await?;
+    ctx.send(
+        CreateReply::default()
+            .content(format!("Invited {} to your party", user.mention()))
+            .ephemeral(true),
+    )
+    .await?;
     Ok(())
 }
 
-async fn leave_party(data: Arc<Data>, user: &UserId, http: Arc<impl CacheHttp>, old_party: Uuid) -> Result<(), Error> {
+async fn leave_party(
+    data: Arc<Data>,
+    user: &UserId,
+    http: Arc<impl CacheHttp>,
+    old_party: Uuid,
+) -> Result<(), Error> {
     let remaining_party_members = {
-        let mut group_data = data
-            .group_data
-            .lock()
-            .unwrap();
-        let user_party = group_data
-            .get_mut(&old_party)
-            .unwrap();
+        let mut group_data = data.group_data.lock().unwrap();
+        let user_party = group_data.get_mut(&old_party).unwrap();
         user_party.players.remove(user);
         if user_party.players.len() == 0 {
             group_data.remove(&old_party);
@@ -1579,22 +1711,21 @@ async fn leave_party(data: Arc<Data>, user: &UserId, http: Arc<impl CacheHttp>, 
         }
     };
     for remaining_party_member in remaining_party_members {
-        remaining_party_member.direct_message(http.clone(), CreateMessage::new().content(format!("{} left your group", user.mention()))).await?;
+        remaining_party_member
+            .direct_message(
+                http.clone(),
+                CreateMessage::new().content(format!("{} left your group", user.mention())),
+            )
+            .await?;
     }
     Ok(())
 }
 
 /// Leave party
 #[poise::command(slash_command, prefix_command, rename = "leave")]
-async fn party_leave(
-    ctx: Context<'_>
-) -> Result<(), Error> {
+async fn party_leave(ctx: Context<'_>) -> Result<(), Error> {
     let old_party = {
-        let mut user_data = ctx
-            .data()
-            .player_data
-            .lock()
-            .unwrap();
+        let mut user_data = ctx.data().player_data.lock().unwrap();
         let user_data = user_data
             .entry(ctx.author().id)
             .or_insert(DerivedPlayerData::default());
@@ -1603,51 +1734,63 @@ async fn party_leave(
         old_party
     };
     let Some(old_party) = old_party else {
-        ctx.send(CreateReply::default().content(format!("You weren't in a party")).ephemeral(true))
-            .await?;
-        return Ok(())
-    };
-    leave_party(ctx.data().clone(), &ctx.author().id, Arc::new(ctx.http()), old_party).await?;
-    ctx.send(CreateReply::default().content(format!("Left party")).ephemeral(true))
+        ctx.send(
+            CreateReply::default()
+                .content(format!("You weren't in a party"))
+                .ephemeral(true),
+        )
         .await?;
+        return Ok(());
+    };
+    leave_party(
+        ctx.data().clone(),
+        &ctx.author().id,
+        Arc::new(ctx.http()),
+        old_party,
+    )
+    .await?;
+    ctx.send(
+        CreateReply::default()
+            .content(format!("Left party"))
+            .ephemeral(true),
+    )
+    .await?;
     Ok(())
 }
 
-
 /// List party members
 #[poise::command(slash_command, prefix_command, rename = "list")]
-async fn party_list(
-    ctx: Context<'_>
-) -> Result<(), Error> {
+async fn party_list(ctx: Context<'_>) -> Result<(), Error> {
     let party = {
-        let mut user_data = ctx
-            .data()
-            .player_data
-            .lock()
-            .unwrap();
+        let mut user_data = ctx.data().player_data.lock().unwrap();
         let user_data = user_data
             .entry(ctx.author().id)
             .or_insert(DerivedPlayerData::default());
         user_data.party.clone()
     };
     let Some(party) = party else {
-        ctx.send(CreateReply::default().content(format!("You aren't in a party")).ephemeral(true))
-            .await?;
-        return Ok(())
+        ctx.send(
+            CreateReply::default()
+                .content(format!("You aren't in a party"))
+                .ephemeral(true),
+        )
+        .await?;
+        return Ok(());
     };
     let party_members = {
-        let mut group_data = ctx
-            .data()
-            .group_data
-            .lock()
-            .unwrap();
-        let user_party = group_data
-            .get_mut(&party)
-            .unwrap();
+        let mut group_data = ctx.data().group_data.lock().unwrap();
+        let user_party = group_data.get_mut(&party).unwrap();
         user_party.players.clone()
     };
-    ctx.send(CreateReply::default().content(format!("Party members: {}", party_members.iter().map(|p| p.mention()).join(", "))).ephemeral(true))
-        .await?;
+    ctx.send(
+        CreateReply::default()
+            .content(format!(
+                "Party members: {}",
+                party_members.iter().map(|p| p.mention()).join(", ")
+            ))
+            .ephemeral(true),
+    )
+    .await?;
     Ok(())
 }
 
@@ -1663,52 +1806,74 @@ async fn party(_: Context<'_>) -> Result<(), Error> {
 
 /// Displays a leaderboard
 #[poise::command(slash_command, prefix_command)]
-async fn leaderboard(
-    ctx: Context<'_>
-) -> Result<(), Error> {
-    let default_rating = ctx.data().configuration.lock().unwrap().default_player_data.rating;
-    let mut player_data = ctx.data().player_data.lock().unwrap().iter().map(|(id, data)| (id.mention(), data.rating.unwrap_or(default_rating).rating)).collect_vec();
+async fn leaderboard(ctx: Context<'_>) -> Result<(), Error> {
+    let default_rating = ctx
+        .data()
+        .configuration
+        .lock()
+        .unwrap()
+        .default_player_data
+        .rating;
+    let mut player_data = ctx
+        .data()
+        .player_data
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(id, data)| (id.mention(), data.rating.unwrap_or(default_rating).rating))
+        .collect_vec();
     player_data.sort_by(|(_, rating_a), (_, rating_b)| rating_b.partial_cmp(rating_a).unwrap());
     let mut response = "## Leaderboard\n".to_string();
     for (idx, (player, rating)) in player_data.iter().enumerate().take(10) {
-        response += format!("#{} {}: {}\n", idx+1, player, rating).as_str();
+        response += format!("#{} {}: {}\n", idx + 1, player, rating).as_str();
     }
-    ctx.send(CreateReply::default().content(response).ephemeral(true).allowed_mentions(CreateAllowedMentions::new().all_users(false)))
-        .await?;
+    ctx.send(
+        CreateReply::default()
+            .content(response)
+            .ephemeral(true)
+            .allowed_mentions(CreateAllowedMentions::new().all_users(false)),
+    )
+    .await?;
     Ok(())
 }
 
 fn update_bans(data: Arc<Data>) {
     let now = chrono::offset::Utc::now();
-    data.player_bans.lock().unwrap().retain(|_, BanData { end_time, reason: _ }| {
-        if let Some(end_time) = end_time {
-            *end_time > now
-        } else {
-            true
-        }
-    })
+    data.player_bans.lock().unwrap().retain(
+        |_,
+         BanData {
+             end_time,
+             reason: _,
+         }| {
+            if let Some(end_time) = end_time {
+                *end_time > now
+            } else {
+                true
+            }
+        },
+    )
 }
 
 /// Bans a player from queueing
 #[poise::command(slash_command, prefix_command, rename = "ban")]
 async fn ban_player(
     ctx: Context<'_>,
-    #[description = "Player"]
-    player: UserId,
-    #[description = "Reason"]
-    reason: Option<String>,
-    #[description = "Days"]
-    days: Option<u32>,
+    #[description = "Player"] player: UserId,
+    #[description = "Reason"] reason: Option<String>,
+    #[description = "Days"] days: Option<u32>,
 ) -> Result<(), Error> {
     update_bans(ctx.data().clone());
     let end_time = days.map(|days| {
-        chrono::offset::Utc::now() + TimeDelta::new(60*60*24*days as i64,0).unwrap()
+        chrono::offset::Utc::now() + TimeDelta::new(60 * 60 * 24 * days as i64, 0).unwrap()
     });
-    let ban_data: BanData = BanData {
-        end_time,
-        reason,
-    };
-    let was_previously_banned = ctx.data().player_bans.lock().unwrap().insert(player, ban_data).is_some();
+    let ban_data: BanData = BanData { end_time, reason };
+    let was_previously_banned = ctx
+        .data()
+        .player_bans
+        .lock()
+        .unwrap()
+        .insert(player, ban_data)
+        .is_some();
 
     let response = if was_previously_banned {
         format!("{}'s ban was updated.", player.mention())
@@ -1724,11 +1889,16 @@ async fn ban_player(
 #[poise::command(slash_command, prefix_command, rename = "unban")]
 async fn unban_player(
     ctx: Context<'_>,
-    #[description = "Player"]
-    player: UserId,
+    #[description = "Player"] player: UserId,
 ) -> Result<(), Error> {
     update_bans(ctx.data().clone());
-    let was_banned = ctx.data().player_bans.lock().unwrap().remove(&player).is_some();
+    let was_banned = ctx
+        .data()
+        .player_bans
+        .lock()
+        .unwrap()
+        .remove(&player)
+        .is_some();
 
     let response = if was_banned {
         format!("Unbanned {}.", player.mention())
@@ -1742,20 +1912,25 @@ async fn unban_player(
 
 /// Lists players banned from queueing
 #[poise::command(slash_command, prefix_command)]
-async fn list_bans(
-    ctx: Context<'_>,
-) -> Result<(), Error> {
+async fn list_bans(ctx: Context<'_>) -> Result<(), Error> {
     update_bans(ctx.data().clone());
-    let ban_data = ctx.data().player_bans.lock().unwrap().iter().map(|(id, ban_data)| {
-        let mut ban = format!("{} banned", id.mention());
-        if let Some(reason) = ban_data.reason.clone() {
-            ban += format!(" for {}", reason).as_str();
-        }
-        if let Some(end_time) = ban_data.end_time {
-            ban += format!(" until <t:{}:f>", end_time.timestamp()).as_str();
-        }
-        ban
-    }).join("\n");
+    let ban_data = ctx
+        .data()
+        .player_bans
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(id, ban_data)| {
+            let mut ban = format!("{} banned", id.mention());
+            if let Some(reason) = ban_data.reason.clone() {
+                ban += format!(" for {}", reason).as_str();
+            }
+            if let Some(end_time) = ban_data.end_time {
+                ban += format!(" until <t:{}:f>", end_time.timestamp()).as_str();
+            }
+            ban
+        })
+        .join("\n");
 
     let response = format!("# Player Bans\n{}", ban_data);
     ctx.send(CreateReply::default().content(response).ephemeral(true))
@@ -1767,12 +1942,22 @@ async fn list_bans(
 #[poise::command(slash_command, prefix_command)]
 async fn get_player(
     ctx: Context<'_>,
-    #[description = "Player"]
-    player: UserId,
+    #[description = "Player"] player: UserId,
 ) -> Result<(), Error> {
-    let player_data = ctx.data().player_data.lock().unwrap().get(&player).unwrap_or(&DerivedPlayerData::default()).clone();
+    let player_data = ctx
+        .data()
+        .player_data
+        .lock()
+        .unwrap()
+        .get(&player)
+        .unwrap_or(&DerivedPlayerData::default())
+        .clone();
 
-    let response = format!("{}'s data```json\n{}\n```", player.mention(), serde_json::to_string_pretty(&player_data).unwrap());
+    let response = format!(
+        "{}'s data```json\n{}\n```",
+        player.mention(),
+        serde_json::to_string_pretty(&player_data).unwrap()
+    );
     ctx.send(CreateReply::default().content(response).ephemeral(true))
         .await?;
     Ok(())
@@ -1783,12 +1968,7 @@ async fn get_player(
     slash_command,
     prefix_command,
     default_member_permissions = "BAN_MEMBERS",
-    subcommands(
-        "ban_player",
-        "unban_player",
-        "list_bans",
-        "get_player"
-    )
+    subcommands("ban_player", "unban_player", "list_bans", "get_player")
 )]
 async fn manage_player(_: Context<'_>) -> Result<(), Error> {
     Ok(())
