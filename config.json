@@ -38,6 +38,7 @@
       "Runasapi"
     ],
     "map_vote_count": 2,
+    "map_vote_time": 0,
     "default_player_data": {
       "rating": {
         "rating": 25.0,

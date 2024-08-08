@@ -41,7 +41,7 @@ struct Data {
     queue_idx: Mutex<u32>,
 } // User data, which is stored and accessible in all command invocations
 type Error = Box<dyn std::error::Error + Send + Sync>;
-type Context<'a> = poise::Context<'a, Data, Error>;
+type Context<'a> = poise::Context<'a, Arc<Data>, Error>;
 
 #[derive(Serialize, Deserialize, Clone)]
 struct QueueGroup {
@@ -63,6 +63,7 @@ struct QueueConfiguration {
     post_match_channel: Option<ChannelId>,
     maps: Vec<String>,
     map_vote_count: u32,
+    map_vote_time: u32,
     default_player_data: PlayerData,
     maximum_queue_cost: f32,
     game_categories: HashMap<String, Vec<RoleId>>,
@@ -78,6 +79,7 @@ impl Default for QueueConfiguration {
             post_match_channel: None,
             maps: vec![],
             map_vote_count: 0,
+            map_vote_time: 0,
             default_player_data: PlayerData::default(),
             maximum_queue_cost: 50.0,
             game_categories: HashMap::new(),
@@ -210,7 +212,7 @@ impl Default for DerivedPlayerData {
     }
 }
 
-fn try_queue_player(data: &Data, user_id: UserId) -> bool {
+fn try_queue_player(data: Arc<Data>, user_id: UserId) -> bool {
     let mut player_data = data.player_data.lock().unwrap();
     let mut queued_players = data.queued_players.lock().unwrap();
     let in_game_players = data.in_game_players.lock().unwrap();
@@ -228,8 +230,8 @@ fn try_queue_player(data: &Data, user_id: UserId) -> bool {
 async fn handler(
     ctx: &serenity::Context,
     event: &serenity::FullEvent,
-    _framework: poise::FrameworkContext<'_, Data, Error>,
-    data: &Data,
+    _framework: poise::FrameworkContext<'_, Arc<Data>, Error>,
+    data: Arc<Data>,
 ) -> Result<(), Error> {
     match event {
         serenity::FullEvent::Ready { .. } => {
@@ -264,17 +266,17 @@ async fn handler(
                 };
 
                 if try_queueing {
-                    if try_queue_player(data, new.user_id) {
+                    if try_queue_player(data.clone(), new.user_id) {
                         player_added_to_queue = true;
                     }
                 }
             }
             if player_added_to_queue {
                 if let Some(delay) =
-                    try_matchmaking(data, ctx.http.clone(), new.guild_id.unwrap()).await?
+                    try_matchmaking(data.clone(), ctx.http.clone(), new.guild_id.unwrap()).await?
                 {
                     tokio::time::sleep(Duration::from_secs(delay as u64)).await;
-                    try_matchmaking(data, ctx.http.clone(), new.guild_id.unwrap()).await?;
+                    try_matchmaking(data.clone(), ctx.http.clone(), new.guild_id.unwrap()).await?;
                 }
             }
         }
@@ -282,8 +284,9 @@ async fn handler(
             if let Some(message_component) = interaction.as_message_component() {
                 let required_votes = {
                     let config = data.configuration.lock().unwrap();
-                    config.team_count * config.team_size / 2
+                    config.team_count * config.team_size / 2 + 1
                 };
+                println!("required_votes: {}", required_votes);
                 let match_number = {
                     let match_channels = data.match_channels.lock().unwrap();
                     match_channels.get(&message_component.channel_id).cloned()
@@ -344,7 +347,7 @@ async fn handler(
                             let mut content = String::new();
                             for (vote_type, count) in votes {
                                 content += format!("{}: {}\n", vote_type, count).as_str();
-                                if count > required_votes {
+                                if count >= required_votes {
                                     vote_result = Some(vote_type);
                                 }
                             }
@@ -380,7 +383,7 @@ async fn handler(
                             let mut content = String::new();
                             for (vote_type, count) in votes {
                                 content += format!("{}: {}\n", vote_type, count).as_str();
-                                if count > required_votes {
+                                if count >= required_votes {
                                     vote_result = Some(vote_type);
                                 }
                             }
@@ -396,11 +399,11 @@ async fn handler(
                             let (channels, players) = {
                                 let mut match_data = data.match_data.lock().unwrap();
                                 let match_data = match_data.remove(&match_number).unwrap();
-                                log_match_results(data, &vote_result, &match_data, match_number);
+                                log_match_results(data.clone(), &vote_result, &match_data, match_number);
                                 (match_data.channels, match_data.members)
                             };
 
-                            apply_match_results(data, vote_result, &players);
+                            apply_match_results(data.clone(), vote_result, &players);
 
                             let guild_id = message_component.guild_id.unwrap();
                             if let Some(post_match_channel) = post_match_channel {
@@ -504,7 +507,7 @@ async fn handler(
     Ok(())
 }
 
-fn log_match_results(_data: &Data, result: &MatchResult, match_data: &MatchData, number: u32) {
+fn log_match_results(_data: Arc<Data>, result: &MatchResult, match_data: &MatchData, number: u32) {
     let mut file = OpenOptions::new()
         .append(true)
         .create(true)
@@ -519,7 +522,7 @@ fn log_match_results(_data: &Data, result: &MatchResult, match_data: &MatchData,
     }
 }
 
-fn apply_match_results(data: &Data, result: MatchResult, players: &Vec<Vec<UserId>>) {
+fn apply_match_results(data: Arc<Data>, result: MatchResult, players: &Vec<Vec<UserId>>) {
     let rating_config: WengLinConfig = WengLinConfig::default();
     if matches!(result, MatchResult::Cancel) {
         return;
@@ -573,7 +576,7 @@ fn apply_match_results(data: &Data, result: MatchResult, players: &Vec<Vec<UserI
 }
 
 async fn try_matchmaking(
-    data: &Data,
+    data: Arc<Data>,
     cache_http: Arc<Http>,
     guild_id: GuildId,
 ) -> Result<Option<f32>, Error> {
@@ -595,7 +598,7 @@ async fn try_matchmaking(
     };
     let queued_players = data.queued_players.lock().unwrap().clone();
     let members = greedy_matchmaking(
-        data,
+        data.clone(),
         queued_players,
         guild_id,
         cache_http.clone(),
@@ -605,7 +608,7 @@ async fn try_matchmaking(
         let delay = 10.0;
         return Ok(Some(delay));
     };
-    let cost_eval = evaluate_cost(data, &members, guild_id, cache_http.clone()).await;
+    let cost_eval = evaluate_cost(data.clone(), &members, guild_id, cache_http.clone()).await;
     if cost_eval.0 > config.maximum_queue_cost {
         let delay = (cost_eval.0 - config.maximum_queue_cost) / total_player_count as f32 + 1.0;
         return Ok(Some(delay));
@@ -659,7 +662,11 @@ async fn try_matchmaking(
         )
         .await?;
     if config.map_vote_count > 0 {
-        let mut map_vote_message = CreateMessage::default().content("# Map Vote");
+        let mut map_vote_message_content = "# Map Vote".to_string();
+        if config.map_vote_time > 0 {
+            map_vote_message_content += format!("\nEnds <t:{}:R>", std::time::UNIX_EPOCH.elapsed().unwrap().as_secs()+config.map_vote_time as u64).as_str();
+        }
+        let mut map_vote_message = CreateMessage::default().content(map_vote_message_content);
         let mut map_pool = config.maps.clone();
         for _ in 0..config.map_vote_count {
             let num = rand::thread_rng().gen_range(0..map_pool.len());
@@ -670,9 +677,39 @@ async fn try_matchmaking(
                     .style(serenity::ButtonStyle::Secondary),
             );
         }
-        match_channel
+        let mut map_message = match_channel
             .send_message(cache_http.clone(), map_vote_message)
             .await?;
+        if config.map_vote_time > 0 {
+            let ctx1 = Arc::clone(&cache_http);
+            let data = data.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(config.map_vote_time as u64)).await;
+                if map_message.components.is_empty() {
+                    return;
+                }
+                let vote_result = {
+                    let match_data = data.match_data.lock().unwrap();
+                    let match_number = new_idx;
+                    let mut votes: HashMap<String, u32> = HashMap::new();
+                    for (_user, vote) in match_data.get(&match_number).unwrap().map_votes.iter()
+                    {
+                        let current_votes = votes.get(vote).unwrap_or(&0);
+                        votes.insert(vote.clone(), current_votes + 1);
+                    }
+                    votes.iter().max_by_key(|(_category, vote_count)| *vote_count).map(|(category, vote_count)| (category.clone(), vote_count.clone())).unwrap().clone()
+                };
+                
+                map_message
+                    .edit(ctx1.clone(), EditMessage::new().components(vec![]))
+                    .await.ok();
+                let content = format!("# Map: {}", vote_result.0);
+                
+                map_message
+                    .edit(ctx1.clone(), EditMessage::new().content(content))
+                    .await.ok();
+            });
+        }
     } else if config.maps.len() > 0 {
         let num = rand::thread_rng().gen_range(0..config.maps.len());
         let chosen_map = config.maps.get(num).unwrap().clone();
@@ -750,7 +787,7 @@ async fn try_matchmaking(
 }
 
 async fn evaluate_cost(
-    data: &Data,
+    data: Arc<Data>,
     players: &Vec<Vec<UserId>>,
     guild_id: GuildId,
     cache_http: Arc<Http>,
@@ -893,7 +930,7 @@ async fn evaluate_cost(
 }
 
 async fn greedy_matchmaking(
-    data: &Data,
+    data: Arc<Data>,
     pool: HashSet<UserId>,
     guild_id: GuildId,
     cache_http: Arc<Http>,
@@ -926,7 +963,7 @@ async fn greedy_matchmaking(
                     result_copy[team_idx].push(possible_addition.clone());
                 }
 
-                let cost = evaluate_cost(data, &result_copy, guild_id, cache_http.clone())
+                let cost = evaluate_cost(data.clone(), &result_copy, guild_id, cache_http.clone())
                     .await
                     .0;
                 if cost < min_cost {
@@ -1147,6 +1184,34 @@ async fn configure_map_vote_count(
 }
 
 /// Displays or sets number of maps for the vote
+#[poise::command(slash_command, prefix_command, rename = "map_vote_time")]
+async fn configure_map_vote_time(
+    ctx: Context<'_>,
+    #[description = "New value"]
+    #[min = 0]
+    new_value: Option<u32>,
+) -> Result<(), Error> {
+    if let Some(new_value) = new_value {
+        {
+            let mut data_lock = ctx.data().configuration.lock().unwrap();
+            data_lock.map_vote_time = new_value;
+        }
+        let response = format!("Map vote time set to {}", new_value);
+        ctx.send(CreateReply::default().content(response).ephemeral(true))
+            .await?;
+        Ok(())
+    } else {
+        let response = {
+            let data_lock = ctx.data().configuration.lock().unwrap();
+            format!("Map vote time is currently {}", data_lock.map_vote_time)
+        };
+        ctx.send(CreateReply::default().content(response).ephemeral(true))
+            .await?;
+        Ok(())
+    }
+}
+
+/// Displays or sets number of maps for the vote
 #[poise::command(slash_command, prefix_command, rename = "maximum_queue_cost")]
 async fn configure_maximum_queue_cost(
     ctx: Context<'_>,
@@ -1262,7 +1327,7 @@ async fn import_config(
 /// Join queue
 #[poise::command(slash_command, prefix_command)]
 async fn queue(ctx: Context<'_>) -> Result<(), Error> {
-    if try_queue_player(ctx.data(), ctx.author().id) {
+    if try_queue_player(ctx.data().clone(), ctx.author().id) {
         let response = {
             let data_lock = ctx.data().queued_players.lock().unwrap();
             format!(
@@ -1273,7 +1338,7 @@ async fn queue(ctx: Context<'_>) -> Result<(), Error> {
         ctx.send(CreateReply::default().content(response).ephemeral(true))
             .await?;
         try_matchmaking(
-            ctx.data(),
+            ctx.data().clone(),
             ctx.serenity_context().http.clone(),
             ctx.guild_id().unwrap(),
         )
@@ -1364,6 +1429,7 @@ async fn list_parties(ctx: Context<'_>) -> Result<(), Error> {
         "configure_post_match_channel",
         "configure_maps",
         "configure_map_vote_count",
+        "configure_map_vote_time",
         "configure_maximum_queue_cost"
     )
 )]
@@ -1458,7 +1524,7 @@ async fn party_invite(
     Ok(())
 }
 
-async fn leave_party(data: &Data, user: &UserId, http: Arc<impl CacheHttp>, old_party: Uuid) -> Result<(), Error> {
+async fn leave_party(data: Arc<Data>, user: &UserId, http: Arc<impl CacheHttp>, old_party: Uuid) -> Result<(), Error> {
     let remaining_party_members = {
         let mut group_data = data
             .group_data
@@ -1504,7 +1570,7 @@ async fn party_leave(
             .await?;
         return Ok(())
     };
-    leave_party(ctx.data(), &ctx.author().id, Arc::new(ctx.http()), old_party).await?;
+    leave_party(ctx.data().clone(), &ctx.author().id, Arc::new(ctx.http()), old_party).await?;
     ctx.send(CreateReply::default().content(format!("Left party")).ephemeral(true))
         .await?;
     Ok(())
@@ -1567,8 +1633,8 @@ async fn leaderboard(
     let mut player_data = ctx.data().player_data.lock().unwrap().iter().map(|(id, data)| (id.mention(), data.rating.unwrap_or(default_rating).rating)).collect_vec();
     player_data.sort_by(|(_, rating_a), (_, rating_b)| rating_b.partial_cmp(rating_a).unwrap());
     let mut response = "## Leaderboard\n".to_string();
-    for (player, rating) in player_data.iter().take(10) {
-        response += format!("{}: {}\n", player, rating).as_str();
+    for (idx, (player, rating)) in player_data.iter().enumerate().take(10) {
+        response += format!("#{} {}: {}\n", idx+1, player, rating).as_str();
     }
     ctx.send(CreateReply::default().content(response).ephemeral(true).allowed_mentions(CreateAllowedMentions::new().all_users(false)))
         .await?;
@@ -1583,7 +1649,7 @@ async fn main() {
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
             event_handler: |ctx, event, framework, data| {
-                Box::pin(handler(ctx, event, framework, data))
+                Box::pin(handler(ctx, event, framework, data.clone()))
             },
             commands: vec![
                 register(),
@@ -1603,14 +1669,14 @@ async fn main() {
         })
         .setup(|_ctx, _ready, _framework| {
             Box::pin(async move {
-                let config_data: Option<Data> =
+                let config_data: Option<Arc<Data>> =
                     fs::read_to_string("config.json").ok().map(|read| {
                         serde_json::from_str(read.as_str()).expect("Failed to parse config file")
                     });
                 if let Some(data) = config_data {
                     return Ok(data);
                 }
-                Ok(Data {
+                Ok(Arc::new(Data {
                     configuration: Mutex::new(QueueConfiguration::default()),
                     queue_idx: Mutex::new(0),
                     queued_players: Mutex::new(HashSet::new()),
@@ -1619,7 +1685,7 @@ async fn main() {
                     match_data: Mutex::new(HashMap::new()),
                     in_game_players: Mutex::new(HashSet::new()),
                     group_data: Mutex::new(HashMap::new()),
-                })
+                }))
             })
         })
         .build();
