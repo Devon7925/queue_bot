@@ -861,17 +861,16 @@ async fn try_matchmaking(
         .category(category.clone())
         .execute(cache_http.clone(), guild_id)
         .await?;
-    let mut vc_channels = vec![];
-    for i in 0..team_count {
-        vc_channels.push(
-            CreateChannel::new(format!("Team {} - #{}", i + 1, new_idx))
-                .category(category.clone())
-                .kind(ChannelType::Voice)
-                .execute(cache_http.clone(), guild_id)
-                .await
-                .unwrap(),
-        );
-    }
+    let vc_channels = future::join_all((0..team_count).map(|i| {
+        CreateChannel::new(format!("Team {} - #{}", i + 1, new_idx))
+            .category(category.clone())
+            .kind(ChannelType::Voice)
+            .execute(cache_http.clone(), guild_id)
+    }))
+    .await
+    .into_iter()
+    .map(|c| c.unwrap())
+    .collect_vec();
     let mut members_message = String::new();
     members_message += format!("# Queue#{}\n", new_idx).as_str();
     for (category_name, value) in cost_eval.1 {
@@ -1015,19 +1014,39 @@ async fn try_matchmaking(
         );
     }
     {
-        for (team_idx, team) in members.iter().enumerate() {
-            for player in team {
-                guild_id
-                    .member(cache_http.clone(), player)
-                    .await?
-                    .edit(
+        future::join_all(
+            members
+                .into_iter()
+                .enumerate()
+                .map(|(team_idx, team)| {
+                    (
+                        vc_channels.get(team_idx.clone()).unwrap(),
+                        team,
                         cache_http.clone(),
-                        EditMember::new().voice_channel(vc_channels.get(team_idx).unwrap().clone()),
+                    )
+                })
+                .map(|(team_vc, team, http)| async move {
+                    future::join_all(
+                        team.into_iter()
+                            .map(|player| (team_vc, player, http.clone()))
+                            .map(|(team_vc, player, http)| async move {
+                                guild_id
+                                    .member(http.clone(), player)
+                                    .await?
+                                    .edit(http.clone(), EditMember::new().voice_channel(team_vc))
+                                    .await?;
+                                Ok::<(), Error>(())
+                            }),
                     )
                     .await
-                    .ok();
-            }
-        }
+                    .into_iter()
+                    .collect::<Result<_, _>>()?;
+                    Ok::<(), Error>(())
+                }),
+        )
+        .await
+        .into_iter()
+        .collect::<Result<_, _>>()?;
     }
     Ok(None)
 }
@@ -2153,33 +2172,21 @@ async fn list_leavers(ctx: Context<'_>) -> Result<(), Error> {
 }
 
 /// Forces the outcome of a game
-#[poise::command(
-    slash_command,
-    prefix_command,
-    rename = "cancel"
-)]
+#[poise::command(slash_command, prefix_command, rename = "cancel")]
 async fn force_outcome_cancel(ctx: Context<'_>) -> Result<(), Error> {
     force_result(ctx, MatchResult::Cancel).await
 }
 
 /// Forces the outcome of a game
-#[poise::command(
-    slash_command,
-    prefix_command,
-    rename = "draw"
-)]
+#[poise::command(slash_command, prefix_command, rename = "draw")]
 async fn force_outcome_draw(ctx: Context<'_>) -> Result<(), Error> {
     force_result(ctx, MatchResult::Tie).await
 }
 
 /// Forces the outcome of a game
-#[poise::command(
-    slash_command,
-    prefix_command,
-    rename = "team"
-)]
+#[poise::command(slash_command, prefix_command, rename = "team")]
 async fn force_outcome_team(ctx: Context<'_>, #[min = 1] team_idx: u32) -> Result<(), Error> {
-    force_result(ctx, MatchResult::Team(team_idx-1)).await
+    force_result(ctx, MatchResult::Team(team_idx - 1)).await
 }
 
 /// Forces the outcome of a game
