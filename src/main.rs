@@ -14,9 +14,9 @@ use poise::{
         self as serenity, futures::future, Builder, CacheHttp, ChannelId, ChannelType,
         CreateActionRow, CreateAllowedMentions, CreateButton, CreateChannel,
         CreateInteractionResponseMessage, CreateMessage, EditMember, EditMessage, GuildId, Http,
-        Mentionable, RoleId, User, UserId,
+        Mentionable, RoleId, UserId,
     },
-    CreateReply, PopArgument,
+    CreateReply,
 };
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -146,6 +146,7 @@ struct MatchData {
     map_votes: HashMap<UserId, String>,
     channels: Vec<ChannelId>,
     members: Vec<Vec<UserId>>,
+    map_vote_end_time: Option<u64>,
 }
 
 impl Default for MatchData {
@@ -155,6 +156,7 @@ impl Default for MatchData {
             channels: vec![],
             members: vec![],
             map_votes: HashMap::new(),
+            map_vote_end_time: None
         }
     }
 }
@@ -456,16 +458,23 @@ async fn handler(
                         let mut vote_result = None;
                         let mut content = {
                             let match_data = data.match_data.lock().unwrap();
+                            let match_data = match_data.get(&match_number).unwrap();
                             let mut votes: HashMap<String, u32> = HashMap::new();
-                            for (_user, vote) in
-                                match_data.get(&match_number).unwrap().map_votes.iter()
+                            for (_user, vote) in match_data.map_votes.iter()
                             {
                                 let current_votes = votes.get(vote).unwrap_or(&0);
                                 votes.insert(vote.clone(), current_votes + 1);
                             }
-                            let mut content = String::new();
+                            let mut content = "# Map Vote".to_string();
+                            if let Some(map_vote_end_time) = match_data.map_vote_end_time {
+                                content += format!(
+                                    "\nEnds <t:{}:R>",
+                                    map_vote_end_time
+                                )
+                                .as_str();
+                            }
                             for (vote_type, count) in votes {
-                                content += format!("{}: {}\n", vote_type, count).as_str();
+                                content += format!("\n{}: {}", vote_type, count).as_str();
                                 if count >= required_votes {
                                     vote_result = Some(vote_type);
                                 }
@@ -899,12 +908,14 @@ async fn try_matchmaking(
                 .content(members_message),
         )
         .await?;
+    let mut map_vote_end_time = None;
     if config.map_vote_count > 0 {
         let mut map_vote_message_content = "# Map Vote".to_string();
         if config.map_vote_time > 0 {
+            map_vote_end_time = Some(std::time::UNIX_EPOCH.elapsed().unwrap().as_secs() + config.map_vote_time as u64);
             map_vote_message_content += format!(
                 "\nEnds <t:{}:R>",
-                std::time::UNIX_EPOCH.elapsed().unwrap().as_secs() + config.map_vote_time as u64
+                map_vote_end_time.unwrap()
             )
             .as_str();
         }
@@ -1010,6 +1021,7 @@ async fn try_matchmaking(
                 channels,
                 members: members.clone(),
                 map_votes: HashMap::new(),
+                map_vote_end_time,
             },
         );
     }
