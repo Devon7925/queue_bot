@@ -159,7 +159,7 @@ impl Default for MatchData {
             channels: vec![],
             members: vec![],
             map_votes: HashMap::new(),
-            map_vote_end_time: None
+            map_vote_end_time: None,
         }
     }
 }
@@ -458,18 +458,13 @@ async fn handler(
                             let match_data = data.match_data.lock().unwrap();
                             let match_data = match_data.get(&match_number).unwrap();
                             let mut votes: HashMap<String, u32> = HashMap::new();
-                            for (_user, vote) in match_data.map_votes.iter()
-                            {
+                            for (_user, vote) in match_data.map_votes.iter() {
                                 let current_votes = votes.get(vote).unwrap_or(&0);
                                 votes.insert(vote.clone(), current_votes + 1);
                             }
                             let mut content = "# Map Vote".to_string();
                             if let Some(map_vote_end_time) = match_data.map_vote_end_time {
-                                content += format!(
-                                    "\nEnds <t:{}:R>",
-                                    map_vote_end_time
-                                )
-                                .as_str();
+                                content += format!("\nEnds <t:{}:R>", map_vote_end_time).as_str();
                             }
                             for (vote_type, count) in votes {
                                 content += format!("\n{}: {}", vote_type, count).as_str();
@@ -809,11 +804,7 @@ fn apply_match_results(data: Arc<Data>, result: MatchResult, players: &Vec<Vec<U
     }
 }
 
-async fn matchmake(
-    data: Arc<Data>,
-    cache_http: Arc<Http>,
-    guild_id: GuildId,
-) -> Result<(), Error> {
+async fn matchmake(data: Arc<Data>, cache_http: Arc<Http>, guild_id: GuildId) -> Result<(), Error> {
     {
         let mut guard = data.is_matchmaking.lock().unwrap();
 
@@ -908,20 +899,21 @@ async fn try_matchmaking(
             }
         }
     }
-    let match_channel = CreateChannel::new(format!("match-{}", new_idx))
-        .category(category.clone())
-        .execute(cache_http.clone(), guild_id)
-        .await?;
-    let vc_channels = future::join_all((0..team_count).map(|i| {
-        CreateChannel::new(format!("Team {} - #{}", i + 1, new_idx))
+    let (match_channel, vc_channels) = future::join(
+        CreateChannel::new(format!("match-{}", new_idx))
             .category(category.clone())
-            .kind(ChannelType::Voice)
-            .execute(cache_http.clone(), guild_id)
-    }))
-    .await
-    .into_iter()
-    .map(|c| c.unwrap())
-    .collect_vec();
+            .execute(cache_http.clone(), guild_id),
+        future::join_all((0..team_count).map(|i| {
+            CreateChannel::new(format!("Team {} - #{}", i + 1, new_idx))
+                .category(category.clone())
+                .kind(ChannelType::Voice)
+                .execute(cache_http.clone(), guild_id)
+        })),
+    )
+    .await;
+    let match_channel = match_channel?;
+    let vc_channels = vc_channels.into_iter().map(|c| c.unwrap()).collect_vec();
+
     let mut members_message = String::new();
     members_message += format!("# Queue#{}\n", new_idx).as_str();
     for (category_name, value) in cost_eval.1 {
@@ -954,12 +946,11 @@ async fn try_matchmaking(
     if config.map_vote_count > 0 {
         let mut map_vote_message_content = "# Map Vote".to_string();
         if config.map_vote_time > 0 {
-            map_vote_end_time = Some(std::time::UNIX_EPOCH.elapsed().unwrap().as_secs() + config.map_vote_time as u64);
-            map_vote_message_content += format!(
-                "\nEnds <t:{}:R>",
-                map_vote_end_time.unwrap()
-            )
-            .as_str();
+            map_vote_end_time = Some(
+                std::time::UNIX_EPOCH.elapsed().unwrap().as_secs() + config.map_vote_time as u64,
+            );
+            map_vote_message_content +=
+                format!("\nEnds <t:{}:R>", map_vote_end_time.unwrap()).as_str();
         }
         let mut map_vote_message = CreateMessage::default().content(map_vote_message_content);
         let mut map_pool = config.maps.clone();
