@@ -11,9 +11,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 use itertools::{Itertools, MinMaxResult};
 use poise::{
     serenity_prelude::{
-        self as serenity, futures::future, Builder, CacheHttp, ChannelId, ChannelType,
-        CreateAllowedMentions, CreateButton, CreateChannel, CreateInteractionResponseMessage,
-        CreateMessage, EditMember, EditMessage, GuildId, Http, Mentionable, RoleId, UserId,
+        self as serenity, futures::future, Builder, CacheHttp, ChannelId, ChannelType, CreateActionRow, CreateAllowedMentions, CreateButton, CreateChannel, CreateInteractionResponseMessage, CreateMessage, EditMember, EditMessage, GuildId, Http, Mentionable, RoleId, User, UserId
     },
     CreateReply,
 };
@@ -42,6 +40,8 @@ struct Data {
     group_data: Mutex<HashMap<Uuid, QueueGroup>>,
     #[serde(default)]
     player_bans: Mutex<HashMap<UserId, BanData>>,
+    #[serde(default)]
+    leaver_data: Mutex<HashMap<UserId, u32>>,
     queue_idx: Mutex<u32>,
 } // User data, which is stored and accessible in all command invocations
 type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -59,6 +59,7 @@ impl Default for Data {
             in_game_players: Mutex::new(HashSet::new()),
             group_data: Mutex::new(HashMap::new()),
             player_bans: Mutex::new(HashMap::new()),
+            leaver_data: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -90,6 +91,7 @@ struct QueueConfiguration {
     maps: Vec<String>,
     map_vote_count: u32,
     map_vote_time: u32,
+    leaver_verification_time: u32,
     default_player_data: PlayerData,
     maximum_queue_cost: f32,
     game_categories: HashMap<String, Vec<RoleId>>,
@@ -106,6 +108,7 @@ impl Default for QueueConfiguration {
             maps: vec![],
             map_vote_count: 0,
             map_vote_time: 0,
+            leaver_verification_time: 30,
             default_player_data: PlayerData::default(),
             maximum_queue_cost: 50.0,
             game_categories: HashMap::new(),
@@ -657,6 +660,24 @@ async fn handler(
                         .await?;
                     return Ok(());
                 }
+                if let Some(non_leaver_id) = message_component.data.custom_id.strip_prefix("leaver_check_") {
+                    let player = UserId::new(non_leaver_id.parse::<u64>().unwrap());
+                    if message_component.user.id != player {
+                        message_component.create_response(ctx, serenity::CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content(format!("You aren't the right player silly :P"))
+                                .ephemeral(true),
+                        )).await?;
+                        return Ok(())
+                    }
+                    message_component.message.delete(ctx).await?;
+                    message_component.create_response(ctx, serenity::CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content(format!("You are no longer marked as a leaver."))
+                            .ephemeral(true),
+                    )).await?;
+                    return Ok(())
+                }
             }
         }
         serenity::FullEvent::Ratelimit { .. } => {
@@ -830,9 +851,11 @@ async fn try_matchmaking(
         }
         let mut map_vote_message = CreateMessage::default().content(map_vote_message_content);
         let mut map_pool = config.maps.clone();
+        let mut maps = vec![];
         for _ in 0..config.map_vote_count {
             let num = rand::thread_rng().gen_range(0..map_pool.len());
             let rand_map = map_pool.remove(num);
+            maps.push(rand_map.clone());
             map_vote_message = map_vote_message.button(
                 CreateButton::new(format!("map_{}", rand_map).clone())
                     .label(rand_map)
@@ -864,8 +887,8 @@ async fn try_matchmaking(
                     votes
                         .iter()
                         .max_by_key(|(_category, vote_count)| *vote_count)
-                        .map(|(category, vote_count)| (category.clone(), vote_count.clone()))
-                        .unwrap()
+                        .map(|(category, _vote_count)| category.clone())
+                        .unwrap_or(maps[0].clone())
                         .clone()
                 };
 
@@ -873,7 +896,7 @@ async fn try_matchmaking(
                     .edit(ctx1.clone(), EditMessage::new().components(vec![]))
                     .await
                     .ok();
-                let content = format!("# Map: {}", vote_result.0);
+                let content = format!("# Map: {}", vote_result);
 
                 map_message
                     .edit(ctx1.clone(), EditMessage::new().content(content))
@@ -1974,6 +1997,86 @@ async fn manage_player(_: Context<'_>) -> Result<(), Error> {
     Ok(())
 }
 
+/// Marks a player as leaver
+#[poise::command(slash_command, prefix_command)]
+async fn mark_leaver(
+    ctx: Context<'_>,
+    #[description = "Player"] player: UserId,
+) -> Result<(), Error> {
+    let match_number = {
+        let match_channels = ctx.data().match_channels.lock().unwrap();
+        match_channels.get(&ctx.channel_id()).cloned()
+    };
+    let Some(match_number) = match_number else {
+        ctx.send(CreateReply::default().content("This command must be done in a match channel!").ephemeral(true))
+            .await?;
+        return Ok(())
+    };
+    if !ctx.data().match_data.lock().unwrap().get(&match_number).unwrap().members.iter().flatten().contains(&player) {
+        ctx.send(CreateReply::default().content("This player is not in this match!").ephemeral(true))
+            .await?;
+        return Ok(())
+    }
+    let mut leaver_message_content = format!("# Did you leave {}?", player.mention());
+    leaver_message_content += format!(
+        "\nEnds <t:{}:R>, otherwise user will be reported",
+        std::time::UNIX_EPOCH.elapsed().unwrap().as_secs() + ctx.data().configuration.lock().unwrap().leaver_verification_time as u64
+    )
+    .as_str();
+    let mut leaver_message = CreateReply::default().content(leaver_message_content);
+    leaver_message = leaver_message.components(vec![CreateActionRow::Buttons(vec![
+        CreateButton::new(format!("leaver_check_{}", player.get()).clone())
+            .label("No, I'm here.")
+            .style(serenity::ButtonStyle::Primary),
+    ])]);
+    let leaver_message = ctx.send(leaver_message).await?.message().await?.id;
+    {
+        let data = ctx.data().clone();
+        let guild_id = ctx.guild_id().unwrap();
+        let channel_id = ctx.channel_id();
+        let ctx1 = ctx.serenity_context().http.clone();
+        tokio::spawn(async move {
+            let leaver_verification_time = data.clone().configuration.lock().unwrap().leaver_verification_time as u64;
+            tokio::time::sleep(Duration::from_secs(leaver_verification_time)).await;
+            let Ok(message) = ctx1.get_message(channel_id, leaver_message).await else {
+                return;
+            };
+            message.delete(ctx1.clone()).await.ok();
+            let Ok(mut member) = guild_id.member(ctx1.clone(), player).await else {
+                return;
+            };
+            member.edit(
+                    ctx1,
+                    EditMember::new().disconnect_member(),
+                )
+                .await
+                .ok();
+            *data.leaver_data.lock().unwrap().entry(player).or_insert(0) += 1;
+        });
+    }
+    
+    Ok(())
+}
+
+/// Lists players who've left games
+#[poise::command(slash_command, prefix_command)]
+async fn list_leavers(ctx: Context<'_>) -> Result<(), Error> {
+    let leave_data = ctx
+        .data()
+        .leaver_data
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(id, count)| {
+            format!("{} left {} times", id.mention(), count)
+        })
+        .join("\n");
+
+    let response = format!("# Player Leave Counts\n{}", leave_data);
+    ctx.send(CreateReply::default().content(response).ephemeral(true))
+        .await?;
+    Ok(())
+}
 #[tokio::main]
 async fn main() {
     let token = std::env::var("DISCORD_BOT_TOKEN").expect("missing DISCORD_BOT_TOKEN");
@@ -1998,6 +2101,8 @@ async fn main() {
                 list_parties(),
                 leaderboard(),
                 manage_player(),
+                mark_leaver(),
+                list_leavers(),
             ],
             ..Default::default()
         })
