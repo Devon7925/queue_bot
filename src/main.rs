@@ -381,8 +381,27 @@ async fn handler(
                     match_channels.get(&message_component.channel_id).cloned()
                 };
                 if let Some(match_number) = match_number {
+                    let is_user_in_match = {
+                        let match_data = data.match_data.lock().unwrap();
+                        let Some(match_data) = match_data.get(&match_number) else {
+                            return Ok(());
+                        };
+                        match_data.members.iter().flatten().contains(&message_component.user.id)
+                    };
                     let mut vote_type = VoteType::None;
                     {
+                        if !is_user_in_match {
+                            message_component
+                                .create_response(
+                                    ctx,
+                                    serenity::CreateInteractionResponse::Message(
+                                        CreateInteractionResponseMessage::new()
+                                            .content(format!("You cannot vote in a game you're not in.")),
+                                    ),
+                                )
+                                .await?;
+                            return Ok(());
+                        }
                         let mut match_data = data.match_data.lock().unwrap();
                         if let Some(map) = message_component.data.custom_id.strip_prefix("map_") {
                             match_data
@@ -396,9 +415,10 @@ async fn handler(
                             message_component.data.custom_id.strip_prefix("team_")
                         {
                             let team_number: u32 = team_data.parse()?;
+                            let Some(match_data) = match_data.get_mut(&match_number) else {
+                                return Ok(())
+                            };
                             match_data
-                                .get_mut(&match_number)
-                                .unwrap()
                                 .result_votes
                                 .insert(message_component.user.id, MatchResult::Team(team_number));
                             vote_type = VoteType::Result;
@@ -491,15 +511,15 @@ async fn handler(
                                 .post_match_channel
                                 .clone();
                             let (channels, players) = {
-                                let mut match_data = data.match_data.lock().unwrap();
-                                let match_data = match_data.remove(&match_number).unwrap();
+                                let match_data = data.match_data.lock().unwrap();
+                                let match_data = match_data.get(&match_number).unwrap();
                                 log_match_results(
                                     data.clone(),
                                     &vote_result,
                                     &match_data,
                                     match_number,
                                 );
-                                (match_data.channels, match_data.members)
+                                (match_data.channels.clone(), match_data.members.clone())
                             };
 
                             apply_match_results(data.clone(), vote_result, &players);
@@ -523,6 +543,11 @@ async fn handler(
                                 data.match_channels.lock().unwrap().remove(&channel);
                                 ctx.http.delete_channel(channel, None).await?;
                             }
+                            {
+                                let mut match_data = data.match_data.lock().unwrap();
+                                match_data.remove(&match_number);
+                            }
+
                         }
                         ctx.http
                             .clone()
@@ -797,6 +822,21 @@ async fn try_matchmaking(
         *queue_idx += 1;
         *queue_idx
     };
+    
+    {
+        for team in members.iter() {
+            for player in team {
+                data.queued_players.lock().unwrap().remove(player);
+                data.in_game_players.lock().unwrap().insert(player.clone());
+                data.player_data
+                    .lock()
+                    .unwrap()
+                    .get_mut(player)
+                    .unwrap()
+                    .queue_enter_time = None;
+            }
+        }
+    }
     let match_channel = CreateChannel::new(format!("match-{}", new_idx))
         .category(category.clone())
         .execute(cache_http.clone(), guild_id)
@@ -966,14 +1006,6 @@ async fn try_matchmaking(
                     )
                     .await
                     .ok();
-                data.queued_players.lock().unwrap().remove(player);
-                data.in_game_players.lock().unwrap().insert(player.clone());
-                data.player_data
-                    .lock()
-                    .unwrap()
-                    .get_mut(player)
-                    .unwrap()
-                    .queue_enter_time = None;
             }
         }
     }
