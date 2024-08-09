@@ -1,10 +1,10 @@
 {
   "configuration": {
-    "team_size": 1,
-    "team_count": 1,
+    "team_size": 6,
+    "team_count": 2,
     "category": "1270231681626017863",
     "queue_channels": [
-      "1270231132847210547"
+      "1271555892478738582"
     ],
     "post_match_channel": "1253881451259367526",
     "maps": [

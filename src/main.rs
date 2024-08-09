@@ -11,9 +11,12 @@ use chrono::{DateTime, TimeDelta, Utc};
 use itertools::{Itertools, MinMaxResult};
 use poise::{
     serenity_prelude::{
-        self as serenity, futures::future, Builder, CacheHttp, ChannelId, ChannelType, CreateActionRow, CreateAllowedMentions, CreateButton, CreateChannel, CreateInteractionResponseMessage, CreateMessage, EditMember, EditMessage, GuildId, Http, Mentionable, RoleId, User, UserId
+        self as serenity, futures::future, Builder, CacheHttp, ChannelId, ChannelType,
+        CreateActionRow, CreateAllowedMentions, CreateButton, CreateChannel,
+        CreateInteractionResponseMessage, CreateMessage, EditMember, EditMessage, GuildId, Http,
+        Mentionable, RoleId, User, UserId,
     },
-    CreateReply,
+    CreateReply, PopArgument,
 };
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -129,7 +132,7 @@ impl std::fmt::Display for MatchResult {
             f,
             "{}",
             match self {
-                MatchResult::Team(num) => format!("Team {}", num),
+                MatchResult::Team(num) => format!("Team {}", num + 1),
                 MatchResult::Tie => "Tie".to_string(),
                 MatchResult::Cancel => "Cancel".to_string(),
             }
@@ -386,7 +389,11 @@ async fn handler(
                         let Some(match_data) = match_data.get(&match_number) else {
                             return Ok(());
                         };
-                        match_data.members.iter().flatten().contains(&message_component.user.id)
+                        match_data
+                            .members
+                            .iter()
+                            .flatten()
+                            .contains(&message_component.user.id)
                     };
                     let mut vote_type = VoteType::None;
                     {
@@ -395,8 +402,9 @@ async fn handler(
                                 .create_response(
                                     ctx,
                                     serenity::CreateInteractionResponse::Message(
-                                        CreateInteractionResponseMessage::new()
-                                            .content(format!("You cannot vote in a game you're not in.")),
+                                        CreateInteractionResponseMessage::new().content(format!(
+                                            "You cannot vote in a game you're not in."
+                                        )),
                                     ),
                                 )
                                 .await?;
@@ -416,7 +424,7 @@ async fn handler(
                         {
                             let team_number: u32 = team_data.parse()?;
                             let Some(match_data) = match_data.get_mut(&match_number) else {
-                                return Ok(())
+                                return Ok(());
                             };
                             match_data
                                 .result_votes
@@ -547,7 +555,6 @@ async fn handler(
                                 let mut match_data = data.match_data.lock().unwrap();
                                 match_data.remove(&match_number);
                             }
-
                         }
                         ctx.http
                             .clone()
@@ -685,23 +692,37 @@ async fn handler(
                         .await?;
                     return Ok(());
                 }
-                if let Some(non_leaver_id) = message_component.data.custom_id.strip_prefix("leaver_check_") {
+                if let Some(non_leaver_id) = message_component
+                    .data
+                    .custom_id
+                    .strip_prefix("leaver_check_")
+                {
                     let player = UserId::new(non_leaver_id.parse::<u64>().unwrap());
                     if message_component.user.id != player {
-                        message_component.create_response(ctx, serenity::CreateInteractionResponse::Message(
-                            CreateInteractionResponseMessage::new()
-                                .content(format!("You aren't the right player silly :P"))
-                                .ephemeral(true),
-                        )).await?;
-                        return Ok(())
+                        message_component
+                            .create_response(
+                                ctx,
+                                serenity::CreateInteractionResponse::Message(
+                                    CreateInteractionResponseMessage::new()
+                                        .content(format!("You aren't the right player silly :P"))
+                                        .ephemeral(true),
+                                ),
+                            )
+                            .await?;
+                        return Ok(());
                     }
                     message_component.message.delete(ctx).await?;
-                    message_component.create_response(ctx, serenity::CreateInteractionResponse::Message(
-                        CreateInteractionResponseMessage::new()
-                            .content(format!("You are no longer marked as a leaver."))
-                            .ephemeral(true),
-                    )).await?;
-                    return Ok(())
+                    message_component
+                        .create_response(
+                            ctx,
+                            serenity::CreateInteractionResponse::Message(
+                                CreateInteractionResponseMessage::new()
+                                    .content(format!("You are no longer marked as a leaver."))
+                                    .ephemeral(true),
+                            ),
+                        )
+                        .await?;
+                    return Ok(());
                 }
             }
         }
@@ -804,8 +825,7 @@ async fn try_matchmaking(
     };
     let queued_players = data.queued_players.lock().unwrap().clone();
     println!("Trying matchmaking");
-    let members =
-        greedy_matchmaking(data.clone(), queued_players).await;
+    let members = greedy_matchmaking(data.clone(), queued_players).await;
     let Some(members) = members else {
         println!("Could not find valid matchmaking");
         let delay = 10.0;
@@ -822,7 +842,7 @@ async fn try_matchmaking(
         *queue_idx += 1;
         *queue_idx
     };
-    
+
     {
         for team in members.iter() {
             for player in team {
@@ -955,7 +975,7 @@ async fn try_matchmaking(
     let mut result_message = CreateMessage::default();
     for i in 0..team_count {
         result_message = result_message.button(
-            CreateButton::new(format!("team_{}", i + 1))
+            CreateButton::new(format!("team_{}", i))
                 .label(format!("Team {}", i + 1))
                 .style(serenity::ButtonStyle::Primary),
         )
@@ -1123,10 +1143,7 @@ async fn evaluate_cost(
     )
 }
 
-async fn greedy_matchmaking(
-    data: Arc<Data>,
-    pool: HashSet<UserId>,
-) -> Option<Vec<Vec<UserId>>> {
+async fn greedy_matchmaking(data: Arc<Data>, pool: HashSet<UserId>) -> Option<Vec<Vec<UserId>>> {
     let team_size = data.configuration.lock().unwrap().team_size;
     let team_count = data.configuration.lock().unwrap().team_count;
     let total_players = team_size * team_count;
@@ -1171,9 +1188,7 @@ async fn greedy_matchmaking(
                     result_copy[team_idx].push(possible_addition.clone());
                 }
 
-                let cost = evaluate_cost(data.clone(), &result_copy)
-                    .await
-                    .0;
+                let cost = evaluate_cost(data.clone(), &result_copy).await.0;
                 if cost < min_cost {
                     min_cost = cost;
                     best_next_result = result_copy;
@@ -2040,27 +2055,53 @@ async fn mark_leaver(
         match_channels.get(&ctx.channel_id()).cloned()
     };
     let Some(match_number) = match_number else {
-        ctx.send(CreateReply::default().content("This command must be done in a match channel!").ephemeral(true))
-            .await?;
-        return Ok(())
+        ctx.send(
+            CreateReply::default()
+                .content("This command must be done in a match channel!")
+                .ephemeral(true),
+        )
+        .await?;
+        return Ok(());
     };
-    if !ctx.data().match_data.lock().unwrap().get(&match_number).unwrap().members.iter().flatten().contains(&player) {
-        ctx.send(CreateReply::default().content("This player is not in this match!").ephemeral(true))
-            .await?;
-        return Ok(())
+    if !ctx
+        .data()
+        .match_data
+        .lock()
+        .unwrap()
+        .get(&match_number)
+        .unwrap()
+        .members
+        .iter()
+        .flatten()
+        .contains(&player)
+    {
+        ctx.send(
+            CreateReply::default()
+                .content("This player is not in this match!")
+                .ephemeral(true),
+        )
+        .await?;
+        return Ok(());
     }
     let mut leaver_message_content = format!("# Did you leave {}?", player.mention());
     leaver_message_content += format!(
         "\nEnds <t:{}:R>, otherwise user will be reported",
-        std::time::UNIX_EPOCH.elapsed().unwrap().as_secs() + ctx.data().configuration.lock().unwrap().leaver_verification_time as u64
+        std::time::UNIX_EPOCH.elapsed().unwrap().as_secs()
+            + ctx
+                .data()
+                .configuration
+                .lock()
+                .unwrap()
+                .leaver_verification_time as u64
     )
     .as_str();
     let mut leaver_message = CreateReply::default().content(leaver_message_content);
-    leaver_message = leaver_message.components(vec![CreateActionRow::Buttons(vec![
-        CreateButton::new(format!("leaver_check_{}", player.get()).clone())
-            .label("No, I'm here.")
-            .style(serenity::ButtonStyle::Primary),
-    ])]);
+    leaver_message =
+        leaver_message.components(vec![CreateActionRow::Buttons(vec![CreateButton::new(
+            format!("leaver_check_{}", player.get()).clone(),
+        )
+        .label("No, I'm here.")
+        .style(serenity::ButtonStyle::Primary)])]);
     let leaver_message = ctx.send(leaver_message).await?.message().await?.id;
     {
         let data = ctx.data().clone();
@@ -2068,7 +2109,12 @@ async fn mark_leaver(
         let channel_id = ctx.channel_id();
         let ctx1 = ctx.serenity_context().http.clone();
         tokio::spawn(async move {
-            let leaver_verification_time = data.clone().configuration.lock().unwrap().leaver_verification_time as u64;
+            let leaver_verification_time = data
+                .clone()
+                .configuration
+                .lock()
+                .unwrap()
+                .leaver_verification_time as u64;
             tokio::time::sleep(Duration::from_secs(leaver_verification_time)).await;
             let Ok(message) = ctx1.get_message(channel_id, leaver_message).await else {
                 return;
@@ -2077,16 +2123,14 @@ async fn mark_leaver(
             let Ok(mut member) = guild_id.member(ctx1.clone(), player).await else {
                 return;
             };
-            member.edit(
-                    ctx1,
-                    EditMember::new().disconnect_member(),
-                )
+            member
+                .edit(ctx1, EditMember::new().disconnect_member())
                 .await
                 .ok();
             *data.leaver_data.lock().unwrap().entry(player).or_insert(0) += 1;
         });
     }
-    
+
     Ok(())
 }
 
@@ -2099,9 +2143,7 @@ async fn list_leavers(ctx: Context<'_>) -> Result<(), Error> {
         .lock()
         .unwrap()
         .iter()
-        .map(|(id, count)| {
-            format!("{} left {} times", id.mention(), count)
-        })
+        .map(|(id, count)| format!("{} left {} times", id.mention(), count))
         .join("\n");
 
     let response = format!("# Player Leave Counts\n{}", leave_data);
@@ -2109,6 +2151,104 @@ async fn list_leavers(ctx: Context<'_>) -> Result<(), Error> {
         .await?;
     Ok(())
 }
+
+/// Forces the outcome of a game
+#[poise::command(
+    slash_command,
+    prefix_command,
+    rename = "cancel"
+)]
+async fn force_outcome_cancel(ctx: Context<'_>) -> Result<(), Error> {
+    force_result(ctx, MatchResult::Cancel).await
+}
+
+/// Forces the outcome of a game
+#[poise::command(
+    slash_command,
+    prefix_command,
+    rename = "draw"
+)]
+async fn force_outcome_draw(ctx: Context<'_>) -> Result<(), Error> {
+    force_result(ctx, MatchResult::Tie).await
+}
+
+/// Forces the outcome of a game
+#[poise::command(
+    slash_command,
+    prefix_command,
+    rename = "team"
+)]
+async fn force_outcome_team(ctx: Context<'_>, #[min = 1] team_idx: u32) -> Result<(), Error> {
+    force_result(ctx, MatchResult::Team(team_idx-1)).await
+}
+
+/// Forces the outcome of a game
+#[poise::command(
+    slash_command,
+    prefix_command,
+    default_member_permissions = "BAN_MEMBERS",
+    subcommands("force_outcome_cancel", "force_outcome_draw", "force_outcome_team")
+)]
+async fn force_outcome(_ctx: Context<'_>) -> Result<(), Error> {
+    Ok(())
+}
+
+async fn force_result(ctx: Context<'_>, result: MatchResult) -> Result<(), Error> {
+    let match_number = {
+        let match_channels = ctx.data().match_channels.lock().unwrap();
+        match_channels.get(&ctx.channel_id()).cloned()
+    };
+    let Some(match_number) = match_number else {
+        ctx.send(
+            CreateReply::default()
+                .content("Not in match: cannot force outcome.")
+                .ephemeral(true),
+        )
+        .await?;
+        return Ok(());
+    };
+    let post_match_channel = ctx
+        .data()
+        .configuration
+        .lock()
+        .unwrap()
+        .post_match_channel
+        .clone();
+    let (channels, players) = {
+        let match_data = ctx.data().match_data.lock().unwrap();
+        let match_data = match_data.get(&match_number).unwrap();
+        log_match_results(ctx.data().clone(), &result, &match_data, match_number);
+        (match_data.channels.clone(), match_data.members.clone())
+    };
+
+    apply_match_results(ctx.data().clone(), result, &players);
+
+    let guild_id = ctx.guild_id().unwrap();
+    if let Some(post_match_channel) = post_match_channel {
+        for player in players.iter().flat_map(|t| t) {
+            ctx.data().in_game_players.lock().unwrap().remove(player);
+            ctx.http()
+                .get_member(guild_id, *player)
+                .await?
+                .edit(
+                    ctx.http(),
+                    EditMember::new().voice_channel(post_match_channel),
+                )
+                .await
+                .ok();
+        }
+    }
+    for channel in channels {
+        ctx.data().match_channels.lock().unwrap().remove(&channel);
+        ctx.http().delete_channel(channel, None).await?;
+    }
+    {
+        let mut match_data = ctx.data().match_data.lock().unwrap();
+        match_data.remove(&match_number);
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
     let token = std::env::var("DISCORD_BOT_TOKEN").expect("missing DISCORD_BOT_TOKEN");
@@ -2135,6 +2275,7 @@ async fn main() {
                 manage_player(),
                 mark_leaver(),
                 list_leavers(),
+                force_outcome(),
             ],
             ..Default::default()
         })
