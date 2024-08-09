@@ -45,6 +45,8 @@ struct Data {
     player_bans: Mutex<HashMap<UserId, BanData>>,
     #[serde(default)]
     leaver_data: Mutex<HashMap<UserId, u32>>,
+    #[serde(default)]
+    is_matchmaking: Mutex<Option<()>>,
     queue_idx: Mutex<u32>,
 } // User data, which is stored and accessible in all command invocations
 type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -63,6 +65,7 @@ impl Default for Data {
             group_data: Mutex::new(HashMap::new()),
             player_bans: Mutex::new(HashMap::new()),
             leaver_data: Mutex::new(HashMap::new()),
+            is_matchmaking: Mutex::new(None),
         }
     }
 }
@@ -367,12 +370,7 @@ async fn handler(
                 }
             }
             if player_added_to_queue {
-                if let Some(delay) =
-                    try_matchmaking(data.clone(), ctx.http.clone(), new.guild_id.unwrap()).await?
-                {
-                    tokio::time::sleep(Duration::from_secs(delay as u64)).await;
-                    try_matchmaking(data.clone(), ctx.http.clone(), new.guild_id.unwrap()).await?;
-                }
+                matchmake(data.clone(), ctx.http.clone(), new.guild_id.unwrap()).await?;
             }
         }
         serenity::FullEvent::InteractionCreate { interaction } => {
@@ -809,6 +807,50 @@ fn apply_match_results(data: Arc<Data>, result: MatchResult, players: &Vec<Vec<U
             );
         }
     }
+}
+
+async fn matchmake(
+    data: Arc<Data>,
+    cache_http: Arc<Http>,
+    guild_id: GuildId,
+) -> Result<(), Error> {
+    {
+        let mut guard = data.is_matchmaking.lock().unwrap();
+
+        if guard.is_some() {
+            // If already running, return
+            return Ok(());
+        }
+
+        // Mark as running
+        *guard = Some(());
+    }
+
+    loop {
+        // Actual task execution
+        let result = try_matchmaking(data.clone(), cache_http.clone(), guild_id).await?;
+
+        if let Some(delay) = result {
+            // Task failed, clear running state and retry after delay
+            *data.is_matchmaking.lock().unwrap() = None;
+            tokio::time::sleep(Duration::from_secs_f32(delay)).await;
+            let mut guard = data.is_matchmaking.lock().unwrap();
+
+            // If re-executed during sleep, exit loop
+            if guard.is_some() {
+                break;
+            }
+
+            // Mark as running again
+            *guard = Some(());
+        } else {
+            break;
+        }
+    }
+
+    // Clear running state when done
+    *data.is_matchmaking.lock().unwrap() = None;
+    Ok(())
 }
 
 async fn try_matchmaking(
@@ -1599,7 +1641,7 @@ async fn queue(ctx: Context<'_>) -> Result<(), Error> {
             };
             ctx.send(CreateReply::default().content(response).ephemeral(true))
                 .await?;
-            try_matchmaking(
+            matchmake(
                 ctx.data().clone(),
                 ctx.serenity_context().http.clone(),
                 ctx.guild_id().unwrap(),
