@@ -4,7 +4,8 @@
     "team_count": 2,
     "category": "1270231681626017863",
     "queue_channels": [
-      "1271555892478738582"
+      "1271555892478738582",
+      "1271643772811345960"
     ],
     "post_match_channel": "1253881451259367526",
     "queue_messages": [
@@ -13,6 +14,7 @@
         "1271636922833440770"
       ]
     ],
+    "audit_channel": "1268326013209677845",
     "maps": [
       "Antarctic Peninsula",
       "Busan",

@@ -92,6 +92,7 @@ struct QueueConfiguration {
     queue_channels: Vec<ChannelId>,
     post_match_channel: Option<ChannelId>,
     queue_messages: Vec<(ChannelId, MessageId)>,
+    audit_channel: Option<ChannelId>,
     maps: Vec<String>,
     map_vote_count: u32,
     map_vote_time: u32,
@@ -110,6 +111,7 @@ impl Default for QueueConfiguration {
             queue_channels: vec![],
             post_match_channel: None,
             queue_messages: vec![],
+            audit_channel: None,
             maps: vec![],
             map_vote_count: 0,
             map_vote_time: 0,
@@ -1638,7 +1640,7 @@ async fn configure_post_match_channel(
             format!(
                 "Post match channel is {}",
                 data_lock
-                    .category
+                    .post_match_channel
                     .as_ref()
                     .map(|c| format!("{}", c.mention()))
                     .unwrap_or("not set".to_string())
@@ -1648,6 +1650,63 @@ async fn configure_post_match_channel(
             .await?;
         Ok(())
     }
+}
+
+/// Sets the channel to move members to after the end of the game
+#[poise::command(slash_command, prefix_command, rename = "audit_channel")]
+async fn configure_audit_channel(
+    ctx: Context<'_>,
+    #[description = "Audit channel"]
+    #[channel_types("Text")]
+    new_value: Option<serenity::Channel>,
+) -> Result<(), Error> {
+    if let Some(new_value) = new_value {
+        let response = {
+            let mut data_lock = ctx.data().configuration.lock().unwrap();
+            data_lock.audit_channel = Some(new_value.id());
+            format!("Audit channel changed to {}", new_value.to_string())
+        };
+        ctx.send(CreateReply::default().content(response).ephemeral(true))
+            .await?;
+        Ok(())
+    } else {
+        let response = {
+            let data_lock = ctx.data().configuration.lock().unwrap();
+            format!(
+                "Audit channel is {}",
+                data_lock
+                    .audit_channel
+                    .as_ref()
+                    .map(|c| format!("{}", c.mention()))
+                    .unwrap_or("not set".to_string())
+            )
+        };
+        ctx.send(CreateReply::default().content(response).ephemeral(true))
+            .await?;
+        Ok(())
+    }
+}
+
+/// Displays your or another user's account creation date
+#[poise::command(
+    slash_command,
+    prefix_command,
+    default_member_permissions = "MANAGE_CHANNELS",
+    subcommands(
+        "configure_team_size",
+        "configure_queue_category",
+        "configure_queue_channels",
+        "configure_team_count",
+        "configure_post_match_channel",
+        "configure_maps",
+        "configure_map_vote_count",
+        "configure_map_vote_time",
+        "configure_maximum_queue_cost",
+        "configure_audit_channel",
+    )
+)]
+async fn configure(_: Context<'_>) -> Result<(), Error> {
+    Ok(())
 }
 
 /// Exports configuration
@@ -1793,27 +1852,6 @@ async fn list_parties(ctx: Context<'_>) -> Result<(), Error> {
     };
     ctx.send(CreateReply::default().content(response).ephemeral(true))
         .await?;
-    Ok(())
-}
-
-/// Displays your or another user's account creation date
-#[poise::command(
-    slash_command,
-    prefix_command,
-    default_member_permissions = "MANAGE_CHANNELS",
-    subcommands(
-        "configure_team_size",
-        "configure_queue_category",
-        "configure_queue_channels",
-        "configure_team_count",
-        "configure_post_match_channel",
-        "configure_maps",
-        "configure_map_vote_count",
-        "configure_map_vote_time",
-        "configure_maximum_queue_cost"
-    )
-)]
-async fn configure(_: Context<'_>) -> Result<(), Error> {
     Ok(())
 }
 
@@ -2091,6 +2129,7 @@ async fn ban_player(
         chrono::offset::Utc::now() + TimeDelta::new(60 * 60 * 24 * days as i64, 0).unwrap()
     });
     let ban_data: BanData = BanData { end_time, reason };
+    let ban_text = get_ban_text(&player, &ban_data);
     let was_previously_banned = ctx
         .data()
         .player_bans
@@ -2102,8 +2141,12 @@ async fn ban_player(
     let response = if was_previously_banned {
         format!("{}'s ban was updated.", player.mention())
     } else {
-        format!("{} banned", player.mention())
+        ban_text.clone()
     };
+    let audit_channel = ctx.data().configuration.lock().unwrap().audit_channel;
+    if let Some(audit_log) = audit_channel{
+        audit_log.send_message(ctx.http(), CreateMessage::new().content(ban_text).allowed_mentions(CreateAllowedMentions::new().all_users(false))).await?;
+    }
     ctx.send(CreateReply::default().content(response).ephemeral(true))
         .await?;
     Ok(())
@@ -2125,6 +2168,10 @@ async fn unban_player(
         .is_some();
 
     let response = if was_banned {
+        let audit_channel = ctx.data().configuration.lock().unwrap().audit_channel;
+        if let Some(audit_log) = audit_channel{
+            audit_log.send_message(ctx.http(), CreateMessage::new().content(format!("Unbanned {}.", player.mention())).allowed_mentions(CreateAllowedMentions::new().all_users(false))).await?;
+        }
         format!("Unbanned {}.", player.mention())
     } else {
         format!("{} was not banned.", player.mention())
@@ -2144,22 +2191,24 @@ async fn list_bans(ctx: Context<'_>) -> Result<(), Error> {
         .lock()
         .unwrap()
         .iter()
-        .map(|(id, ban_data)| {
-            let mut ban = format!("{} banned", id.mention());
-            if let Some(reason) = ban_data.reason.clone() {
-                ban += format!(" for {}", reason).as_str();
-            }
-            if let Some(end_time) = ban_data.end_time {
-                ban += format!(" until <t:{}:f>", end_time.timestamp()).as_str();
-            }
-            ban
-        })
+        .map(|(id, ban_data)| get_ban_text(id, ban_data))
         .join("\n");
 
     let response = format!("# Player Bans\n{}", ban_data);
     ctx.send(CreateReply::default().content(response).ephemeral(true))
         .await?;
     Ok(())
+}
+
+fn get_ban_text(id: &UserId, ban_data: &BanData) -> String {
+    let mut ban = format!("{} banned", id.mention());
+    if let Some(reason) = ban_data.reason.clone() {
+        ban += format!(" for {}", reason).as_str();
+    }
+    if let Some(end_time) = ban_data.end_time {
+        ban += format!(" until <t:{}:f>", end_time.timestamp()).as_str();
+    }
+    ban
 }
 
 /// Gets player info
