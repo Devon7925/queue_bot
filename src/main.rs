@@ -263,29 +263,19 @@ async fn try_queue_player(
         let config = data.configuration.lock().unwrap();
         config.game_categories.clone()
     };
-    let user = user_id.to_user(http.clone()).await.unwrap();
+    let user_roles = guild_id.member(http.clone(), user_id).await.unwrap().roles;
 
-    let player_categories: HashMap<String, Vec<usize>> = future::join_all(
-        game_categories
+    let player_categories: HashMap<String, Vec<usize>> = game_categories
             .iter()
-            .map(|(category_name, category_roles)| async {
+            .map(|(category_name, category_roles)| {
                 (
                     category_name.clone(),
-                    future::join_all(category_roles.iter().map(|role| async {
-                        user.has_role(http.clone(), guild_id, *role).await.unwrap()
-                    }))
-                    .await
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, has_role)| **has_role)
+                    category_roles.iter().enumerate()
+                    .filter(|(_, role)| user_roles.contains(role))
                     .map(|(idx, _)| idx)
                     .collect_vec(),
                 )
-            }),
-    )
-    .await
-    .into_iter()
-    .collect();
+            }).collect();
     {
         let mut player_data = data.player_data.lock().unwrap();
         player_data
@@ -329,17 +319,20 @@ async fn handler(
             let mut player_added_to_queue = false;
             {
                 {
-                    let config = data.configuration.lock().unwrap();
+                    let config = data.configuration.lock().unwrap().clone();
                     if let Some(old) = old {
                         if let Some(channel_id) = old.channel_id {
                             if config.queue_channels.contains(&channel_id) {
-                                let mut player_data = data.player_data.lock().unwrap();
-                                let mut queued_players = data.queued_players.lock().unwrap();
-                                player_data
-                                    .entry(new.user_id)
-                                    .or_insert(DerivedPlayerData::default())
-                                    .queue_enter_time = None;
-                                queued_players.remove(&old.user_id);
+                                {
+                                    let mut player_data = data.player_data.lock().unwrap();
+                                    let mut queued_players = data.queued_players.lock().unwrap();
+                                    player_data
+                                        .entry(new.user_id)
+                                        .or_insert(DerivedPlayerData::default())
+                                        .queue_enter_time = None;
+                                    queued_players.remove(&old.user_id);
+                                }
+                                update_queue_messages(data.clone(), ctx.http.clone()).await?;
                             }
                         }
                     }
@@ -927,7 +920,6 @@ async fn matchmake(data: Arc<Data>, http: Arc<Http>, guild_id: GuildId) -> Resul
             // Mark as running again
             *guard = Some(());
         } else {
-            println!("queue success");
             update_queue_messages(data.clone(), http.clone()).await?;
             break;
         }
