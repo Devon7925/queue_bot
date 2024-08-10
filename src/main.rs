@@ -11,10 +11,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 use itertools::{Itertools, MinMaxResult};
 use poise::{
     serenity_prelude::{
-        self as serenity, futures::future, Builder, CacheHttp, ChannelId, ChannelType,
-        CreateActionRow, CreateAllowedMentions, CreateButton, CreateChannel,
-        CreateInteractionResponseMessage, CreateMessage, EditMember, EditMessage, GuildId, Http,
-        Mentionable, RoleId, UserId,
+        self as serenity, futures::future, Builder, CacheHttp, ChannelId, ChannelType, CreateActionRow, CreateAllowedMentions, CreateButton, CreateChannel, CreateInteractionResponse, CreateInteractionResponseMessage, CreateMessage, EditMember, EditMessage, GuildId, Http, Mentionable, MessageId, RoleId, UserId
     },
     CreateReply,
 };
@@ -94,6 +91,7 @@ struct QueueConfiguration {
     category: Option<ChannelId>,
     queue_channels: Vec<ChannelId>,
     post_match_channel: Option<ChannelId>,
+    queue_messages: Vec<(ChannelId, MessageId)>,
     maps: Vec<String>,
     map_vote_count: u32,
     map_vote_time: u32,
@@ -111,6 +109,7 @@ impl Default for QueueConfiguration {
             category: None,
             queue_channels: vec![],
             post_match_channel: None,
+            queue_messages: vec![],
             maps: vec![],
             map_vote_count: 0,
             map_vote_time: 0,
@@ -254,7 +253,7 @@ impl Default for DerivedPlayerData {
 async fn try_queue_player(
     data: Arc<Data>,
     user_id: UserId,
-    http: impl CacheHttp + Clone,
+    http: Arc<Http>,
     guild_id: GuildId,
 ) -> Result<(), String> {
     update_bans(data.clone());
@@ -285,29 +284,32 @@ async fn try_queue_player(
     .await
     .into_iter()
     .collect();
-    let mut player_data = data.player_data.lock().unwrap();
-    player_data
-        .entry(user_id)
-        .or_insert(DerivedPlayerData::default())
-        .game_categories = player_categories;
-    let mut queued_players = data.queued_players.lock().unwrap();
-    if let Some(player_ban) = data.player_bans.lock().unwrap().get(&user_id) {
-        if let Some(ban_reason) = player_ban.reason.clone() {
-            return Err(format!(
-                "Cannot queue because you're banned for {}",
-                ban_reason
-            ));
+    {
+        let mut player_data = data.player_data.lock().unwrap();
+        player_data
+            .entry(user_id)
+            .or_insert(DerivedPlayerData::default())
+            .game_categories = player_categories;
+        let mut queued_players = data.queued_players.lock().unwrap();
+        if let Some(player_ban) = data.player_bans.lock().unwrap().get(&user_id) {
+            if let Some(ban_reason) = player_ban.reason.clone() {
+                return Err(format!(
+                    "Cannot queue because you're banned for {}",
+                    ban_reason
+                ));
+            }
+            return Err("Cannot queue because you're banned".to_string());
         }
-        return Err("Cannot queue because you're banned".to_string());
+        if data.in_game_players.lock().unwrap().contains(&user_id) {
+            return Err("Cannot queue while in game!".to_string());
+        }
+        player_data
+            .entry(user_id)
+            .or_insert(DerivedPlayerData::default())
+            .queue_enter_time = Some(chrono::offset::Utc::now());
+        queued_players.insert(user_id);
     }
-    if data.in_game_players.lock().unwrap().contains(&user_id) {
-        return Err("Cannot queue while in game!".to_string());
-    }
-    player_data
-        .entry(user_id)
-        .or_insert(DerivedPlayerData::default())
-        .queue_enter_time = Some(chrono::offset::Utc::now());
-    queued_players.insert(user_id);
+    update_queue_messages(data, http).await.ok();
     Ok(())
 }
 
@@ -535,9 +537,12 @@ async fn handler(
                             apply_match_results(data.clone(), vote_result, &players);
 
                             let guild_id = message_component.guild_id.unwrap();
+                            for player in players.iter().flat_map(|t| t) {
+                                data.in_game_players.lock().unwrap().remove(player);
+                            }
+                            update_queue_messages(data.clone(), ctx.http.clone()).await?;
                             if let Some(post_match_channel) = post_match_channel {
                                 for player in players.iter().flat_map(|t| t) {
-                                    data.in_game_players.lock().unwrap().remove(player);
                                     ctx.http
                                         .get_member(guild_id, *player)
                                         .await?
@@ -726,12 +731,97 @@ async fn handler(
                         .await?;
                     return Ok(());
                 }
+                if message_component.data.custom_id == "queue" {
+                    match try_queue_player(
+                        data.clone(),
+                        message_component.user.id,
+                        ctx.http.clone(),
+                        message_component.guild_id.unwrap(),
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            message_component.create_response(ctx.http(), CreateInteractionResponse::Message(CreateInteractionResponseMessage::new().content("Joined queue!").ephemeral(true)))
+                                .await?;
+                            matchmake(
+                                data.clone(),
+                                ctx.http.clone(),
+                                message_component.guild_id.unwrap(),
+                            )
+                            .await?;
+                        }
+                        Err(reason) => {
+                            message_component.create_response(ctx.http(), CreateInteractionResponse::Message(CreateInteractionResponseMessage::new().content(reason).ephemeral(true)))
+                                .await?;
+                        }
+                    }
+                    return Ok(())
+                }
+                if message_component.data.custom_id == "leave_queue" {
+                    let removed = {
+                        let mut queued_players = data.queued_players.lock().unwrap();
+                        let mut player_data = data.player_data.lock().unwrap();
+                        player_data
+                            .get_mut(&message_component.user.id)
+                            .unwrap()
+                            .queue_enter_time = None;
+                        queued_players.remove(&message_component.user.id)
+                    };
+                    if removed {
+                        message_component.create_response(ctx.http(), CreateInteractionResponse::Message(CreateInteractionResponseMessage::new().content("You are no longer queueing!").ephemeral(true)))
+                            .await?;
+                        update_queue_messages(data.clone(), ctx.http.clone()).await?;
+                    } else {
+                        message_component.create_response(ctx.http(), CreateInteractionResponse::Message(CreateInteractionResponseMessage::new().content("You weren't queued!").ephemeral(true)))
+                            .await?;
+                    }
+                    return Ok(())
+                }
+                if message_component.data.custom_id == "status" {
+                    let was_in_queue = {
+                        let queued_players = data.queued_players.lock().unwrap();
+                        queued_players.contains(&message_component.user.id)
+                    };
+                    let was_in_game = {
+                        let gaming_players = data.in_game_players.lock().unwrap();
+                        gaming_players.contains(&message_component.user.id)
+                    };
+                    if was_in_queue {
+                        message_component.create_response(ctx.http(), CreateInteractionResponse::Message(CreateInteractionResponseMessage::new().content("You are in queue.").ephemeral(true)))
+                            .await?;
+                    } else if was_in_game {
+                        message_component.create_response(ctx.http(), CreateInteractionResponse::Message(CreateInteractionResponseMessage::new().content("You are in a game.").ephemeral(true)))
+                            .await?;
+                    } else {
+                        message_component.create_response(ctx.http(), CreateInteractionResponse::Message(CreateInteractionResponseMessage::new().content("You aren't in queue").ephemeral(true)))
+                            .await?;
+                    }
+                    return Ok(())
+                }
             }
         }
         serenity::FullEvent::Ratelimit { .. } => {
             println!("Rate limited")
         }
         _ => {}
+    }
+    Ok(())
+}
+
+async fn update_queue_messages(data: Arc<Data>, http: Arc<Http>) -> Result<(), Error> {
+    let response = {
+        let queued_players = data.queued_players.lock().unwrap();
+        let in_game_players = data.in_game_players.lock().unwrap();
+        format!(
+            "## Matchmaking Queue\n### {} people are playing right now\nThere are {} queued players: {}",
+            queued_players.len() + in_game_players.len(),
+            queued_players.len(),
+            queued_players.iter().map(|c| c.mention()).join(", ")
+        )
+    };
+    let queue_messages = data.configuration.lock().unwrap().queue_messages.clone();
+    for (message_channel, queue_message) in queue_messages {
+        message_channel.edit_message(http.clone(), queue_message, EditMessage::new().content(&response)).await?;
     }
     Ok(())
 }
@@ -804,7 +894,7 @@ fn apply_match_results(data: Arc<Data>, result: MatchResult, players: &Vec<Vec<U
     }
 }
 
-async fn matchmake(data: Arc<Data>, cache_http: Arc<Http>, guild_id: GuildId) -> Result<(), Error> {
+async fn matchmake(data: Arc<Data>, http: Arc<Http>, guild_id: GuildId) -> Result<(), Error> {
     {
         let mut guard = data.is_matchmaking.lock().unwrap();
 
@@ -819,7 +909,7 @@ async fn matchmake(data: Arc<Data>, cache_http: Arc<Http>, guild_id: GuildId) ->
 
     loop {
         // Actual task execution
-        let result = try_matchmaking(data.clone(), cache_http.clone(), guild_id).await?;
+        let result = try_matchmaking(data.clone(), http.clone(), guild_id).await?;
 
         if let Some(delay) = result {
             // Task failed, clear running state and retry after delay
@@ -835,6 +925,8 @@ async fn matchmake(data: Arc<Data>, cache_http: Arc<Http>, guild_id: GuildId) ->
             // Mark as running again
             *guard = Some(());
         } else {
+            println!("queue success");
+            update_queue_messages(data.clone(), http.clone()).await?;
             break;
         }
     }
@@ -1075,23 +1167,19 @@ async fn try_matchmaking(
                         team.into_iter()
                             .map(|player| (team_vc, player, http.clone()))
                             .map(|(team_vc, player, http)| async move {
-                                guild_id
+                                if let Ok(mut member) = guild_id
                                     .member(http.clone(), player)
-                                    .await?
-                                    .edit(http.clone(), EditMember::new().voice_channel(team_vc))
-                                    .await?;
-                                Ok::<(), Error>(())
+                                    .await {
+                                    member.edit(http.clone(), EditMember::new().voice_channel(team_vc))
+                                        .await
+                                        .ok();
+                                }
                             }),
                     )
-                    .await
-                    .into_iter()
-                    .collect::<Result<_, _>>()?;
-                    Ok::<(), Error>(())
+                    .await;
                 }),
         )
-        .await
-        .into_iter()
-        .collect::<Result<_, _>>()?;
+        .await;
     }
     Ok(None)
 }
@@ -1470,7 +1558,7 @@ async fn configure_map_vote_count(
     }
 }
 
-/// Displays or sets number of maps for the vote
+/// Displays or sets time maps for the vote (0 for no timeout)
 #[poise::command(slash_command, prefix_command, rename = "map_vote_time")]
 async fn configure_map_vote_time(
     ctx: Context<'_>,
@@ -1617,7 +1705,7 @@ async fn queue(ctx: Context<'_>) -> Result<(), Error> {
     match try_queue_player(
         ctx.data().clone(),
         ctx.author().id,
-        ctx.http(),
+        ctx.serenity_context().http.clone(),
         ctx.guild_id().unwrap(),
     )
     .await
@@ -1667,6 +1755,7 @@ async fn leave_queue(ctx: Context<'_>) -> Result<(), Error> {
                 .ephemeral(true),
         )
         .await?;
+        update_queue_messages(ctx.data().clone(), ctx.serenity_context().http.clone()).await?;
         Ok(())
     } else {
         ctx.send(
@@ -1685,7 +1774,8 @@ async fn list_queued(ctx: Context<'_>) -> Result<(), Error> {
     let response = {
         let data_lock = ctx.data().queued_players.lock().unwrap();
         format!(
-            "Queued players: {}",
+            "There are {} queued players: {}",
+            data_lock.len(),
             data_lock.iter().map(|c| c.mention()).join(", ")
         )
     };
@@ -2301,6 +2391,30 @@ async fn force_result(ctx: Context<'_>, result: MatchResult) -> Result<(), Error
     Ok(())
 }
 
+/// Displays or sets number of maps for the vote
+#[poise::command(
+    slash_command,
+    prefix_command,
+    default_member_permissions = "MANAGE_CHANNELS"
+)]
+async fn create_queue_message(
+    ctx: Context<'_>,
+) -> Result<(), Error> {
+    let msg = ctx.send(CreateReply::default().content("## Matchmaking queue").components(
+        vec![
+            CreateActionRow::Buttons(vec![
+                CreateButton::new("queue").label("Join Queue").style(serenity::ButtonStyle::Primary),
+                CreateButton::new("leave_queue").label("Leave Queue").style(serenity::ButtonStyle::Danger),
+                CreateButton::new("status").label("Status").style(serenity::ButtonStyle::Secondary),
+            ])
+        ]
+    ).ephemeral(false))
+        .await?.into_message().await?.id;
+    ctx.data().configuration.lock().unwrap().queue_messages.push((ctx.channel_id(), msg));
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
     let token = std::env::var("DISCORD_BOT_TOKEN").expect("missing DISCORD_BOT_TOKEN");
@@ -2328,6 +2442,7 @@ async fn main() {
                 mark_leaver(),
                 list_leavers(),
                 force_outcome(),
+                create_queue_message(),
             ],
             ..Default::default()
         })
