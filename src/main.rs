@@ -21,6 +21,7 @@ use skillratings::{
     weng_lin::{WengLin, WengLinConfig, WengLinRating},
     MultiTeamOutcome, MultiTeamRatingSystem,
 };
+use tokio::sync::Notify;
 use uuid::Uuid;
 
 #[derive(Serialize, Deserialize)]
@@ -44,6 +45,8 @@ struct Data {
     leaver_data: Mutex<HashMap<UserId, u32>>,
     #[serde(default)]
     is_matchmaking: Mutex<Option<()>>,
+    #[serde(skip)]
+    message_edit_notify: Mutex<Arc<Notify>>,
     queue_idx: Mutex<u32>,
 } // User data, which is stored and accessible in all command invocations
 type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -62,6 +65,7 @@ impl Default for Data {
             group_data: Mutex::new(HashMap::new()),
             player_bans: Mutex::new(HashMap::new()),
             leaver_data: Mutex::new(HashMap::new()),
+            message_edit_notify: Mutex::new(Arc::new(Notify::new())),
             is_matchmaking: Mutex::new(None),
         }
     }
@@ -264,7 +268,6 @@ async fn try_queue_player(
         config.game_categories.clone()
     };
     let user_roles = guild_id.member(http.clone(), user_id).await.unwrap().roles;
-
     let player_categories: HashMap<String, Vec<usize>> = game_categories
             .iter()
             .map(|(category_name, category_roles)| {
@@ -301,7 +304,6 @@ async fn try_queue_player(
             .queue_enter_time = Some(chrono::offset::Utc::now());
         queued_players.insert(user_id);
     }
-    update_queue_messages(data, http).await.ok();
     Ok(())
 }
 
@@ -313,7 +315,16 @@ async fn handler(
 ) -> Result<(), Error> {
     match event {
         serenity::FullEvent::Ready { .. } => {
-            println!("Ready")
+            println!("Ready");
+            let notify2 = data.message_edit_notify.lock().unwrap().clone();
+            let http = ctx.http.clone();
+            tokio::spawn(async move {
+                loop {
+                    notify2.notified().await;
+                    update_queue_messages(data.clone(), http.clone()).await.ok();
+                    tokio::time::sleep(Duration::from_secs_f32(1.0)).await;
+                }
+            });
         }
         serenity::FullEvent::VoiceStateUpdate { old, new } => {
             let mut player_added_to_queue = false;
@@ -332,7 +343,7 @@ async fn handler(
                                         .queue_enter_time = None;
                                     queued_players.remove(&old.user_id);
                                 }
-                                update_queue_messages(data.clone(), ctx.http.clone()).await?;
+                                data.message_edit_notify.lock().unwrap().notify_one();
                             }
                         }
                     }
@@ -357,6 +368,7 @@ async fn handler(
                     {
                         Ok(()) => {
                             player_added_to_queue = true;
+                            data.message_edit_notify.lock().unwrap().notify_one();
                         }
                         Err(reason) => {
                             new.user_id
@@ -535,9 +547,15 @@ async fn handler(
                             for player in players.iter().flat_map(|t| t) {
                                 data.in_game_players.lock().unwrap().remove(player);
                             }
-                            update_queue_messages(data.clone(), ctx.http.clone()).await?;
+                            data.message_edit_notify.lock().unwrap().notify_one();
                             if let Some(post_match_channel) = post_match_channel {
-                                for player in players.iter().flat_map(|t| t) {
+                                future::join_all(players.iter().flat_map(|t| t).filter(|player| 
+                                    if let Some(Some(current_vc)) = guild_id.to_guild_cached(&ctx.cache).unwrap().voice_states.get(player).map(|p| p.channel_id) {
+                                        channels.contains(&current_vc)
+                                    } else {
+                                        false
+                                    }
+                                ).map(|player| async {
                                     ctx.http
                                         .get_member(guild_id, *player)
                                         .await?
@@ -545,9 +563,9 @@ async fn handler(
                                             ctx.http.clone(),
                                             EditMember::new().voice_channel(post_match_channel),
                                         )
-                                        .await
-                                        .ok();
-                                }
+                                        .await?;
+                                    Ok::<(), Error>(())
+                                })).await.into_iter().collect::<Result<(), _>>()?;
                             }
                             for channel in channels {
                                 data.match_channels.lock().unwrap().remove(&channel);
@@ -557,6 +575,7 @@ async fn handler(
                                 let mut match_data = data.match_data.lock().unwrap();
                                 match_data.remove(&match_number);
                             }
+                            return Ok(());
                         }
                         ctx.http
                             .clone()
@@ -738,6 +757,7 @@ async fn handler(
                         Ok(()) => {
                             message_component.create_response(ctx.http(), CreateInteractionResponse::Message(CreateInteractionResponseMessage::new().content("Joined queue!").ephemeral(true)))
                                 .await?;
+                            data.message_edit_notify.lock().unwrap().notify_one();
                             matchmake(
                                 data.clone(),
                                 ctx.http.clone(),
@@ -765,7 +785,7 @@ async fn handler(
                     if removed {
                         message_component.create_response(ctx.http(), CreateInteractionResponse::Message(CreateInteractionResponseMessage::new().content("You are no longer queueing!").ephemeral(true)))
                             .await?;
-                        update_queue_messages(data.clone(), ctx.http.clone()).await?;
+                        data.message_edit_notify.lock().unwrap().notify_one();
                     } else {
                         message_component.create_response(ctx.http(), CreateInteractionResponse::Message(CreateInteractionResponseMessage::new().content("You weren't queued!").ephemeral(true)))
                             .await?;
@@ -920,7 +940,7 @@ async fn matchmake(data: Arc<Data>, http: Arc<Http>, guild_id: GuildId) -> Resul
             // Mark as running again
             *guard = Some(());
         } else {
-            update_queue_messages(data.clone(), http.clone()).await?;
+            data.message_edit_notify.lock().unwrap().notify_one();
             break;
         }
     }
@@ -1771,6 +1791,7 @@ async fn queue(ctx: Context<'_>) -> Result<(), Error> {
             };
             ctx.send(CreateReply::default().content(response).ephemeral(true))
                 .await?;
+            ctx.data().message_edit_notify.lock().unwrap().notify_one();
             matchmake(
                 ctx.data().clone(),
                 ctx.serenity_context().http.clone(),
@@ -1806,7 +1827,7 @@ async fn leave_queue(ctx: Context<'_>) -> Result<(), Error> {
                 .ephemeral(true),
         )
         .await?;
-        update_queue_messages(ctx.data().clone(), ctx.serenity_context().http.clone()).await?;
+        ctx.data().message_edit_notify.lock().unwrap().notify_one();
         Ok(())
     } else {
         ctx.send(
