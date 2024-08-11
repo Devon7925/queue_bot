@@ -11,7 +11,10 @@ use chrono::{DateTime, TimeDelta, Utc};
 use itertools::{Itertools, MinMaxResult};
 use poise::{
     serenity_prelude::{
-        self as serenity, futures::future, Builder, CacheHttp, ChannelId, ChannelType, CreateActionRow, CreateAllowedMentions, CreateButton, CreateChannel, CreateInteractionResponse, CreateInteractionResponseMessage, CreateMessage, EditMember, EditMessage, GuildId, Http, Mentionable, MessageId, RoleId, UserId
+        self as serenity, futures::future, Builder, CacheHttp, ChannelId, ChannelType,
+        CreateActionRow, CreateAllowedMentions, CreateButton, CreateChannel,
+        CreateInteractionResponse, CreateInteractionResponseMessage, CreateMessage, EditMember,
+        EditMessage, GuildId, Http, Mentionable, MessageId, RoleId, UserId,
     },
     CreateReply,
 };
@@ -269,16 +272,19 @@ async fn try_queue_player(
     };
     let user_roles = guild_id.member(http.clone(), user_id).await.unwrap().roles;
     let player_categories: HashMap<String, Vec<usize>> = game_categories
-            .iter()
-            .map(|(category_name, category_roles)| {
-                (
-                    category_name.clone(),
-                    category_roles.iter().enumerate()
+        .iter()
+        .map(|(category_name, category_roles)| {
+            (
+                category_name.clone(),
+                category_roles
+                    .iter()
+                    .enumerate()
                     .filter(|(_, role)| user_roles.contains(role))
                     .map(|(idx, _)| idx)
                     .collect_vec(),
-                )
-            }).collect();
+            )
+        })
+        .collect();
     {
         let mut player_data = data.player_data.lock().unwrap();
         player_data
@@ -549,23 +555,39 @@ async fn handler(
                             }
                             data.message_edit_notify.lock().unwrap().notify_one();
                             if let Some(post_match_channel) = post_match_channel {
-                                future::join_all(players.iter().flat_map(|t| t).filter(|player| 
-                                    if let Some(Some(current_vc)) = guild_id.to_guild_cached(&ctx.cache).unwrap().voice_states.get(player).map(|p| p.channel_id) {
-                                        channels.contains(&current_vc)
-                                    } else {
-                                        false
-                                    }
-                                ).map(|player| async {
-                                    ctx.http
-                                        .get_member(guild_id, *player)
-                                        .await?
-                                        .edit(
-                                            ctx.http.clone(),
-                                            EditMember::new().voice_channel(post_match_channel),
-                                        )
-                                        .await?;
-                                    Ok::<(), Error>(())
-                                })).await.into_iter().collect::<Result<(), _>>()?;
+                                future::join_all(
+                                    players
+                                        .iter()
+                                        .flat_map(|t| t)
+                                        .filter(|player| {
+                                            if let Some(Some(current_vc)) = guild_id
+                                                .to_guild_cached(&ctx.cache)
+                                                .unwrap()
+                                                .voice_states
+                                                .get(player)
+                                                .map(|p| p.channel_id)
+                                            {
+                                                channels.contains(&current_vc)
+                                            } else {
+                                                false
+                                            }
+                                        })
+                                        .map(|player| async {
+                                            ctx.http
+                                                .get_member(guild_id, *player)
+                                                .await?
+                                                .edit(
+                                                    ctx.http.clone(),
+                                                    EditMember::new()
+                                                        .voice_channel(post_match_channel),
+                                                )
+                                                .await?;
+                                            Ok::<(), Error>(())
+                                        }),
+                                )
+                                .await
+                                .into_iter()
+                                .collect::<Result<(), _>>()?;
                             }
                             for channel in channels {
                                 data.match_channels.lock().unwrap().remove(&channel);
@@ -755,7 +777,15 @@ async fn handler(
                     .await
                     {
                         Ok(()) => {
-                            message_component.create_response(ctx.http(), CreateInteractionResponse::Message(CreateInteractionResponseMessage::new().content("Joined queue!").ephemeral(true)))
+                            message_component
+                                .create_response(
+                                    ctx.http(),
+                                    CreateInteractionResponse::Message(
+                                        CreateInteractionResponseMessage::new()
+                                            .content("Joined queue!")
+                                            .ephemeral(true),
+                                    ),
+                                )
                                 .await?;
                             data.message_edit_notify.lock().unwrap().notify_one();
                             matchmake(
@@ -766,31 +796,55 @@ async fn handler(
                             .await?;
                         }
                         Err(reason) => {
-                            message_component.create_response(ctx.http(), CreateInteractionResponse::Message(CreateInteractionResponseMessage::new().content(reason).ephemeral(true)))
+                            message_component
+                                .create_response(
+                                    ctx.http(),
+                                    CreateInteractionResponse::Message(
+                                        CreateInteractionResponseMessage::new()
+                                            .content(reason)
+                                            .ephemeral(true),
+                                    ),
+                                )
                                 .await?;
                         }
                     }
-                    return Ok(())
+                    return Ok(());
                 }
                 if message_component.data.custom_id == "leave_queue" {
                     let removed = {
                         let mut queued_players = data.queued_players.lock().unwrap();
                         let mut player_data = data.player_data.lock().unwrap();
                         player_data
-                            .get_mut(&message_component.user.id)
-                            .unwrap()
+                            .entry(message_component.user.id)
+                            .or_default()
                             .queue_enter_time = None;
                         queued_players.remove(&message_component.user.id)
                     };
                     if removed {
-                        message_component.create_response(ctx.http(), CreateInteractionResponse::Message(CreateInteractionResponseMessage::new().content("You are no longer queueing!").ephemeral(true)))
+                        message_component
+                            .create_response(
+                                ctx.http(),
+                                CreateInteractionResponse::Message(
+                                    CreateInteractionResponseMessage::new()
+                                        .content("You are no longer queueing!")
+                                        .ephemeral(true),
+                                ),
+                            )
                             .await?;
                         data.message_edit_notify.lock().unwrap().notify_one();
                     } else {
-                        message_component.create_response(ctx.http(), CreateInteractionResponse::Message(CreateInteractionResponseMessage::new().content("You weren't queued!").ephemeral(true)))
+                        message_component
+                            .create_response(
+                                ctx.http(),
+                                CreateInteractionResponse::Message(
+                                    CreateInteractionResponseMessage::new()
+                                        .content("You weren't queued!")
+                                        .ephemeral(true),
+                                ),
+                            )
                             .await?;
                     }
-                    return Ok(())
+                    return Ok(());
                 }
                 if message_component.data.custom_id == "status" {
                     let was_in_queue = {
@@ -802,16 +856,40 @@ async fn handler(
                         gaming_players.contains(&message_component.user.id)
                     };
                     if was_in_queue {
-                        message_component.create_response(ctx.http(), CreateInteractionResponse::Message(CreateInteractionResponseMessage::new().content("You are in queue.").ephemeral(true)))
+                        message_component
+                            .create_response(
+                                ctx.http(),
+                                CreateInteractionResponse::Message(
+                                    CreateInteractionResponseMessage::new()
+                                        .content("You are in queue.")
+                                        .ephemeral(true),
+                                ),
+                            )
                             .await?;
                     } else if was_in_game {
-                        message_component.create_response(ctx.http(), CreateInteractionResponse::Message(CreateInteractionResponseMessage::new().content("You are in a game.").ephemeral(true)))
+                        message_component
+                            .create_response(
+                                ctx.http(),
+                                CreateInteractionResponse::Message(
+                                    CreateInteractionResponseMessage::new()
+                                        .content("You are in a game.")
+                                        .ephemeral(true),
+                                ),
+                            )
                             .await?;
                     } else {
-                        message_component.create_response(ctx.http(), CreateInteractionResponse::Message(CreateInteractionResponseMessage::new().content("You aren't in queue").ephemeral(true)))
+                        message_component
+                            .create_response(
+                                ctx.http(),
+                                CreateInteractionResponse::Message(
+                                    CreateInteractionResponseMessage::new()
+                                        .content("You aren't in queue")
+                                        .ephemeral(true),
+                                ),
+                            )
                             .await?;
                     }
-                    return Ok(())
+                    return Ok(());
                 }
             }
         }
@@ -836,7 +914,13 @@ async fn update_queue_messages(data: Arc<Data>, http: Arc<Http>) -> Result<(), E
     };
     let queue_messages = data.configuration.lock().unwrap().queue_messages.clone();
     for (message_channel, queue_message) in queue_messages {
-        message_channel.edit_message(http.clone(), queue_message, EditMessage::new().content(&response)).await?;
+        message_channel
+            .edit_message(
+                http.clone(),
+                queue_message,
+                EditMessage::new().content(&response),
+            )
+            .await?;
     }
     Ok(())
 }
@@ -1019,182 +1103,197 @@ async fn try_matchmaking(
     .await;
     let match_channel = match_channel?;
     let vc_channels = vc_channels.into_iter().map(|c| c.unwrap()).collect_vec();
-
-    let mut members_message = String::new();
-    members_message += format!("# Queue#{}\n", new_idx).as_str();
-    for (category_name, value) in cost_eval.1 {
-        members_message += format!(
-            "{}: {}\n",
-            category_name,
-            config.game_categories[&category_name][value].mention()
-        )
-        .as_str();
-    }
-    for (team_idx, team) in members.iter().enumerate() {
-        members_message += format!("## Team {}\n", team_idx + 1).as_str();
-        for player in team {
-            members_message += format!("{}\n", player.mention()).as_str();
-        }
-    }
-    match_channel
-        .send_message(
-            cache_http.clone(),
-            CreateMessage::default()
-                .allowed_mentions(
-                    CreateAllowedMentions::default()
-                        .all_roles(false)
-                        .all_users(true),
+    let members_copy = members.clone();
+    let vc_channels_copy = vc_channels.clone();
+    let cache_http_copy = cache_http.clone();
+    future::join(
+        async {
+            let mut members_message = String::new();
+            members_message += format!("# Queue#{}\n", new_idx).as_str();
+            for (category_name, value) in cost_eval.1 {
+                members_message += format!(
+                    "{}: {}\n",
+                    category_name,
+                    config.game_categories[&category_name][value].mention()
                 )
-                .content(members_message),
-        )
-        .await?;
-    let mut map_vote_end_time = None;
-    if config.map_vote_count > 0 {
-        let mut map_vote_message_content = "# Map Vote".to_string();
-        if config.map_vote_time > 0 {
-            map_vote_end_time = Some(
-                std::time::UNIX_EPOCH.elapsed().unwrap().as_secs() + config.map_vote_time as u64,
-            );
-            map_vote_message_content +=
-                format!("\nEnds <t:{}:R>", map_vote_end_time.unwrap()).as_str();
-        }
-        let mut map_vote_message = CreateMessage::default().content(map_vote_message_content);
-        let mut map_pool = config.maps.clone();
-        let mut maps = vec![];
-        for _ in 0..config.map_vote_count {
-            let num = rand::thread_rng().gen_range(0..map_pool.len());
-            let rand_map = map_pool.remove(num);
-            maps.push(rand_map.clone());
-            map_vote_message = map_vote_message.button(
-                CreateButton::new(format!("map_{}", rand_map).clone())
-                    .label(rand_map)
-                    .style(serenity::ButtonStyle::Secondary),
-            );
-        }
-        let mut map_message = match_channel
-            .send_message(cache_http.clone(), map_vote_message)
-            .await?;
-        if config.map_vote_time > 0 {
-            let ctx1 = Arc::clone(&cache_http);
-            let data = data.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_secs(config.map_vote_time as u64)).await;
-                if map_message.components.is_empty() {
-                    return;
-                }
-                let vote_result = {
-                    let match_data = data.match_data.lock().unwrap();
-                    let match_number = new_idx;
-                    let mut votes: HashMap<String, u32> = HashMap::new();
-                    let Some(match_data) = match_data.get(&match_number) else {
-                        return;
-                    };
-                    for (_user, vote) in match_data.map_votes.iter() {
-                        let current_votes = votes.get(vote).unwrap_or(&0);
-                        votes.insert(vote.clone(), current_votes + 1);
+                .as_str();
+            }
+            for (team_idx, team) in members_copy.iter().enumerate() {
+                members_message += format!("## Team {}\n", team_idx + 1).as_str();
+                let mut team_copy = team.clone();
+                team_copy.sort_by_key(|player| {
+                    if let Some(Some(Some(name))) = player
+                        .to_user_cached(&cache_http_copy.cache().unwrap())
+                        .map(|user| user.member.as_ref().map(|member| member.nick.clone()))
+                    {
+                        name
+                    } else {
+                        "".to_string()
                     }
-                    votes
-                        .iter()
-                        .max_by_key(|(_category, vote_count)| *vote_count)
-                        .map(|(category, _vote_count)| category.clone())
-                        .unwrap_or(maps[0].clone())
-                        .clone()
-                };
-
-                map_message
-                    .edit(ctx1.clone(), EditMessage::new().components(vec![]))
-                    .await
-                    .ok();
-                let content = format!("# Map: {}", vote_result);
-
-                map_message
-                    .edit(ctx1.clone(), EditMessage::new().content(content))
-                    .await
-                    .ok();
-            });
-        }
-    } else if config.maps.len() > 0 {
-        let num = rand::thread_rng().gen_range(0..config.maps.len());
-        let chosen_map = config.maps.get(num).unwrap().clone();
-        let map_vote_message = CreateMessage::default().content(format!("# Map: {}", chosen_map));
-        match_channel
-            .send_message(cache_http.clone(), map_vote_message)
-            .await?;
-    }
-    let mut result_message = CreateMessage::default();
-    for i in 0..team_count {
-        result_message = result_message.button(
-            CreateButton::new(format!("team_{}", i))
-                .label(format!("Team {}", i + 1))
-                .style(serenity::ButtonStyle::Primary),
-        )
-    }
-    match_channel
-        .send_message(
-            cache_http.clone(),
-            result_message
-                .button(
-                    CreateButton::new("tie")
-                        .label("Tie")
-                        .style(serenity::ButtonStyle::Secondary),
+                });
+                for player in team_copy {
+                    members_message += format!("{}\n", player.mention()).as_str();
+                }
+            }
+            match_channel
+                .send_message(
+                    cache_http_copy.clone(),
+                    CreateMessage::default()
+                        .allowed_mentions(
+                            CreateAllowedMentions::default()
+                                .all_roles(false)
+                                .all_users(true),
+                        )
+                        .content(members_message),
                 )
-                .button(
-                    CreateButton::new("cancel")
-                        .label("Cancel")
-                        .style(serenity::ButtonStyle::Danger),
-                ),
-        )
-        .await?;
-    {
-        let mut channels = data.match_channels.lock().unwrap();
-        channels.insert(match_channel.id, new_idx);
-    }
-    {
-        let mut match_data = data.match_data.lock().unwrap();
-        let mut channels = vec![match_channel.id];
-        channels.extend(vc_channels.iter().map(|c| c.id));
-        match_data.insert(
-            new_idx,
-            MatchData {
-                result_votes: HashMap::new(),
-                channels,
-                members: members.clone(),
-                map_votes: HashMap::new(),
-                map_vote_end_time,
-            },
-        );
-    }
-    {
-        future::join_all(
-            members
-                .into_iter()
-                .enumerate()
-                .map(|(team_idx, team)| {
-                    (
-                        vc_channels.get(team_idx.clone()).unwrap(),
-                        team,
-                        cache_http.clone(),
-                    )
-                })
-                .map(|(team_vc, team, http)| async move {
-                    future::join_all(
-                        team.into_iter()
-                            .map(|player| (team_vc, player, http.clone()))
-                            .map(|(team_vc, player, http)| async move {
-                                if let Ok(mut member) = guild_id
-                                    .member(http.clone(), player)
-                                    .await {
-                                    member.edit(http.clone(), EditMember::new().voice_channel(team_vc))
-                                        .await
-                                        .ok();
-                                }
-                            }),
-                    )
-                    .await;
-                }),
-        )
-        .await;
-    }
+                .await?;
+            let mut map_vote_end_time = None;
+            if config.map_vote_count > 0 {
+                let mut map_vote_message_content = "# Map Vote".to_string();
+                if config.map_vote_time > 0 {
+                    map_vote_end_time = Some(
+                        std::time::UNIX_EPOCH.elapsed().unwrap().as_secs()
+                            + config.map_vote_time as u64,
+                    );
+                    map_vote_message_content +=
+                        format!("\nEnds <t:{}:R>", map_vote_end_time.unwrap()).as_str();
+                }
+                let mut map_vote_message =
+                    CreateMessage::default().content(map_vote_message_content);
+                let mut map_pool = config.maps.clone();
+                let mut maps = vec![];
+                for _ in 0..config.map_vote_count {
+                    let num = rand::thread_rng().gen_range(0..map_pool.len());
+                    let rand_map = map_pool.remove(num);
+                    maps.push(rand_map.clone());
+                    map_vote_message = map_vote_message.button(
+                        CreateButton::new(format!("map_{}", rand_map).clone())
+                            .label(rand_map)
+                            .style(serenity::ButtonStyle::Secondary),
+                    );
+                }
+                let mut map_message = match_channel
+                    .send_message(cache_http_copy.clone(), map_vote_message)
+                    .await?;
+                if config.map_vote_time > 0 {
+                    let ctx1 = Arc::clone(&cache_http_copy);
+                    let data = data.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_secs(config.map_vote_time as u64)).await;
+                        if map_message.components.is_empty() {
+                            return;
+                        }
+                        let vote_result = {
+                            let match_data = data.match_data.lock().unwrap();
+                            let match_number = new_idx;
+                            let mut votes: HashMap<String, u32> = HashMap::new();
+                            let Some(match_data) = match_data.get(&match_number) else {
+                                return;
+                            };
+                            for (_user, vote) in match_data.map_votes.iter() {
+                                let current_votes = votes.get(vote).unwrap_or(&0);
+                                votes.insert(vote.clone(), current_votes + 1);
+                            }
+                            votes
+                                .iter()
+                                .max_by_key(|(_category, vote_count)| *vote_count)
+                                .map(|(category, _vote_count)| category.clone())
+                                .unwrap_or(maps[0].clone())
+                                .clone()
+                        };
+                        let content = format!("# Map: {}", vote_result);
+
+                        map_message
+                            .edit(
+                                ctx1.clone(),
+                                EditMessage::new().components(vec![]).content(content),
+                            )
+                            .await
+                            .ok();
+                    });
+                }
+            } else if config.maps.len() > 0 {
+                let num = rand::thread_rng().gen_range(0..config.maps.len());
+                let chosen_map = config.maps.get(num).unwrap().clone();
+                let map_vote_message =
+                    CreateMessage::default().content(format!("# Map: {}", chosen_map));
+                match_channel
+                    .send_message(cache_http_copy.clone(), map_vote_message)
+                    .await?;
+            }
+            let mut result_message = CreateMessage::default();
+            for i in 0..team_count {
+                result_message = result_message.button(
+                    CreateButton::new(format!("team_{}", i))
+                        .label(format!("Team {}", i + 1))
+                        .style(serenity::ButtonStyle::Primary),
+                )
+            }
+            match_channel
+                .send_message(
+                    cache_http_copy.clone(),
+                    result_message
+                        .button(
+                            CreateButton::new("tie")
+                                .label("Tie")
+                                .style(serenity::ButtonStyle::Secondary),
+                        )
+                        .button(
+                            CreateButton::new("cancel")
+                                .label("Cancel")
+                                .style(serenity::ButtonStyle::Danger),
+                        ),
+                )
+                .await?;
+            {
+                let mut channels = data.match_channels.lock().unwrap();
+                channels.insert(match_channel.id, new_idx);
+            }
+            {
+                let mut match_data = data.match_data.lock().unwrap();
+                let mut channels = vec![match_channel.id];
+                channels.extend(vc_channels_copy.iter().map(|c| c.id));
+                match_data.insert(
+                    new_idx,
+                    MatchData {
+                        result_votes: HashMap::new(),
+                        channels,
+                        members: members_copy,
+                        map_votes: HashMap::new(),
+                        map_vote_end_time,
+                    },
+                );
+            }
+            Ok::<(), Error>(())
+        },
+        async move {
+            future::join_all(
+                members
+                    .into_iter()
+                    .enumerate()
+                    .map(|(team_idx, team)| {
+                        (
+                            vc_channels.get(team_idx.clone()).unwrap(),
+                            team,
+                            cache_http.clone(),
+                        )
+                    })
+                    .map(|(team_vc, team, http)| async move {
+                        future::join_all(
+                            team.into_iter()
+                                .map(|player| (team_vc, player, http.clone()))
+                                .map(|(team_vc, player, http)| async move {
+                                    guild_id.move_member(http, player, team_vc.id).await
+                                }),
+                        )
+                        .await;
+                    }),
+            )
+            .await;
+        },
+    )
+    .await
+    .0?;
     Ok(None)
 }
 
@@ -2157,8 +2256,15 @@ async fn ban_player(
         ban_text.clone()
     };
     let audit_channel = ctx.data().configuration.lock().unwrap().audit_channel;
-    if let Some(audit_log) = audit_channel{
-        audit_log.send_message(ctx.http(), CreateMessage::new().content(ban_text).allowed_mentions(CreateAllowedMentions::new().all_users(false))).await?;
+    if let Some(audit_log) = audit_channel {
+        audit_log
+            .send_message(
+                ctx.http(),
+                CreateMessage::new()
+                    .content(ban_text)
+                    .allowed_mentions(CreateAllowedMentions::new().all_users(false)),
+            )
+            .await?;
     }
     ctx.send(CreateReply::default().content(response).ephemeral(true))
         .await?;
@@ -2182,8 +2288,15 @@ async fn unban_player(
 
     let response = if was_banned {
         let audit_channel = ctx.data().configuration.lock().unwrap().audit_channel;
-        if let Some(audit_log) = audit_channel{
-            audit_log.send_message(ctx.http(), CreateMessage::new().content(format!("Unbanned {}.", player.mention())).allowed_mentions(CreateAllowedMentions::new().all_users(false))).await?;
+        if let Some(audit_log) = audit_channel {
+            audit_log
+                .send_message(
+                    ctx.http(),
+                    CreateMessage::new()
+                        .content(format!("Unbanned {}.", player.mention()))
+                        .allowed_mentions(CreateAllowedMentions::new().all_users(false)),
+                )
+                .await?;
         }
         format!("Unbanned {}.", player.mention())
     } else {
@@ -2459,20 +2572,34 @@ async fn force_result(ctx: Context<'_>, result: MatchResult) -> Result<(), Error
     prefix_command,
     default_member_permissions = "MANAGE_CHANNELS"
 )]
-async fn create_queue_message(
-    ctx: Context<'_>,
-) -> Result<(), Error> {
-    let msg = ctx.send(CreateReply::default().content("## Matchmaking queue").components(
-        vec![
-            CreateActionRow::Buttons(vec![
-                CreateButton::new("queue").label("Join Queue").style(serenity::ButtonStyle::Primary),
-                CreateButton::new("leave_queue").label("Leave Queue").style(serenity::ButtonStyle::Danger),
-                CreateButton::new("status").label("Status").style(serenity::ButtonStyle::Secondary),
-            ])
-        ]
-    ).ephemeral(false))
-        .await?.into_message().await?.id;
-    ctx.data().configuration.lock().unwrap().queue_messages.push((ctx.channel_id(), msg));
+async fn create_queue_message(ctx: Context<'_>) -> Result<(), Error> {
+    let msg = ctx
+        .send(
+            CreateReply::default()
+                .content("## Matchmaking queue")
+                .components(vec![CreateActionRow::Buttons(vec![
+                    CreateButton::new("queue")
+                        .label("Join Queue")
+                        .style(serenity::ButtonStyle::Primary),
+                    CreateButton::new("leave_queue")
+                        .label("Leave Queue")
+                        .style(serenity::ButtonStyle::Danger),
+                    CreateButton::new("status")
+                        .label("Status")
+                        .style(serenity::ButtonStyle::Secondary),
+                ])])
+                .ephemeral(false),
+        )
+        .await?
+        .into_message()
+        .await?
+        .id;
+    ctx.data()
+        .configuration
+        .lock()
+        .unwrap()
+        .queue_messages
+        .push((ctx.channel_id(), msg));
 
     Ok(())
 }
