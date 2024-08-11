@@ -158,6 +158,7 @@ struct MatchData {
     channels: Vec<ChannelId>,
     members: Vec<Vec<UserId>>,
     map_vote_end_time: Option<u64>,
+    resolved: bool,
 }
 
 impl Default for MatchData {
@@ -168,6 +169,7 @@ impl Default for MatchData {
             members: vec![],
             map_votes: HashMap::new(),
             map_vote_end_time: None,
+            resolved: false,
         }
     }
 }
@@ -509,6 +511,13 @@ async fn handler(
                             .await?;
                     }
                     if matches!(vote_type, VoteType::Result) {
+                        if {
+                            let match_data = data.match_data.lock().unwrap();
+                            let match_data = match_data.get(&match_number).unwrap();
+                            match_data.resolved
+                        } {
+                            return Ok(())
+                        }
                         let mut vote_result = None;
                         let content = {
                             let match_data = data.match_data.lock().unwrap();
@@ -536,8 +545,9 @@ async fn handler(
                                 .post_match_channel
                                 .clone();
                             let (channels, players) = {
-                                let match_data = data.match_data.lock().unwrap();
-                                let match_data = match_data.get(&match_number).unwrap();
+                                let mut match_data = data.match_data.lock().unwrap();
+                                let match_data = match_data.get_mut(&match_number).unwrap();
+                                match_data.resolved = true;
                                 log_match_results(
                                     data.clone(),
                                     &vote_result,
@@ -1261,6 +1271,7 @@ async fn try_matchmaking(
                         members: members_copy,
                         map_votes: HashMap::new(),
                         map_vote_end_time,
+                        resolved: false,
                     },
                 );
             }
