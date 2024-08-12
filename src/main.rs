@@ -516,7 +516,7 @@ async fn handler(
                             let match_data = match_data.get(&match_number).unwrap();
                             match_data.resolved
                         } {
-                            return Ok(())
+                            return Ok(());
                         }
                         let mut vote_result = None;
                         let content = {
@@ -2615,6 +2615,24 @@ async fn create_queue_message(ctx: Context<'_>) -> Result<(), Error> {
     Ok(())
 }
 
+/// Sends a message without pinging
+#[poise::command(slash_command, prefix_command)]
+async fn no_ping(ctx: Context<'_>, #[rest] text: String) -> Result<(), Error> {
+    ctx
+        .send(
+            CreateReply::default()
+                .content(format!("{}: {}", ctx.author().mention(), text))
+                .ephemeral(false)
+                .allowed_mentions(CreateAllowedMentions::default().empty_roles().empty_users()),
+        )
+        .await?
+        .into_message()
+        .await?
+        .id;
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
     let token = std::env::var("DISCORD_BOT_TOKEN").expect("missing DISCORD_BOT_TOKEN");
@@ -2643,6 +2661,7 @@ async fn main() {
                 list_leavers(),
                 force_outcome(),
                 create_queue_message(),
+                no_ping(),
             ],
             ..Default::default()
         })
