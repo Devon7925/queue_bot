@@ -107,6 +107,7 @@ struct QueueConfiguration {
     default_player_data: PlayerData,
     maximum_queue_cost: f32,
     game_categories: HashMap<String, Vec<RoleId>>,
+    log_chats: bool,
 }
 
 impl Default for QueueConfiguration {
@@ -126,6 +127,7 @@ impl Default for QueueConfiguration {
             default_player_data: PlayerData::default(),
             maximum_queue_cost: 50.0,
             game_categories: HashMap::new(),
+            log_chats: true,
         }
     }
 }
@@ -900,6 +902,27 @@ async fn handler(
                             .await?;
                     }
                     return Ok(());
+                }
+            }
+        }
+        serenity::FullEvent::Message { new_message } => {
+            if data.configuration.lock().unwrap().log_chats {
+                let Some(match_id) = data.match_channels.lock().unwrap().get(&new_message.channel_id).cloned() else {
+                    return Ok(());
+                };
+                fs::create_dir_all("match_logs")?;
+                let mut file = OpenOptions::new()
+                    .append(true)
+                    .create(true)
+                    .open(format!("match_logs/match-{}.log", match_id))
+                    .unwrap();
+                if let Err(e) = writeln!(
+                    file,
+                    "{}:{}",
+                    new_message.author.mention(),
+                    new_message.content.clone(),
+                ) {
+                    eprintln!("Couldn't write to file: {}", e);
                 }
             }
         }
@@ -1809,6 +1832,37 @@ async fn configure_audit_channel(
     }
 }
 
+/// Sets whether or not match chat messages are logged
+#[poise::command(slash_command, prefix_command, rename = "log_chats")]
+async fn configure_log_chats(
+    ctx: Context<'_>,
+    #[description = "Log chats"]
+    new_value: Option<bool>,
+) -> Result<(), Error> {
+    if let Some(new_value) = new_value {
+        let response = {
+            let mut data_lock = ctx.data().configuration.lock().unwrap();
+            data_lock.log_chats = new_value;
+            format!("Log chats changed to {}", new_value.to_string())
+        };
+        ctx.send(CreateReply::default().content(response).ephemeral(true))
+            .await?;
+        Ok(())
+    } else {
+        let response = {
+            let data_lock = ctx.data().configuration.lock().unwrap();
+            format!(
+                "Log chats is {}",
+                data_lock
+                    .log_chats
+            )
+        };
+        ctx.send(CreateReply::default().content(response).ephemeral(true))
+            .await?;
+        Ok(())
+    }
+}
+
 /// Displays your or another user's account creation date
 #[poise::command(
     slash_command,
@@ -1825,6 +1879,7 @@ async fn configure_audit_channel(
         "configure_map_vote_time",
         "configure_maximum_queue_cost",
         "configure_audit_channel",
+        "configure_log_chats",
     )
 )]
 async fn configure(_: Context<'_>) -> Result<(), Error> {
@@ -1925,8 +1980,8 @@ async fn leave_queue(ctx: Context<'_>) -> Result<(), Error> {
         let mut queued_players = ctx.data().queued_players.lock().unwrap();
         let mut player_data = ctx.data().player_data.lock().unwrap();
         player_data
-            .get_mut(&ctx.author().id)
-            .unwrap()
+            .entry(ctx.author().id.clone())
+            .or_insert(DerivedPlayerData::default())
             .queue_enter_time = None;
         queued_players.remove(&ctx.author().id)
     };
@@ -2636,7 +2691,7 @@ async fn no_ping(ctx: Context<'_>, #[rest] text: String) -> Result<(), Error> {
 #[tokio::main]
 async fn main() {
     let token = std::env::var("DISCORD_BOT_TOKEN").expect("missing DISCORD_BOT_TOKEN");
-    let intents = serenity::GatewayIntents::non_privileged();
+    let intents = serenity::GatewayIntents::non_privileged().union(serenity::GatewayIntents::MESSAGE_CONTENT);
 
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
