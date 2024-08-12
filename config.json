@@ -7,7 +7,11 @@
       "1271555892478738582",
       "1271643772811345960"
     ],
-    "post_match_channel": "1253881451259367526",
+    "visability_override_roles": [
+      "1264743322862223400",
+      "1193325979859419207"
+    ],
+    "post_match_channel": "1272438262212067365",
     "queue_messages": [
       [
         "1271623762760175759",
@@ -53,7 +57,6 @@
         "rating": 25.0,
         "uncertainty": 8.333333333333334
       },
-      "queue_enter_time": null,
       "player_queueing_config": {
         "cost_per_avg_mmr_differential": 4.0,
         "acceptable_mmr_differential": 1.0,

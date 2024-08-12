@@ -14,7 +14,8 @@ use poise::{
         self as serenity, futures::future, Builder, CacheHttp, ChannelId, ChannelType,
         CreateActionRow, CreateAllowedMentions, CreateButton, CreateChannel,
         CreateInteractionResponse, CreateInteractionResponseMessage, CreateMessage, EditMember,
-        EditMessage, GuildId, Http, Mentionable, MessageId, RoleId, UserId,
+        EditMessage, GuildId, Http, Mentionable, MessageId, PermissionOverwrite,
+        PermissionOverwriteType, Permissions, RoleId, UserId,
     },
     CreateReply,
 };
@@ -97,6 +98,7 @@ struct QueueConfiguration {
     team_count: u32,
     category: Option<ChannelId>,
     queue_channels: Vec<ChannelId>,
+    visability_override_roles: Vec<RoleId>,
     post_match_channel: Option<ChannelId>,
     queue_messages: Vec<(ChannelId, MessageId)>,
     audit_channel: Option<ChannelId>,
@@ -117,6 +119,7 @@ impl Default for QueueConfiguration {
             team_count: 2,
             category: None,
             queue_channels: vec![],
+            visability_override_roles: vec![],
             post_match_channel: None,
             queue_messages: vec![],
             audit_channel: None,
@@ -907,7 +910,13 @@ async fn handler(
         }
         serenity::FullEvent::Message { new_message } => {
             if data.configuration.lock().unwrap().log_chats {
-                let Some(match_id) = data.match_channels.lock().unwrap().get(&new_message.channel_id).cloned() else {
+                let Some(match_id) = data
+                    .match_channels
+                    .lock()
+                    .unwrap()
+                    .get(&new_message.channel_id)
+                    .cloned()
+                else {
                     return Ok(());
                 };
                 fs::create_dir_all("match_logs")?;
@@ -1026,7 +1035,11 @@ fn apply_match_results(data: Arc<Data>, result: MatchResult, players: &Vec<Vec<U
     }
 }
 
-async fn matchmake(data: Arc<Data>, http: Arc<Http>, guild_id: GuildId) -> Result<(), Error> {
+async fn matchmake(
+    data: Arc<Data>,
+    http: Arc<Http>,
+    guild_id: GuildId,
+) -> Result<(), Error> {
     {
         let mut guard = data.is_matchmaking.lock().unwrap();
 
@@ -1122,13 +1135,47 @@ async fn try_matchmaking(
             }
         }
     }
+    let mut permissions = members
+        .iter()
+        .flat_map(|t| t)
+        .map(|user| PermissionOverwrite {
+            deny: Permissions::empty(),
+            allow: Permissions::VIEW_CHANNEL,
+            kind: PermissionOverwriteType::Member(user.clone()),
+        })
+        .collect_vec();
+    permissions.push(PermissionOverwrite {
+        deny: Permissions::VIEW_CHANNEL,
+        allow: Permissions::empty(),
+        kind: PermissionOverwriteType::Role(guild_id.everyone_role()),
+    });
+    permissions.push(PermissionOverwrite {
+        deny: Permissions::empty(),
+        allow: Permissions::VIEW_CHANNEL,
+        kind: PermissionOverwriteType::Member(cache_http.get_current_user().await?.id),
+    });
+    for role in data
+        .configuration
+        .lock()
+        .unwrap()
+        .visability_override_roles
+        .iter()
+    {
+        permissions.push(PermissionOverwrite {
+            deny: Permissions::empty(),
+            allow: Permissions::VIEW_CHANNEL,
+            kind: PermissionOverwriteType::Role(role.clone()),
+        })
+    }
     let (match_channel, vc_channels) = future::join(
         CreateChannel::new(format!("match-{}", new_idx))
             .category(category.clone())
+            .permissions(permissions.clone())
             .execute(cache_http.clone(), guild_id),
         future::join_all((0..team_count).map(|i| {
             CreateChannel::new(format!("Team {} - #{}", i + 1, new_idx))
                 .category(category.clone())
+                .permissions(permissions.clone())
                 .kind(ChannelType::Voice)
                 .execute(cache_http.clone(), guild_id)
         })),
@@ -1836,8 +1883,7 @@ async fn configure_audit_channel(
 #[poise::command(slash_command, prefix_command, rename = "log_chats")]
 async fn configure_log_chats(
     ctx: Context<'_>,
-    #[description = "Log chats"]
-    new_value: Option<bool>,
+    #[description = "Log chats"] new_value: Option<bool>,
 ) -> Result<(), Error> {
     if let Some(new_value) = new_value {
         let response = {
@@ -1851,10 +1897,39 @@ async fn configure_log_chats(
     } else {
         let response = {
             let data_lock = ctx.data().configuration.lock().unwrap();
+            format!("Log chats is {}", data_lock.log_chats)
+        };
+        ctx.send(CreateReply::default().content(response).ephemeral(true))
+            .await?;
+        Ok(())
+    }
+}
+
+/// Configures roles that can see match channels of matches their not in
+#[poise::command(slash_command, prefix_command, rename = "visability_override_roles")]
+async fn configure_visability_override_roles(
+    ctx: Context<'_>,
+    #[description = "New override role"] new_value: Option<serenity::RoleId>,
+) -> Result<(), Error> {
+    if let Some(new_value) = new_value {
+        let response = {
+            let mut data_lock = ctx.data().configuration.lock().unwrap();
+            data_lock.visability_override_roles.push(new_value);
+            format!("{} added as override role", new_value.to_string())
+        };
+        ctx.send(CreateReply::default().content(response).ephemeral(true))
+            .await?;
+        Ok(())
+    } else {
+        let response = {
+            let data_lock = ctx.data().configuration.lock().unwrap();
             format!(
-                "Log chats is {}",
+                "Override roles are {}",
                 data_lock
-                    .log_chats
+                    .visability_override_roles
+                    .iter()
+                    .map(|c| format!("{}", c.mention()))
+                    .join(", ")
             )
         };
         ctx.send(CreateReply::default().content(response).ephemeral(true))
@@ -1880,6 +1955,7 @@ async fn configure_log_chats(
         "configure_maximum_queue_cost",
         "configure_audit_channel",
         "configure_log_chats",
+        "configure_visability_override_roles",
     )
 )]
 async fn configure(_: Context<'_>) -> Result<(), Error> {
@@ -2673,17 +2749,16 @@ async fn create_queue_message(ctx: Context<'_>) -> Result<(), Error> {
 /// Sends a message without pinging
 #[poise::command(slash_command, prefix_command)]
 async fn no_ping(ctx: Context<'_>, #[rest] text: String) -> Result<(), Error> {
-    ctx
-        .send(
-            CreateReply::default()
-                .content(format!("{}: {}", ctx.author().mention(), text))
-                .ephemeral(false)
-                .allowed_mentions(CreateAllowedMentions::default().empty_roles().empty_users()),
-        )
-        .await?
-        .into_message()
-        .await?
-        .id;
+    ctx.send(
+        CreateReply::default()
+            .content(format!("{}: {}", ctx.author().mention(), text))
+            .ephemeral(false)
+            .allowed_mentions(CreateAllowedMentions::default().empty_roles().empty_users()),
+    )
+    .await?
+    .into_message()
+    .await?
+    .id;
 
     Ok(())
 }
@@ -2691,7 +2766,8 @@ async fn no_ping(ctx: Context<'_>, #[rest] text: String) -> Result<(), Error> {
 #[tokio::main]
 async fn main() {
     let token = std::env::var("DISCORD_BOT_TOKEN").expect("missing DISCORD_BOT_TOKEN");
-    let intents = serenity::GatewayIntents::non_privileged().union(serenity::GatewayIntents::MESSAGE_CONTENT);
+    let intents =
+        serenity::GatewayIntents::non_privileged().union(serenity::GatewayIntents::MESSAGE_CONTENT);
 
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
