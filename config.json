@@ -62,7 +62,9 @@
         "acceptable_mmr_differential": 1.0,
         "cost_per_mmr_range": 2.0,
         "acceptable_mmr_range": 3.0,
-        "wrong_game_category_cost": {}
+        "wrong_game_category_cost": {
+          "Region": 10.0
+        }
       }
     },
     "maximum_queue_cost": 50.0,
