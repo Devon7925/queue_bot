@@ -104,12 +104,12 @@ struct QueueConfiguration {
     team_size: u32,
     team_count: u32,
     category: Option<ChannelId>,
-    queue_channels: Vec<ChannelId>,
-    visability_override_roles: Vec<RoleId>,
+    queue_channels: HashSet<ChannelId>,
+    visability_override_roles: HashSet<RoleId>,
     post_match_channel: Option<ChannelId>,
     queue_messages: Vec<(ChannelId, MessageId)>,
     audit_channel: Option<ChannelId>,
-    maps: Vec<String>,
+    maps: HashSet<String>,
     map_vote_count: u32,
     map_vote_time: u32,
     leaver_verification_time: u32,
@@ -125,12 +125,12 @@ impl Default for QueueConfiguration {
             team_size: 5,
             team_count: 2,
             category: None,
-            queue_channels: vec![],
-            visability_override_roles: vec![],
+            queue_channels: HashSet::new(),
+            visability_override_roles: HashSet::new(),
             post_match_channel: None,
             queue_messages: vec![],
             audit_channel: None,
-            maps: vec![],
+            maps: HashSet::new(),
             map_vote_count: 0,
             map_vote_time: 0,
             leaver_verification_time: 30,
@@ -1247,7 +1247,7 @@ async fn try_matchmaking(
                 }
                 let mut map_vote_message =
                     CreateMessage::default().content(map_vote_message_content);
-                let mut map_pool = config.maps.clone();
+                let mut map_pool = config.maps.iter().collect_vec();
                 let mut maps = vec![];
                 for _ in 0..config.map_vote_count {
                     let num = rand::thread_rng().gen_range(0..map_pool.len());
@@ -1300,8 +1300,9 @@ async fn try_matchmaking(
                     });
                 }
             } else if config.maps.len() > 0 {
-                let num = rand::thread_rng().gen_range(0..config.maps.len());
-                let chosen_map = config.maps.get(num).unwrap().clone();
+                let map_pool = config.maps.iter().collect_vec();
+                let num = rand::thread_rng().gen_range(0..map_pool.len());
+                let chosen_map = map_pool.get(num).unwrap();
                 let map_vote_message =
                     CreateMessage::default().content(format!("# Map: {}", chosen_map));
                 match_channel
