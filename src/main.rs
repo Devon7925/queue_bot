@@ -1,6 +1,6 @@
-mod player_config_commands;
-mod configure_command;
 mod admin_commands;
+mod configure_command;
+mod player_config_commands;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -163,7 +163,7 @@ impl std::fmt::Display for MatchResult {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct MatchData {
     result_votes: HashMap<UserId, MatchResult>,
     map_votes: HashMap<UserId, String>,
@@ -431,9 +431,11 @@ async fn handler(
                                 .create_response(
                                     ctx,
                                     serenity::CreateInteractionResponse::Message(
-                                        CreateInteractionResponseMessage::new().content(format!(
-                                            "You cannot vote in a game you're not in."
-                                        )).ephemeral(true),
+                                        CreateInteractionResponseMessage::new()
+                                            .content(format!(
+                                                "You cannot vote in a game you're not in."
+                                            ))
+                                            .ephemeral(true),
                                     ),
                                 )
                                 .await?;
@@ -1042,11 +1044,7 @@ fn apply_match_results(data: Arc<Data>, result: MatchResult, players: &Vec<Vec<U
     }
 }
 
-async fn matchmake(
-    data: Arc<Data>,
-    http: Arc<Http>,
-    guild_id: GuildId,
-) -> Result<(), Error> {
+async fn matchmake(data: Arc<Data>, http: Arc<Http>, guild_id: GuildId) -> Result<(), Error> {
     {
         let mut guard = data.is_matchmaking.lock().unwrap();
 
@@ -1956,18 +1954,29 @@ async fn mark_leaver(
         .await?;
         return Ok(());
     };
-    if !ctx
+    let match_data: MatchData = ctx
         .data()
         .match_data
         .lock()
         .unwrap()
         .get(&match_number)
-        .unwrap()
+        .ok_or("Could not get match data")?
+        .clone();
+    if !match_data
         .members
         .iter()
         .flatten()
-        .contains(&player)
+        .contains(&ctx.author().id)
     {
+        ctx.send(
+            CreateReply::default()
+                .content("You aren't in this match!")
+                .ephemeral(true),
+        )
+        .await?;
+        return Ok(());
+    }
+    if !match_data.members.iter().flatten().contains(&player) {
         ctx.send(
             CreateReply::default()
                 .content("This player is not in this match!")
@@ -2027,6 +2036,62 @@ async fn mark_leaver(
     Ok(())
 }
 
+/// Pings players that haven't voted
+#[poise::command(slash_command, prefix_command)]
+async fn ping_non_voters(ctx: Context<'_>) -> Result<(), Error> {
+    let match_number = {
+        let match_channels = ctx.data().match_channels.lock().unwrap();
+        match_channels.get(&ctx.channel_id()).cloned()
+    };
+    let Some(match_number) = match_number else {
+        ctx.send(
+            CreateReply::default()
+                .content("This command must be done in a match channel!")
+                .ephemeral(true),
+        )
+        .await?;
+        return Ok(());
+    };
+    let match_data: MatchData = ctx
+        .data()
+        .match_data
+        .lock()
+        .unwrap()
+        .get(&match_number)
+        .ok_or("Could not get match data")?
+        .clone();
+    if !match_data
+        .members
+        .iter()
+        .flatten()
+        .contains(&ctx.author().id)
+    {
+        ctx.send(
+            CreateReply::default()
+                .content("You aren't in this match!")
+                .ephemeral(true),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let mut message_content = format!("# Remember to vote\n");
+    message_content += match_data
+        .members
+        .iter()
+        .flatten()
+        .filter(|member| !match_data.result_votes.contains_key(&member))
+        .map(|member| format!("{}", member.mention()))
+        .join(", ")
+        .as_str();
+    ctx.send(CreateReply::default().content(message_content))
+        .await?
+        .message()
+        .await?;
+
+    Ok(())
+}
+
 /// Sends a message without pinging
 #[poise::command(slash_command, prefix_command)]
 async fn no_ping(ctx: Context<'_>, #[rest] text: String) -> Result<(), Error> {
@@ -2043,7 +2108,6 @@ async fn no_ping(ctx: Context<'_>, #[rest] text: String) -> Result<(), Error> {
 
     Ok(())
 }
-
 
 #[tokio::main]
 async fn main() {
@@ -2076,6 +2140,7 @@ async fn main() {
                 create_queue_message(),
                 no_ping(),
                 player_config(),
+                ping_non_voters(),
             ],
             ..Default::default()
         })
