@@ -433,7 +433,7 @@ async fn handler(
                                     serenity::CreateInteractionResponse::Message(
                                         CreateInteractionResponseMessage::new().content(format!(
                                             "You cannot vote in a game you're not in."
-                                        )),
+                                        )).ephemeral(true),
                                     ),
                                 )
                                 .await?;
@@ -1207,17 +1207,7 @@ async fn try_matchmaking(
             }
             for (team_idx, team) in members_copy.iter().enumerate() {
                 members_message += format!("## Team {}\n", team_idx + 1).as_str();
-                let mut team_copy = team.clone();
-                team_copy.sort_by_key(|player| {
-                    if let Some(Some(Some(name))) = player
-                        .to_user_cached(&cache_http_copy.cache().unwrap())
-                        .map(|user| user.member.as_ref().map(|member| member.nick.clone()))
-                    {
-                        name
-                    } else {
-                        "".to_string()
-                    }
-                });
+                let team_copy = team.clone();
                 for player in team_copy {
                     members_message += format!("{}\n", player.mention()).as_str();
                 }
