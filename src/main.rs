@@ -92,6 +92,7 @@ struct BanData {
 #[derive(Serialize, Deserialize, Clone)]
 struct QueueGroup {
     players: HashSet<UserId>,
+    pending_invites: HashSet<UserId>,
 }
 
 enum VoteType {
@@ -286,6 +287,11 @@ async fn try_queue_player(
     }
     if data.queued_players.lock().unwrap().contains(&user_id) {
         return Err("You're already in queue!".to_string());
+    }
+    if let Some(group) = data.player_data.lock().unwrap().get(&user_id).unwrap().party {
+        if data.group_data.lock().unwrap().get(&group).unwrap().pending_invites.len() > 0 {
+            return Err("Cannot queue while your party has pending invites!".to_string());
+        }
     }
     update_bans(data.clone());
     let game_categories = {
@@ -675,6 +681,7 @@ async fn handler(
                         let mut group_data = data.group_data.lock().unwrap();
                         let party = group_data.get_mut(&party_uuid);
                         if let Some(party) = party {
+                            party.pending_invites.remove(&message_component.user.id);
                             party.players.insert(message_component.user.id);
                             Some(party.players.clone())
                         } else {
@@ -747,10 +754,11 @@ async fn handler(
                     .strip_prefix("reject_party_")
                 {
                     let group_members = {
-                        let group_data = data.group_data.lock().unwrap();
+                        let mut group_data = data.group_data.lock().unwrap();
                         let party =
-                            group_data.get(&serde_json::from_str::<Uuid>(party_id).unwrap());
+                            group_data.get_mut(&serde_json::from_str::<Uuid>(party_id).unwrap());
                         if let Some(party) = party {
+                            party.pending_invites.remove(&message_component.user.id);
                             Some(party.players.clone())
                         } else {
                             None
@@ -1783,16 +1791,21 @@ async fn party_invite(
         }
         user_data.party.unwrap()
     };
-    let user_party = ctx
-        .data()
-        .group_data
-        .lock()
-        .unwrap()
-        .entry(party)
-        .or_insert(QueueGroup {
-            players: HashSet::from([ctx.author().id]),
-        })
-        .clone();
+    let user_party = {
+        let mut group_data = ctx
+            .data()
+            .group_data
+            .lock()
+            .unwrap();
+        let user_party = group_data
+            .entry(party)
+            .or_insert(QueueGroup {
+                players: HashSet::from([ctx.author().id]),
+                pending_invites: HashSet::new(),
+            });
+        user_party.pending_invites.insert(user);
+        user_party.clone()
+    };
     user.create_dm_channel(ctx)
         .await?
         .send_message(
@@ -1918,17 +1931,18 @@ async fn party_list(ctx: Context<'_>) -> Result<(), Error> {
         .await?;
         return Ok(());
     };
-    let party_members = {
+    let (party_members, pending_members) = {
         let mut group_data = ctx.data().group_data.lock().unwrap();
         let user_party = group_data.get_mut(&party).unwrap();
-        user_party.players.clone()
+        (user_party.players.clone(), user_party.pending_invites.clone())
     };
+    let mut content = format!("Party members: {}", party_members.iter().map(|p| p.mention()).join(", "));
+    if pending_members.len() > 0 {
+        content += format!("\nPending members: {}", pending_members.iter().map(|p| p.mention()).join(", ")).as_str();
+    }
     ctx.send(
         CreateReply::default()
-            .content(format!(
-                "Party members: {}",
-                party_members.iter().map(|p| p.mention()).join(", ")
-            ))
+            .content(content)
             .ephemeral(true),
     )
     .await?;
