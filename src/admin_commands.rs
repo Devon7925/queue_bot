@@ -26,12 +26,12 @@ async fn ban_player(
     #[description = "Player"] player: UserId,
     #[description = "Reason"] reason: Option<String>,
     #[description = "Days"] days: Option<u32>,
+    #[description = "Hours"] hours: Option<u32>,
     #[description = "Is shadow ban"] is_shadow_ban: Option<bool>,
 ) -> Result<(), Error> {
     update_bans(ctx.data().clone());
-    let end_time = days.map(|days| {
-        chrono::offset::Utc::now() + TimeDelta::new(60 * 60 * 24 * days as i64, 0).unwrap()
-    });
+    let ban_seconds = 60 * 60 * (24 * days.unwrap_or(0) as i64 + hours.unwrap_or(0) as i64);
+    let end_time = (ban_seconds > 0).then(|| chrono::offset::Utc::now() + TimeDelta::new(ban_seconds, 0).unwrap());
     let ban_data: BanData = BanData { end_time, reason, shadow_ban: is_shadow_ban.unwrap_or(false) };
     let ban_text = get_ban_text(&player, &ban_data);
     let was_previously_banned = ctx
