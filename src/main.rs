@@ -278,7 +278,14 @@ async fn try_queue_player(
     user_id: UserId,
     http: Arc<Http>,
     guild_id: GuildId,
+    queue_party: bool,
 ) -> Result<(), String> {
+    if data.in_game_players.lock().unwrap().contains(&user_id) {
+        return Err("Cannot queue while in game!".to_string());
+    }
+    if data.queued_players.lock().unwrap().contains(&user_id) {
+        return Err("You're already in queue!".to_string());
+    }
     update_bans(data.clone());
     let game_categories = {
         let config = data.configuration.lock().unwrap();
@@ -299,7 +306,7 @@ async fn try_queue_player(
             )
         })
         .collect();
-    {
+    let party_id = {
         let mut player_data = data.player_data.lock().unwrap();
         player_data
             .entry(user_id)
@@ -315,15 +322,40 @@ async fn try_queue_player(
             }
             return Err("Cannot queue because you're banned".to_string());
         }
-        if data.in_game_players.lock().unwrap().contains(&user_id) {
-            return Err("Cannot queue while in game!".to_string());
-        }
-        player_data
+        let player_data = player_data
             .entry(user_id)
-            .or_insert(DerivedPlayerData::default())
-            .queue_enter_time = Some(chrono::offset::Utc::now());
+            .or_insert(DerivedPlayerData::default());
+
+        player_data.queue_enter_time = Some(chrono::offset::Utc::now());
         queued_players.insert(user_id);
+
+        player_data.party
+    };
+
+    if queue_party {
+        if let Some(party) = party_id {
+            let party_members = data
+                .group_data
+                .lock()
+                .unwrap()
+                .get(&party)
+                .unwrap()
+                .players
+                .clone();
+
+            for player in party_members {
+                Box::pin(try_queue_player(
+                    data.clone(),
+                    player,
+                    http.clone(),
+                    guild_id,
+                    false,
+                ))
+                .await?;
+            }
+        }
     }
+
     Ok(())
 }
 
@@ -383,6 +415,7 @@ async fn handler(
                         new.user_id,
                         ctx.http.clone(),
                         new.guild_id.unwrap(),
+                        true,
                     )
                     .await
                     {
@@ -797,6 +830,7 @@ async fn handler(
                         message_component.user.id,
                         ctx.http.clone(),
                         message_component.guild_id.unwrap(),
+                        true,
                     )
                     .await
                     {
@@ -835,39 +869,17 @@ async fn handler(
                     return Ok(());
                 }
                 if message_component.data.custom_id == "leave_queue" {
-                    let removed = {
-                        let mut queued_players = data.queued_players.lock().unwrap();
-                        let mut player_data = data.player_data.lock().unwrap();
-                        player_data
-                            .entry(message_component.user.id)
-                            .or_default()
-                            .queue_enter_time = None;
-                        queued_players.remove(&message_component.user.id)
-                    };
-                    if removed {
-                        message_component
-                            .create_response(
-                                ctx.http(),
-                                CreateInteractionResponse::Message(
-                                    CreateInteractionResponseMessage::new()
-                                        .content("You are no longer queueing!")
-                                        .ephemeral(true),
-                                ),
-                            )
-                            .await?;
-                        data.message_edit_notify.lock().unwrap().notify_one();
-                    } else {
-                        message_component
-                            .create_response(
-                                ctx.http(),
-                                CreateInteractionResponse::Message(
-                                    CreateInteractionResponseMessage::new()
-                                        .content("You weren't queued!")
-                                        .ephemeral(true),
-                                ),
-                            )
-                            .await?;
-                    }
+                    let response = player_leave_queue(data.clone(), message_component.user.id, true);
+                    message_component
+                        .create_response(
+                            ctx.http(),
+                            CreateInteractionResponse::Message(
+                                CreateInteractionResponseMessage::new()
+                                    .content(response)
+                                    .ephemeral(true),
+                            ),
+                        )
+                        .await?;
                     return Ok(());
                 }
                 if message_component.data.custom_id == "status" {
@@ -1462,7 +1474,7 @@ async fn evaluate_cost(
                 let queue_config = player
                     .player_queueing_config
                     .derive(&default_player_data.player_queueing_config);
-                let time_in_queue = (now - player.queue_enter_time.unwrap()).num_seconds();
+                let time_in_queue = player.queue_enter_time.map(|queue_time| (now - queue_time).num_seconds()).unwrap_or(0);
                 let mut player_cost = 0.0;
                 player_cost += (mmr_differential - queue_config.acceptable_mmr_differential)
                     .max(0.0)
@@ -1590,6 +1602,7 @@ async fn queue(ctx: Context<'_>) -> Result<(), Error> {
         ctx.author().id,
         ctx.serenity_context().http.clone(),
         ctx.guild_id().unwrap(),
+        true,
     )
     .await
     {
@@ -1620,36 +1633,53 @@ async fn queue(ctx: Context<'_>) -> Result<(), Error> {
     }
 }
 
+fn player_leave_queue(data: Arc<Data>, user: UserId, queue_group: bool) -> String {
+    if queue_group {
+        if let Some(Some(party_members)) = data
+            .player_data
+            .lock()
+            .unwrap()
+            .entry(user.clone())
+            .or_insert(DerivedPlayerData::default())
+            .party
+            .map(|party| {
+                data.group_data
+                    .lock()
+                    .unwrap()
+                    .get(&party)
+                    .map(|p| p.players.clone())
+            })
+        {
+            for user in party_members {
+                player_leave_queue(data.clone(), user, false);
+            }
+            return "Party left queue".to_string();
+        }
+    }
+    let removed = {
+        let mut queued_players = data.queued_players.lock().unwrap();
+        let mut player_data = data.player_data.lock().unwrap();
+        player_data
+            .entry(user.clone())
+            .or_insert(DerivedPlayerData::default())
+            .queue_enter_time = None;
+        queued_players.remove(&user)
+    };
+    if removed {
+        data.message_edit_notify.lock().unwrap().notify_one();
+        "You are no longer queueing!".to_string()
+    } else {
+        "You weren't queued!".to_string()
+    }
+}
+
 /// Join queue
 #[poise::command(slash_command, prefix_command)]
 async fn leave_queue(ctx: Context<'_>) -> Result<(), Error> {
-    let removed = {
-        let mut queued_players = ctx.data().queued_players.lock().unwrap();
-        let mut player_data = ctx.data().player_data.lock().unwrap();
-        player_data
-            .entry(ctx.author().id.clone())
-            .or_insert(DerivedPlayerData::default())
-            .queue_enter_time = None;
-        queued_players.remove(&ctx.author().id)
-    };
-    if removed {
-        ctx.send(
-            CreateReply::default()
-                .content("You are no longer queueing!")
-                .ephemeral(true),
-        )
+    let response = player_leave_queue(ctx.data().clone(), ctx.author().id, true);
+    ctx.send(CreateReply::default().content(response).ephemeral(true))
         .await?;
-        ctx.data().message_edit_notify.lock().unwrap().notify_one();
-        Ok(())
-    } else {
-        ctx.send(
-            CreateReply::default()
-                .content("You weren't queued!")
-                .ephemeral(true),
-        )
-        .await?;
-        Ok(())
-    }
+    Ok(())
 }
 
 /// Lists queued players
@@ -1713,6 +1743,26 @@ async fn party_invite(
     ctx: Context<'_>,
     #[description = "Invite player to party"] user: UserId,
 ) -> Result<(), Error> {
+    if ctx.data().queued_players.lock().unwrap().contains(&ctx.author().id) {
+        ctx.send(
+            CreateReply::default()
+                .content(format!("Cannot invite players to party while in queue"))
+                .ephemeral(true),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    if ctx.data().in_game_players.lock().unwrap().contains(&ctx.author().id) {
+        ctx.send(
+            CreateReply::default()
+                .content(format!("Cannot invite players to party while in game"))
+                .ephemeral(true),
+        )
+        .await?;
+        return Ok(());
+    }
+
     let party = {
         let mut user_data = ctx.data().player_data.lock().unwrap();
         let user_data = user_data
