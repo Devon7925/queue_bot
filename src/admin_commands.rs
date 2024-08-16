@@ -26,12 +26,13 @@ async fn ban_player(
     #[description = "Player"] player: UserId,
     #[description = "Reason"] reason: Option<String>,
     #[description = "Days"] days: Option<u32>,
+    #[description = "Is shadow ban"] is_shadow_ban: Option<bool>,
 ) -> Result<(), Error> {
     update_bans(ctx.data().clone());
     let end_time = days.map(|days| {
         chrono::offset::Utc::now() + TimeDelta::new(60 * 60 * 24 * days as i64, 0).unwrap()
     });
-    let ban_data: BanData = BanData { end_time, reason };
+    let ban_data: BanData = BanData { end_time, reason, shadow_ban: is_shadow_ban.unwrap_or(false) };
     let ban_text = get_ban_text(&player, &ban_data);
     let was_previously_banned = ctx
         .data()
@@ -42,7 +43,7 @@ async fn ban_player(
         .is_some();
 
     let response = if was_previously_banned {
-        format!("{}'s ban was updated.", player.mention())
+        format!("Ban updated: {}", ban_text.clone())
     } else {
         ban_text.clone()
     };
@@ -122,7 +123,11 @@ pub async fn list_bans(ctx: Context<'_>) -> Result<(), Error> {
 }
 
 fn get_ban_text(id: &UserId, ban_data: &BanData) -> String {
-    let mut ban = format!("{} banned", id.mention());
+    let mut ban = format!("{}", id.mention());
+    if ban_data.shadow_ban {
+        ban += " shadow";
+    }
+    ban += " banned";
     if let Some(reason) = ban_data.reason.clone() {
         ban += format!(" for {}", reason).as_str();
     }

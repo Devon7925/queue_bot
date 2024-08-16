@@ -86,6 +86,7 @@ impl Default for Data {
 struct BanData {
     end_time: Option<DateTime<Utc>>,
     reason: Option<String>,
+    shadow_ban: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -314,13 +315,15 @@ async fn try_queue_player(
             .game_categories = player_categories;
         let mut queued_players = data.queued_players.lock().unwrap();
         if let Some(player_ban) = data.player_bans.lock().unwrap().get(&user_id) {
-            if let Some(ban_reason) = player_ban.reason.clone() {
-                return Err(format!(
-                    "Cannot queue because you're banned for {}",
-                    ban_reason
-                ));
+            if !player_ban.shadow_ban {
+                if let Some(ban_reason) = player_ban.reason.clone() {
+                    return Err(format!(
+                        "Cannot queue because you're banned for {}",
+                        ban_reason
+                    ));
+                }
+                return Err("Cannot queue because you're banned".to_string());
             }
-            return Err("Cannot queue because you're banned".to_string());
         }
         let player_data = player_data
             .entry(user_id)
@@ -1118,7 +1121,11 @@ async fn try_matchmaking(
     let Some(category) = config.category else {
         return Err(Error::from("No category"));
     };
-    let queued_players = data.queued_players.lock().unwrap().clone();
+    let mut queued_players = data.queued_players.lock().unwrap().clone();
+    {
+        let bans = data.player_bans.lock().unwrap();
+        queued_players.retain(|p| !bans.contains_key(p));
+    }
     println!("Trying matchmaking");
     let members = greedy_matchmaking(data.clone(), queued_players).await;
     let Some(members) = members else {
@@ -1510,7 +1517,7 @@ async fn greedy_matchmaking(data: Arc<Data>, pool: HashSet<UserId>) -> Option<Ve
         let mut min_cost = f32::MAX;
         let mut best_next_result = vec![];
         let mut best_added_players = vec![];
-        for possible_addition in players.iter() {
+        'additions_loop: for possible_addition in players.iter() {
             for team_idx in 0..team_count as usize {
                 if result[team_idx].len() >= team_size as usize {
                     continue;
@@ -1534,6 +1541,9 @@ async fn greedy_matchmaking(data: Arc<Data>, pool: HashSet<UserId>) -> Option<Ve
                         .players
                         .iter()
                     {
+                        if !players.contains(player) {
+                            continue 'additions_loop;
+                        }
                         added_players.push(player.clone());
                         result_copy[team_idx].push(player.clone());
                     }
@@ -1975,6 +1985,7 @@ fn update_bans(data: Arc<Data>) {
          BanData {
              end_time,
              reason: _,
+             shadow_ban: _,
          }| {
             if let Some(end_time) = end_time {
                 *end_time > now
