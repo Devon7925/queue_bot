@@ -282,6 +282,12 @@ async fn try_queue_player(
     guild_id: GuildId,
     queue_party: bool,
 ) -> Result<(), String> {
+    {
+        let mut player_data = data.player_data.lock().unwrap();
+        player_data
+            .entry(user_id)
+            .or_insert(DerivedPlayerData::default());
+    }
     if data.in_game_players.lock().unwrap().contains(&user_id) {
         return Err("Cannot queue while in game!".to_string());
     }
@@ -316,8 +322,8 @@ async fn try_queue_player(
     let party_id = {
         let mut player_data = data.player_data.lock().unwrap();
         player_data
-            .entry(user_id)
-            .or_insert(DerivedPlayerData::default())
+            .get_mut(&user_id)
+            .unwrap()
             .game_categories = player_categories;
         let mut queued_players = data.queued_players.lock().unwrap();
         if let Some(player_ban) = data.player_bans.lock().unwrap().get(&user_id) {
@@ -364,8 +370,70 @@ async fn try_queue_player(
             }
         }
     }
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs_f32(60.0*30.0)).await;
+            match ensure_wants_queue(data.clone(), http.clone(), &user_id).await {
+                Ok(true) => break,
+                Ok(false) => {},
+                Err(err) => {
+                    eprintln!("{}", err);
+                    break;
+                }
+            };
+        }
+    });
 
     Ok(())
+}
+
+async fn ensure_wants_queue(data: Arc<Data>, http: Arc<Http>, user: &UserId) -> Result<bool, Error> {
+    if !data.queued_players.lock().unwrap().contains(user) {
+        return Ok(true)
+    }
+    let mut leaver_message_content = format!("# Are you still wanting to queue {}?", user.mention());
+    leaver_message_content += format!(
+        "\nEnds <t:{}:R>, otherwise you will be kicked from queue",
+        std::time::UNIX_EPOCH.elapsed().unwrap().as_secs()
+            + data
+                .configuration
+                .lock()
+                .unwrap()
+                .leaver_verification_time as u64
+    )
+    .as_str();
+    let mut leaver_message = CreateMessage::default().content(leaver_message_content);
+    leaver_message =
+        leaver_message.components(vec![CreateActionRow::Buttons(vec![
+            CreateButton::new(format!("queue_check"))
+                .label("Yes, I'm here.")
+                .style(serenity::ButtonStyle::Primary),
+            CreateButton::new(format!("afk_leave_queue"))
+                .label("No, exit queue.")
+                .style(serenity::ButtonStyle::Primary),
+        ])]);
+    let leaver_message = user.direct_message(http.clone(), leaver_message).await?;
+    {
+        let user = user.clone();
+        let data = data.clone();
+        let ctx1 = http.clone();
+        tokio::spawn(async move {
+            let leaver_verification_time = data
+                .clone()
+                .configuration
+                .lock()
+                .unwrap()
+                .leaver_verification_time as u64;
+            tokio::time::sleep(Duration::from_secs(leaver_verification_time)).await;
+            let Ok(message) = ctx1.get_message(leaver_message.channel_id, leaver_message.id).await else {
+                return;
+            };
+            data.queued_players.lock().unwrap().remove(&user);
+            message.delete(ctx1.clone()).await.ok();
+        });
+    }
+
+    Ok(false)
 }
 
 async fn handler(
@@ -835,6 +903,20 @@ async fn handler(
                         .await?;
                     return Ok(());
                 }
+                if message_component.data.custom_id == "queue_check" {
+                    message_component.message.delete(ctx).await?;
+                    message_component
+                        .create_response(
+                            ctx,
+                            serenity::CreateInteractionResponse::Message(
+                                CreateInteractionResponseMessage::new()
+                                    .content(format!("You will stay in queue."))
+                                    .ephemeral(true),
+                            ),
+                        )
+                        .await?;
+                    return Ok(());
+                }
                 if message_component.data.custom_id == "queue" {
                     match try_queue_player(
                         data.clone(),
@@ -891,6 +973,21 @@ async fn handler(
                             ),
                         )
                         .await?;
+                    return Ok(());
+                }
+                if message_component.data.custom_id == "afk_leave_queue" {
+                    let response = player_leave_queue(data.clone(), message_component.user.id, true);
+                    message_component
+                        .create_response(
+                            ctx.http(),
+                            CreateInteractionResponse::Message(
+                                CreateInteractionResponseMessage::new()
+                                    .content(response)
+                                    .ephemeral(true),
+                            ),
+                        )
+                        .await?;
+                    message_component.message.delete(ctx.http()).await?;
                     return Ok(());
                 }
                 if message_component.data.custom_id == "status" {
