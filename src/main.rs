@@ -249,12 +249,30 @@ impl Default for PlayerData {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
+struct PlayerStats {
+    wins: u32,
+    losses: u32,
+    draws: u32,
+}
+
+impl Default for PlayerStats {
+    fn default() -> Self {
+        Self {
+            wins: 0,
+            losses: 0,
+            draws: 0,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
 struct DerivedPlayerData {
     rating: Option<WengLinRating>,
     queue_enter_time: Option<DateTime<Utc>>,
     party: Option<Uuid>,
     player_queueing_config: DerivedPlayerQueueingConfig,
     game_categories: HashMap<String, Vec<usize>>,
+    stats: PlayerStats,
 }
 
 impl Default for DerivedPlayerData {
@@ -271,6 +289,7 @@ impl Default for DerivedPlayerData {
                 wrong_game_category_cost: None,
             },
             game_categories: HashMap::new(),
+            stats: PlayerStats::default(),
         }
     }
 }
@@ -1165,7 +1184,7 @@ fn apply_match_results(data: Arc<Data>, result: MatchResult, players: &Vec<Vec<U
             )
         })
         .collect_vec();
-    let result = MultiTeamRatingSystem::rate(
+    let rating_result = MultiTeamRatingSystem::rate(
         &system,
         outcome
             .iter()
@@ -1174,15 +1193,28 @@ fn apply_match_results(data: Arc<Data>, result: MatchResult, players: &Vec<Vec<U
             .as_slice(),
     );
     for (team_idx, team) in players.iter().enumerate() {
+        let result = match result {
+            MatchResult::Team(idx) if idx == team_idx as u32 => 1,
+            MatchResult::Team(_) => 2,
+            MatchResult::Tie => 3,
+            MatchResult::Cancel => panic!("Invalid state"),
+        };
         for (player_idx, player) in team.iter().enumerate() {
-            player_data.get_mut(player).unwrap().rating = Some(
-                result
+            let player = player_data.get_mut(player).unwrap();
+            player.rating = Some(
+                rating_result
                     .get(team_idx)
                     .unwrap()
                     .get(player_idx)
                     .unwrap()
                     .clone(),
             );
+            match result {
+                1 => player.stats.wins += 1,
+                2 => player.stats.losses += 1,
+                3 => player.stats.draws += 1,
+                _ => {}
+            }
         }
     }
 }
@@ -1858,20 +1890,27 @@ async fn stats(
     #[description = "User to get stats for"] user: Option<serenity::UserId>,
 ) -> Result<(), Error> {
     let user = user.unwrap_or(ctx.author().id);
-    let rating = {
+    let (stats, rating) = {
         let mut player_data = ctx.data().player_data.lock().unwrap();
         let config = ctx.data().configuration.lock().unwrap();
-        player_data
+        let player_data = player_data
             .entry(user)
-            .or_insert(DerivedPlayerData::default())
-            .rating
-            .unwrap_or(config.default_player_data.rating)
+            .or_insert(DerivedPlayerData::default());
+        (
+            player_data.stats.clone(),
+            player_data
+                .rating
+                .unwrap_or(config.default_player_data.rating),
+        )
     };
     let response = format!(
-        "{}'s mmr is {}, with uncertainty {}",
+        "{}'s mmr is {}, with uncertainty {}\nScore: {}-{}-{}",
         user.mention(),
         rating.rating,
-        rating.uncertainty
+        rating.uncertainty,
+        stats.wins,
+        stats.losses,
+        stats.draws
     );
     ctx.send(CreateReply::default().content(response).ephemeral(true))
         .await?;
