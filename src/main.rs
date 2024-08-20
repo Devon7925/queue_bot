@@ -294,8 +294,24 @@ async fn try_queue_player(
     if data.queued_players.lock().unwrap().contains(&user_id) {
         return Err("You're already in queue!".to_string());
     }
-    if let Some(group) = data.player_data.lock().unwrap().get(&user_id).unwrap().party {
-        if data.group_data.lock().unwrap().get(&group).unwrap().pending_invites.len() > 0 {
+    if let Some(group) = data
+        .player_data
+        .lock()
+        .unwrap()
+        .get(&user_id)
+        .unwrap()
+        .party
+    {
+        if data
+            .group_data
+            .lock()
+            .unwrap()
+            .get(&group)
+            .unwrap()
+            .pending_invites
+            .len()
+            > 0
+        {
             return Err("Cannot queue while your party has pending invites!".to_string());
         }
     }
@@ -321,10 +337,7 @@ async fn try_queue_player(
         .collect();
     let party_id = {
         let mut player_data = data.player_data.lock().unwrap();
-        player_data
-            .get_mut(&user_id)
-            .unwrap()
-            .game_categories = player_categories;
+        player_data.get_mut(&user_id).unwrap().game_categories = player_categories;
         let mut queued_players = data.queued_players.lock().unwrap();
         if let Some(player_ban) = data.player_bans.lock().unwrap().get(&user_id) {
             if !player_ban.shadow_ban {
@@ -372,10 +385,10 @@ async fn try_queue_player(
     }
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(Duration::from_secs_f32(60.0*30.0)).await;
+            tokio::time::sleep(Duration::from_secs_f32(60.0 * 30.0)).await;
             match ensure_wants_queue(data.clone(), http.clone(), &user_id).await {
                 Ok(true) => break,
-                Ok(false) => {},
+                Ok(false) => {}
                 Err(err) => {
                     eprintln!("{}", err);
                     break;
@@ -387,32 +400,36 @@ async fn try_queue_player(
     Ok(())
 }
 
-async fn ensure_wants_queue(data: Arc<Data>, http: Arc<Http>, user: &UserId) -> Result<bool, Error> {
+async fn ensure_wants_queue(
+    data: Arc<Data>,
+    http: Arc<Http>,
+    user: &UserId,
+) -> Result<bool, Error> {
     if !data.queued_players.lock().unwrap().contains(user) {
-        return Ok(true)
+        return Ok(true);
     }
-    let mut leaver_message_content = format!("# Are you still wanting to queue {}?", user.mention());
+    let mut leaver_message_content =
+        format!("# Are you still wanting to queue {}?", user.mention());
     leaver_message_content += format!(
         "\nEnds <t:{}:R>, otherwise you will be kicked from queue",
         std::time::UNIX_EPOCH.elapsed().unwrap().as_secs()
-            + data
-                .configuration
-                .lock()
-                .unwrap()
-                .leaver_verification_time as u64
+            + data.configuration.lock().unwrap().leaver_verification_time as u64
     )
     .as_str();
     let mut leaver_message = CreateMessage::default().content(leaver_message_content);
-    leaver_message =
-        leaver_message.components(vec![CreateActionRow::Buttons(vec![
-            CreateButton::new(format!("queue_check"))
-                .label("Yes, I'm here.")
-                .style(serenity::ButtonStyle::Primary),
-            CreateButton::new(format!("afk_leave_queue"))
-                .label("No, exit queue.")
-                .style(serenity::ButtonStyle::Primary),
-        ])]);
-    let leaver_message = user.direct_message(http.clone(), leaver_message).await?;
+    leaver_message = leaver_message.components(vec![CreateActionRow::Buttons(vec![
+        CreateButton::new(format!("queue_check"))
+            .label("Yes, I'm here.")
+            .style(serenity::ButtonStyle::Primary),
+        CreateButton::new(format!("afk_leave_queue"))
+            .label("No, exit queue.")
+            .style(serenity::ButtonStyle::Primary),
+    ])]);
+    let Ok(leaver_message) = user.direct_message(http.clone(), leaver_message).await else {
+        data.queued_players.lock().unwrap().remove(&user);
+        data.message_edit_notify.lock().unwrap().notify_one();
+        return Ok(true);
+    };
     {
         let user = user.clone();
         let data = data.clone();
@@ -425,10 +442,14 @@ async fn ensure_wants_queue(data: Arc<Data>, http: Arc<Http>, user: &UserId) -> 
                 .unwrap()
                 .leaver_verification_time as u64;
             tokio::time::sleep(Duration::from_secs(leaver_verification_time)).await;
-            let Ok(message) = ctx1.get_message(leaver_message.channel_id, leaver_message.id).await else {
+            let Ok(message) = ctx1
+                .get_message(leaver_message.channel_id, leaver_message.id)
+                .await
+            else {
                 return;
             };
             data.queued_players.lock().unwrap().remove(&user);
+            data.message_edit_notify.lock().unwrap().notify_one();
             message.delete(ctx1.clone()).await.ok();
         });
     }
@@ -962,7 +983,8 @@ async fn handler(
                     return Ok(());
                 }
                 if message_component.data.custom_id == "leave_queue" {
-                    let response = player_leave_queue(data.clone(), message_component.user.id, true);
+                    let response =
+                        player_leave_queue(data.clone(), message_component.user.id, true);
                     message_component
                         .create_response(
                             ctx.http(),
@@ -976,7 +998,8 @@ async fn handler(
                     return Ok(());
                 }
                 if message_component.data.custom_id == "afk_leave_queue" {
-                    let response = player_leave_queue(data.clone(), message_component.user.id, true);
+                    let response =
+                        player_leave_queue(data.clone(), message_component.user.id, true);
                     message_component
                         .create_response(
                             ctx.http(),
@@ -1586,7 +1609,10 @@ async fn evaluate_cost(
                 let queue_config = player
                     .player_queueing_config
                     .derive(&default_player_data.player_queueing_config);
-                let time_in_queue = player.queue_enter_time.map(|queue_time| (now - queue_time).num_seconds()).unwrap_or(0);
+                let time_in_queue = player
+                    .queue_enter_time
+                    .map(|queue_time| (now - queue_time).num_seconds())
+                    .unwrap_or(0);
                 let mut player_cost = 0.0;
                 player_cost += (mmr_differential - queue_config.acceptable_mmr_differential)
                     .max(0.0)
@@ -1858,7 +1884,13 @@ async fn party_invite(
     ctx: Context<'_>,
     #[description = "Invite player to party"] user: UserId,
 ) -> Result<(), Error> {
-    if ctx.data().queued_players.lock().unwrap().contains(&ctx.author().id) {
+    if ctx
+        .data()
+        .queued_players
+        .lock()
+        .unwrap()
+        .contains(&ctx.author().id)
+    {
         ctx.send(
             CreateReply::default()
                 .content(format!("Cannot invite players to party while in queue"))
@@ -1868,7 +1900,13 @@ async fn party_invite(
         return Ok(());
     }
 
-    if ctx.data().in_game_players.lock().unwrap().contains(&ctx.author().id) {
+    if ctx
+        .data()
+        .in_game_players
+        .lock()
+        .unwrap()
+        .contains(&ctx.author().id)
+    {
         ctx.send(
             CreateReply::default()
                 .content(format!("Cannot invite players to party while in game"))
@@ -1889,23 +1927,16 @@ async fn party_invite(
         user_data.party.unwrap()
     };
     let user_party = {
-        let mut group_data = ctx
-            .data()
-            .group_data
-            .lock()
-            .unwrap();
-        let user_party = group_data
-            .entry(party)
-            .or_insert(QueueGroup {
-                players: HashSet::from([ctx.author().id]),
-                pending_invites: HashSet::new(),
-            });
+        let mut group_data = ctx.data().group_data.lock().unwrap();
+        let user_party = group_data.entry(party).or_insert(QueueGroup {
+            players: HashSet::from([ctx.author().id]),
+            pending_invites: HashSet::new(),
+        });
         user_party.pending_invites.insert(user);
         user_party.clone()
     };
-    user.create_dm_channel(ctx)
-        .await?
-        .send_message(
+    let Ok(_) = user
+        .direct_message(
             ctx,
             CreateMessage::default()
                 .content(format!(
@@ -1934,7 +1965,19 @@ async fn party_invite(
                     .style(serenity::ButtonStyle::Danger),
                 ),
         )
+        .await
+    else {
+        ctx.send(
+            CreateReply::default()
+                .content(format!(
+                    "Could not invite {} to your party. Maybe they don't have dms open?",
+                    user.mention()
+                ))
+                .ephemeral(true),
+        )
         .await?;
+        return Ok(());
+    };
     ctx.send(
         CreateReply::default()
             .content(format!("Invited {} to your party", user.mention()))
@@ -2031,18 +2074,24 @@ async fn party_list(ctx: Context<'_>) -> Result<(), Error> {
     let (party_members, pending_members) = {
         let mut group_data = ctx.data().group_data.lock().unwrap();
         let user_party = group_data.get_mut(&party).unwrap();
-        (user_party.players.clone(), user_party.pending_invites.clone())
+        (
+            user_party.players.clone(),
+            user_party.pending_invites.clone(),
+        )
     };
-    let mut content = format!("Party members: {}", party_members.iter().map(|p| p.mention()).join(", "));
+    let mut content = format!(
+        "Party members: {}",
+        party_members.iter().map(|p| p.mention()).join(", ")
+    );
     if pending_members.len() > 0 {
-        content += format!("\nPending members: {}", pending_members.iter().map(|p| p.mention()).join(", ")).as_str();
+        content += format!(
+            "\nPending members: {}",
+            pending_members.iter().map(|p| p.mention()).join(", ")
+        )
+        .as_str();
     }
-    ctx.send(
-        CreateReply::default()
-            .content(content)
-            .ephemeral(true),
-    )
-    .await?;
+    ctx.send(CreateReply::default().content(content).ephemeral(true))
+        .await?;
     Ok(())
 }
 
