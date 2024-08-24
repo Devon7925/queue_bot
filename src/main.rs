@@ -42,23 +42,25 @@ struct Data {
     queued_players: Mutex<HashSet<UserId>>,
     #[serde(default)]
     in_game_players: Mutex<HashSet<UserId>>,
-    #[serde(default)]
-    player_data: Mutex<HashMap<UserId, DerivedPlayerData>>,
-    #[serde(default)]
-    match_data: Mutex<HashMap<u32, MatchData>>,
-    #[serde(default)]
-    match_channels: Mutex<HashMap<ChannelId, u32>>,
-    #[serde(default)]
-    group_data: Mutex<HashMap<Uuid, QueueGroup>>,
+    #[serde(skip)]
+    message_edit_notify: Mutex<Arc<Notify>>,
+    queue_idx: Mutex<u32>,
     #[serde(default)]
     player_bans: Mutex<HashMap<UserId, BanData>>,
     #[serde(default)]
     leaver_data: Mutex<HashMap<UserId, u32>>,
     #[serde(default)]
+    player_data: Mutex<HashMap<UserId, DerivedPlayerData>>,
+    #[serde(default)]
+    global_player_data: Mutex<HashMap<UserId, GlobalPlayerData>>,
+    #[serde(default)]
+    match_data: Mutex<HashMap<Uuid, MatchData>>,
+    #[serde(default)]
+    match_channels: Mutex<HashMap<ChannelId, Uuid>>,
+    #[serde(default)]
+    group_data: Mutex<HashMap<Uuid, QueueGroup>>,
+    #[serde(default)]
     is_matchmaking: Mutex<Option<()>>,
-    #[serde(skip)]
-    message_edit_notify: Mutex<Arc<Notify>>,
-    queue_idx: Mutex<u32>,
 } // User data, which is stored and accessible in all command invocations
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type Context<'a> = poise::Context<'a, Arc<Data>, Error>;
@@ -71,6 +73,7 @@ impl Default for Data {
             queued_players: Mutex::new(HashSet::new()),
             match_channels: Mutex::new(HashMap::new()),
             player_data: Mutex::new(HashMap::new()),
+            global_player_data: Mutex::new(HashMap::new()),
             match_data: Mutex::new(HashMap::new()),
             in_game_players: Mutex::new(HashSet::new()),
             group_data: Mutex::new(HashMap::new()),
@@ -173,6 +176,7 @@ struct MatchData {
     members: Vec<Vec<UserId>>,
     map_vote_end_time: Option<u64>,
     resolved: bool,
+    name: String,
 }
 
 impl Default for MatchData {
@@ -184,6 +188,7 @@ impl Default for MatchData {
             map_votes: HashMap::new(),
             map_vote_end_time: None,
             resolved: false,
+            name: "".to_string(),
         }
     }
 }
@@ -268,8 +273,6 @@ impl Default for PlayerStats {
 #[derive(Serialize, Deserialize, Clone)]
 struct DerivedPlayerData {
     rating: Option<WengLinRating>,
-    queue_enter_time: Option<DateTime<Utc>>,
-    party: Option<Uuid>,
     player_queueing_config: DerivedPlayerQueueingConfig,
     game_categories: HashMap<String, Vec<usize>>,
     stats: PlayerStats,
@@ -279,8 +282,6 @@ impl Default for DerivedPlayerData {
     fn default() -> Self {
         Self {
             rating: None,
-            queue_enter_time: None,
-            party: None,
             player_queueing_config: DerivedPlayerQueueingConfig {
                 cost_per_avg_mmr_differential: None,
                 acceptable_mmr_differential: None,
@@ -290,6 +291,21 @@ impl Default for DerivedPlayerData {
             },
             game_categories: HashMap::new(),
             stats: PlayerStats::default(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct GlobalPlayerData {
+    queue_enter_time: Option<DateTime<Utc>>,
+    party: Option<Uuid>,
+}
+
+impl Default for GlobalPlayerData {
+    fn default() -> Self {
+        Self {
+            queue_enter_time: None,
+            party: None
         }
     }
 }
@@ -314,7 +330,7 @@ async fn try_queue_player(
         return Err("You're already in queue!".to_string());
     }
     if let Some(group) = data
-        .player_data
+        .global_player_data
         .lock()
         .unwrap()
         .get(&user_id)
@@ -354,10 +370,9 @@ async fn try_queue_player(
             )
         })
         .collect();
-    let party_id = {
+    {
         let mut player_data = data.player_data.lock().unwrap();
         player_data.get_mut(&user_id).unwrap().game_categories = player_categories;
-        let mut queued_players = data.queued_players.lock().unwrap();
         if let Some(player_ban) = data.player_bans.lock().unwrap().get(&user_id) {
             if !player_ban.shadow_ban {
                 if let Some(ban_reason) = player_ban.reason.clone() {
@@ -369,14 +384,18 @@ async fn try_queue_player(
                 return Err("Cannot queue because you're banned".to_string());
             }
         }
-        let player_data = player_data
+    }
+    let party_id = {
+        let mut global_player_data = data.global_player_data.lock().unwrap();
+        let mut queued_players = data.queued_players.lock().unwrap();
+        let global_player_data = global_player_data
             .entry(user_id)
-            .or_insert(DerivedPlayerData::default());
+            .or_insert(GlobalPlayerData::default());
 
-        player_data.queue_enter_time = Some(chrono::offset::Utc::now());
+        global_player_data.queue_enter_time = Some(chrono::offset::Utc::now());
         queued_players.insert(user_id);
 
-        player_data.party
+        global_player_data.party
     };
 
     if queue_party {
@@ -504,11 +523,11 @@ async fn handler(
                         if let Some(channel_id) = old.channel_id {
                             if config.queue_channels.contains(&channel_id) {
                                 {
-                                    let mut player_data = data.player_data.lock().unwrap();
+                                    let mut player_data = data.global_player_data.lock().unwrap();
                                     let mut queued_players = data.queued_players.lock().unwrap();
                                     player_data
                                         .entry(new.user_id)
-                                        .or_insert(DerivedPlayerData::default())
+                                        .or_insert(GlobalPlayerData::default())
                                         .queue_enter_time = None;
                                     queued_players.remove(&old.user_id);
                                 }
@@ -716,7 +735,6 @@ async fn handler(
                                     data.clone(),
                                     &vote_result,
                                     &match_data,
-                                    match_number,
                                 );
                                 (match_data.channels.clone(), match_data.members.clone())
                             };
@@ -809,10 +827,10 @@ async fn handler(
                         return Ok(());
                     };
                     let old_party = {
-                        let mut player_data = data.player_data.lock().unwrap();
+                        let mut player_data = data.global_player_data.lock().unwrap();
                         let player_data = player_data
                             .entry(message_component.user.id)
-                            .or_insert(DerivedPlayerData::default());
+                            .or_insert(GlobalPlayerData::default());
                         let old_party = player_data.party;
                         player_data.party = Some(party_uuid);
                         old_party
@@ -1138,7 +1156,7 @@ async fn update_queue_messages(data: Arc<Data>, http: Arc<Http>) -> Result<(), E
     Ok(())
 }
 
-fn log_match_results(_data: Arc<Data>, result: &MatchResult, match_data: &MatchData, number: u32) {
+fn log_match_results(_data: Arc<Data>, result: &MatchResult, match_data: &MatchData) {
     let mut file = OpenOptions::new()
         .append(true)
         .create(true)
@@ -1146,8 +1164,8 @@ fn log_match_results(_data: Arc<Data>, result: &MatchResult, match_data: &MatchD
         .unwrap();
     if let Err(e) = writeln!(
         file,
-        "match #{}:{:?}\nresult:{}",
-        number, match_data, result
+        "match {}:{:?}\nresult:{}",
+        match_data.name, match_data, result
     ) {
         eprintln!("Couldn't write to file: {}", e);
     }
@@ -1293,7 +1311,29 @@ async fn try_matchmaking(
         let delay = 10.0;
         return Ok(Some(delay));
     };
-    let cost_eval = evaluate_cost(data.clone(), &members).await;
+    let player_game_data = {
+        let player_data = data.player_data.lock().unwrap();
+        members
+            .iter()
+            .map(|team| {
+                team.iter()
+                    .map(|player| player_data.get(player).unwrap().clone())
+                    .collect_vec()
+            })
+            .collect_vec()
+    };
+    let global_player_data = {
+        let player_data = data.global_player_data.lock().unwrap();
+        members
+            .iter()
+            .map(|team| {
+                team.iter()
+                    .map(|player| player_data.get(player).unwrap().clone())
+                    .collect_vec()
+            })
+            .collect_vec()
+    };
+    let cost_eval = evaluate_cost(data.clone(), &player_game_data, &global_player_data).await;
     if cost_eval.0 > config.maximum_queue_cost {
         println!("Best option has cost of {}", cost_eval.0);
         let delay = (cost_eval.0 - config.maximum_queue_cost) / total_player_count as f32 + 1.0;
@@ -1304,13 +1344,14 @@ async fn try_matchmaking(
         *queue_idx += 1;
         *queue_idx
     };
+    let new_id = Uuid::new_v4();
 
     {
         for team in members.iter() {
             for player in team {
                 data.queued_players.lock().unwrap().remove(player);
                 data.in_game_players.lock().unwrap().insert(player.clone());
-                data.player_data
+                data.global_player_data
                     .lock()
                     .unwrap()
                     .get_mut(player)
@@ -1439,9 +1480,8 @@ async fn try_matchmaking(
                         }
                         let vote_result = {
                             let match_data = data.match_data.lock().unwrap();
-                            let match_number = new_idx;
                             let mut votes: HashMap<String, u32> = HashMap::new();
-                            let Some(match_data) = match_data.get(&match_number) else {
+                            let Some(match_data) = match_data.get(&new_id) else {
                                 return;
                             };
                             for (_user, vote) in match_data.map_votes.iter() {
@@ -1502,14 +1542,14 @@ async fn try_matchmaking(
                 .await?;
             {
                 let mut channels = data.match_channels.lock().unwrap();
-                channels.insert(match_channel.id, new_idx);
+                channels.insert(match_channel.id, new_id);
             }
             {
                 let mut match_data = data.match_data.lock().unwrap();
                 let mut channels = vec![match_channel.id];
                 channels.extend(vc_channels_copy.iter().map(|c| c.id));
                 match_data.insert(
-                    new_idx,
+                    new_id,
                     MatchData {
                         result_votes: HashMap::new(),
                         channels,
@@ -1517,6 +1557,7 @@ async fn try_matchmaking(
                         map_votes: HashMap::new(),
                         map_vote_end_time,
                         resolved: false,
+                        name: format!("#{}", new_idx)
                     },
                 );
             }
@@ -1555,19 +1596,9 @@ async fn try_matchmaking(
 
 async fn evaluate_cost(
     data: Arc<Data>,
-    players: &Vec<Vec<UserId>>,
+    player_data: &Vec<Vec<DerivedPlayerData>>,
+    global_player_data: &Vec<Vec<GlobalPlayerData>>,
 ) -> (f32, HashMap<String, usize>) {
-    let player_game_data = {
-        let player_data = data.player_data.lock().unwrap();
-        players
-            .iter()
-            .map(|team| {
-                team.iter()
-                    .map(|player| player_data.get(player).unwrap().clone())
-                    .collect_vec()
-            })
-            .collect_vec()
-    };
     let (team_size, game_categories, default_player_data) = {
         let config = data.configuration.lock().unwrap();
         (
@@ -1576,7 +1607,7 @@ async fn evaluate_cost(
             config.default_player_data.clone(),
         )
     };
-    let team_mmrs = player_game_data.iter().map(|team| {
+    let team_mmrs = player_data.iter().map(|team| {
         team.iter()
             .map(|player| player.rating.unwrap_or(default_player_data.rating).rating as f32)
             .sum::<f32>()
@@ -1587,7 +1618,7 @@ async fn evaluate_cost(
         MinMaxResult::OneElement(_) => 0.0,
         MinMaxResult::MinMax(min, max) => max - min,
     };
-    let mmr_range = player_game_data
+    let mmr_range = player_data
         .iter()
         .flat_map(|team| {
             team.iter()
@@ -1600,7 +1631,7 @@ async fn evaluate_cost(
         MinMaxResult::MinMax(min, max) => max - min,
     };
 
-    let player_categories: Vec<HashMap<String, Vec<usize>>> = player_game_data
+    let player_categories: Vec<HashMap<String, Vec<usize>>> = player_data
         .iter()
         .flat_map(|team| team.iter().map(|player| player.game_categories.clone()))
         .collect_vec();
@@ -1633,15 +1664,16 @@ async fn evaluate_cost(
         .collect();
     let now = chrono::offset::Utc::now();
     (
-        player_game_data
+        player_data
             .iter()
             .flat_map(|team| team.iter())
+            .zip(global_player_data.iter().flat_map(|team| team.iter()))
             .zip(player_categories.iter())
-            .map(|(player, player_categories)| {
+            .map(|((player, global_player), player_categories)| {
                 let queue_config = player
                     .player_queueing_config
                     .derive(&default_player_data.player_queueing_config);
-                let time_in_queue = player
+                let time_in_queue = global_player
                     .queue_enter_time
                     .map(|queue_time| (now - queue_time).num_seconds())
                     .unwrap_or(0);
@@ -1688,7 +1720,7 @@ async fn greedy_matchmaking(data: Arc<Data>, pool: HashSet<UserId>) -> Option<Ve
                 let mut result_copy = result.clone();
                 let mut added_players = vec![];
                 if let Some(party) = data
-                    .player_data
+                    .global_player_data
                     .lock()
                     .unwrap()
                     .get(possible_addition)
@@ -1715,7 +1747,29 @@ async fn greedy_matchmaking(data: Arc<Data>, pool: HashSet<UserId>) -> Option<Ve
                     result_copy[team_idx].push(possible_addition.clone());
                 }
 
-                let cost = evaluate_cost(data.clone(), &result_copy).await.0;
+                let player_game_data = {
+                    let player_data = data.player_data.lock().unwrap();
+                    result_copy
+                        .iter()
+                        .map(|team| {
+                            team.iter()
+                                .map(|player| player_data.get(player).unwrap().clone())
+                                .collect_vec()
+                        })
+                        .collect_vec()
+                };
+                let global_player_data = {
+                    let player_data = data.global_player_data.lock().unwrap();
+                    result_copy
+                        .iter()
+                        .map(|team| {
+                            team.iter()
+                                .map(|player| player_data.get(player).unwrap().clone())
+                                .collect_vec()
+                        })
+                        .collect_vec()
+                };
+                let cost = evaluate_cost(data.clone(), &player_game_data, &global_player_data).await.0;
                 if cost < min_cost {
                     min_cost = cost;
                     best_next_result = result_copy;
@@ -1809,11 +1863,11 @@ async fn queue(ctx: Context<'_>) -> Result<(), Error> {
 fn player_leave_queue(data: Arc<Data>, user: UserId, queue_group: bool) -> String {
     if queue_group {
         if let Some(Some(party_members)) = data
-            .player_data
+            .global_player_data
             .lock()
             .unwrap()
             .entry(user.clone())
-            .or_insert(DerivedPlayerData::default())
+            .or_insert(GlobalPlayerData::default())
             .party
             .map(|party| {
                 data.group_data
@@ -1831,10 +1885,10 @@ fn player_leave_queue(data: Arc<Data>, user: UserId, queue_group: bool) -> Strin
     }
     let removed = {
         let mut queued_players = data.queued_players.lock().unwrap();
-        let mut player_data = data.player_data.lock().unwrap();
+        let mut player_data = data.global_player_data.lock().unwrap();
         player_data
             .entry(user.clone())
-            .or_insert(DerivedPlayerData::default())
+            .or_insert(GlobalPlayerData::default())
             .queue_enter_time = None;
         queued_players.remove(&user)
     };
@@ -1956,10 +2010,10 @@ async fn party_invite(
     }
 
     let party = {
-        let mut user_data = ctx.data().player_data.lock().unwrap();
+        let mut user_data = ctx.data().global_player_data.lock().unwrap();
         let user_data = user_data
             .entry(ctx.author().id)
-            .or_insert(DerivedPlayerData::default());
+            .or_insert(GlobalPlayerData::default());
         if user_data.party.is_none() {
             user_data.party = Some(Uuid::new_v4());
         }
@@ -2058,10 +2112,10 @@ async fn leave_party(
 #[poise::command(slash_command, prefix_command, rename = "leave")]
 async fn party_leave(ctx: Context<'_>) -> Result<(), Error> {
     let old_party = {
-        let mut user_data = ctx.data().player_data.lock().unwrap();
+        let mut user_data = ctx.data().global_player_data.lock().unwrap();
         let user_data = user_data
             .entry(ctx.author().id)
-            .or_insert(DerivedPlayerData::default());
+            .or_insert(GlobalPlayerData::default());
         let old_party = user_data.party.clone();
         user_data.party = None;
         old_party
@@ -2095,10 +2149,10 @@ async fn party_leave(ctx: Context<'_>) -> Result<(), Error> {
 #[poise::command(slash_command, prefix_command, rename = "list")]
 async fn party_list(ctx: Context<'_>) -> Result<(), Error> {
     let party = {
-        let mut user_data = ctx.data().player_data.lock().unwrap();
+        let mut user_data = ctx.data().global_player_data.lock().unwrap();
         let user_data = user_data
             .entry(ctx.author().id)
-            .or_insert(DerivedPlayerData::default());
+            .or_insert(GlobalPlayerData::default());
         user_data.party.clone()
     };
     let Some(party) = party else {

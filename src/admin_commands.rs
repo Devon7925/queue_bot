@@ -248,7 +248,7 @@ async fn force_result(ctx: Context<'_>, result: MatchResult) -> Result<(), Error
     let (channels, players) = {
         let match_data = ctx.data().match_data.lock().unwrap();
         let match_data = match_data.get(&match_number).unwrap();
-        log_match_results(ctx.data().clone(), &result, &match_data, match_number);
+        log_match_results(ctx.data().clone(), &result, &match_data);
         (match_data.channels.clone(), match_data.members.clone())
     };
 
