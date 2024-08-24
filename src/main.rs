@@ -4,6 +4,7 @@ mod player_config_commands;
 
 use std::{
     collections::{HashMap, HashSet},
+    fmt::Display,
     fs::{self, OpenOptions},
     hash::Hash,
     io::prelude::*,
@@ -33,15 +34,53 @@ use skillratings::{
     MultiTeamOutcome, MultiTeamRatingSystem,
 };
 use tokio::sync::Notify;
-use uuid::Uuid;
+
+#[derive(Serialize, Deserialize, Eq, PartialEq, Debug, Clone, Hash, Copy)]
+struct MatchUuid(uuid::Uuid);
+
+impl Display for MatchUuid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl MatchUuid {
+    fn new() -> Self {
+        MatchUuid(uuid::Uuid::new_v4())
+    }
+}
+
+#[derive(Serialize, Deserialize, Eq, PartialEq, Debug, Clone, Hash, Copy)]
+struct GroupUuid(uuid::Uuid);
+
+impl Display for GroupUuid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl GroupUuid {
+    fn new() -> Self {
+        GroupUuid(uuid::Uuid::new_v4())
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 struct Data {
+    #[serde(default)]
+    in_game_players: Mutex<HashSet<UserId>>,
+    #[serde(default)]
+    global_player_data: Mutex<HashMap<UserId, GlobalPlayerData>>,
+    #[serde(default)]
+    match_channels: Mutex<HashMap<ChannelId, MatchUuid>>,
+    #[serde(default)]
+    match_data: Mutex<HashMap<MatchUuid, MatchData>>,
+    #[serde(default)]
+    group_data: Mutex<HashMap<GroupUuid, QueueGroup>>,
+
     configuration: Mutex<QueueConfiguration>,
     #[serde(default)]
     queued_players: Mutex<HashSet<UserId>>,
-    #[serde(default)]
-    in_game_players: Mutex<HashSet<UserId>>,
     #[serde(skip)]
     message_edit_notify: Mutex<Arc<Notify>>,
     queue_idx: Mutex<u32>,
@@ -51,14 +90,6 @@ struct Data {
     leaver_data: Mutex<HashMap<UserId, u32>>,
     #[serde(default)]
     player_data: Mutex<HashMap<UserId, DerivedPlayerData>>,
-    #[serde(default)]
-    global_player_data: Mutex<HashMap<UserId, GlobalPlayerData>>,
-    #[serde(default)]
-    match_data: Mutex<HashMap<Uuid, MatchData>>,
-    #[serde(default)]
-    match_channels: Mutex<HashMap<ChannelId, Uuid>>,
-    #[serde(default)]
-    group_data: Mutex<HashMap<Uuid, QueueGroup>>,
     #[serde(default)]
     is_matchmaking: Mutex<Option<()>>,
 } // User data, which is stored and accessible in all command invocations
@@ -298,14 +329,14 @@ impl Default for DerivedPlayerData {
 #[derive(Serialize, Deserialize, Clone)]
 struct GlobalPlayerData {
     queue_enter_time: Option<DateTime<Utc>>,
-    party: Option<Uuid>,
+    party: Option<GroupUuid>,
 }
 
 impl Default for GlobalPlayerData {
     fn default() -> Self {
         Self {
             queue_enter_time: None,
-            party: None
+            party: None,
         }
     }
 }
@@ -731,11 +762,7 @@ async fn handler(
                                 let mut match_data = data.match_data.lock().unwrap();
                                 let match_data = match_data.get_mut(&match_number).unwrap();
                                 match_data.resolved = true;
-                                log_match_results(
-                                    data.clone(),
-                                    &vote_result,
-                                    &match_data,
-                                );
+                                log_match_results(data.clone(), &vote_result, &match_data);
                                 (match_data.channels.clone(), match_data.members.clone())
                             };
 
@@ -802,7 +829,7 @@ async fn handler(
                 }
                 if let Some(party_id) = message_component.data.custom_id.strip_prefix("join_party_")
                 {
-                    let party_uuid = serde_json::from_str::<Uuid>(party_id).unwrap();
+                    let party_uuid = serde_json::from_str::<GroupUuid>(party_id).unwrap();
                     let group_members = {
                         let mut group_data = data.group_data.lock().unwrap();
                         let party = group_data.get_mut(&party_uuid);
@@ -882,7 +909,7 @@ async fn handler(
                     let group_members = {
                         let mut group_data = data.group_data.lock().unwrap();
                         let party =
-                            group_data.get_mut(&serde_json::from_str::<Uuid>(party_id).unwrap());
+                            group_data.get_mut(&serde_json::from_str::<GroupUuid>(party_id).unwrap());
                         if let Some(party) = party {
                             party.pending_invites.remove(&message_component.user.id);
                             Some(party.players.clone())
@@ -1344,7 +1371,7 @@ async fn try_matchmaking(
         *queue_idx += 1;
         *queue_idx
     };
-    let new_id = Uuid::new_v4();
+    let new_id = MatchUuid::new();
 
     {
         for team in members.iter() {
@@ -1557,7 +1584,7 @@ async fn try_matchmaking(
                         map_votes: HashMap::new(),
                         map_vote_end_time,
                         resolved: false,
-                        name: format!("#{}", new_idx)
+                        name: format!("#{}", new_idx),
                     },
                 );
             }
@@ -1769,7 +1796,9 @@ async fn greedy_matchmaking(data: Arc<Data>, pool: HashSet<UserId>) -> Option<Ve
                         })
                         .collect_vec()
                 };
-                let cost = evaluate_cost(data.clone(), &player_game_data, &global_player_data).await.0;
+                let cost = evaluate_cost(data.clone(), &player_game_data, &global_player_data)
+                    .await
+                    .0;
                 if cost < min_cost {
                     min_cost = cost;
                     best_next_result = result_copy;
@@ -2015,7 +2044,7 @@ async fn party_invite(
             .entry(ctx.author().id)
             .or_insert(GlobalPlayerData::default());
         if user_data.party.is_none() {
-            user_data.party = Some(Uuid::new_v4());
+            user_data.party = Some(GroupUuid::new());
         }
         user_data.party.unwrap()
     };
@@ -2084,7 +2113,7 @@ async fn leave_party(
     data: Arc<Data>,
     user: &UserId,
     http: Arc<impl CacheHttp>,
-    old_party: Uuid,
+    old_party: GroupUuid,
 ) -> Result<(), Error> {
     let remaining_party_members = {
         let mut group_data = data.group_data.lock().unwrap();
