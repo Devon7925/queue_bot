@@ -14,7 +14,8 @@ use std::{
 
 use admin_commands::{create_queue_message, force_outcome, list_leavers, manage_player, register};
 use chrono::{DateTime, Utc};
-use configure_command::{configure, import_config};
+use configure_command::{configure, create_queue, export_config, import_config};
+use dashmap::DashMap;
 use itertools::{Itertools, MinMaxResult};
 use player_config_commands::player_config;
 use poise::{
@@ -23,7 +24,7 @@ use poise::{
         CreateActionRow, CreateAllowedMentions, CreateButton, CreateChannel,
         CreateInteractionResponse, CreateInteractionResponseMessage, CreateMessage, EditMember,
         EditMessage, GuildId, Http, Mentionable, MessageId, PermissionOverwrite,
-        PermissionOverwriteType, Permissions, RoleId, UserId,
+        PermissionOverwriteType, Permissions, RoleId, UserId, VoiceState,
     },
     CreateReply,
 };
@@ -65,10 +66,23 @@ impl GroupUuid {
     }
 }
 
+#[derive(Serialize, Deserialize, Eq, PartialEq, Debug, Clone, Hash, Copy)]
+struct QueueUuid(uuid::Uuid);
+
+impl Display for QueueUuid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl QueueUuid {
+    fn new() -> Self {
+        QueueUuid(uuid::Uuid::new_v4())
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct Data {
-    #[serde(default)]
-    in_game_players: Mutex<HashSet<UserId>>,
     #[serde(default)]
     global_player_data: Mutex<HashMap<UserId, GlobalPlayerData>>,
     #[serde(default)]
@@ -77,21 +91,26 @@ struct Data {
     match_data: Mutex<HashMap<MatchUuid, MatchData>>,
     #[serde(default)]
     group_data: Mutex<HashMap<GroupUuid, QueueGroup>>,
-
-    configuration: Mutex<QueueConfiguration>,
     #[serde(default)]
-    queued_players: Mutex<HashSet<UserId>>,
+    guild_data: Mutex<HashMap<GuildId, GuildData>>,
+    #[serde(default)]
+    configuration: DashMap<QueueUuid, QueueConfiguration>,
+    #[serde(default)]
+    queued_players: DashMap<QueueUuid, HashSet<UserId>>,
+    #[serde(default)]
+    current_games: DashMap<QueueUuid, HashSet<MatchUuid>>,
     #[serde(skip)]
-    message_edit_notify: Mutex<Arc<Notify>>,
-    queue_idx: Mutex<u32>,
+    message_edit_notify: DashMap<QueueUuid, Arc<Notify>>,
     #[serde(default)]
-    player_bans: Mutex<HashMap<UserId, BanData>>,
+    queue_idx: DashMap<QueueUuid, u32>,
     #[serde(default)]
-    leaver_data: Mutex<HashMap<UserId, u32>>,
+    player_bans: DashMap<QueueUuid, HashMap<UserId, BanData>>,
     #[serde(default)]
-    player_data: Mutex<HashMap<UserId, DerivedPlayerData>>,
+    leaver_data: DashMap<QueueUuid, HashMap<UserId, u32>>,
     #[serde(default)]
-    is_matchmaking: Mutex<Option<()>>,
+    player_data: DashMap<QueueUuid, HashMap<UserId, DerivedPlayerData>>,
+    #[serde(default)]
+    is_matchmaking: DashMap<QueueUuid, Option<()>>,
 } // User data, which is stored and accessible in all command invocations
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type Context<'a> = poise::Context<'a, Arc<Data>, Error>;
@@ -99,19 +118,20 @@ type Context<'a> = poise::Context<'a, Arc<Data>, Error>;
 impl Default for Data {
     fn default() -> Self {
         Self {
-            configuration: Mutex::new(QueueConfiguration::default()),
-            queue_idx: Mutex::new(0),
-            queued_players: Mutex::new(HashSet::new()),
-            match_channels: Mutex::new(HashMap::new()),
-            player_data: Mutex::new(HashMap::new()),
             global_player_data: Mutex::new(HashMap::new()),
+            match_channels: Mutex::new(HashMap::new()),
             match_data: Mutex::new(HashMap::new()),
-            in_game_players: Mutex::new(HashSet::new()),
             group_data: Mutex::new(HashMap::new()),
-            player_bans: Mutex::new(HashMap::new()),
-            leaver_data: Mutex::new(HashMap::new()),
-            message_edit_notify: Mutex::new(Arc::new(Notify::new())),
-            is_matchmaking: Mutex::new(None),
+            guild_data: Mutex::new(HashMap::new()),
+            configuration: DashMap::new(),
+            queue_idx: DashMap::new(),
+            queued_players: DashMap::new(),
+            current_games: DashMap::new(),
+            player_data: DashMap::new(),
+            player_bans: DashMap::new(),
+            leaver_data: DashMap::new(),
+            message_edit_notify: DashMap::new(),
+            is_matchmaking: DashMap::new(),
         }
     }
 }
@@ -121,6 +141,19 @@ struct BanData {
     end_time: Option<DateTime<Utc>>,
     reason: Option<String>,
     shadow_ban: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct GuildData {
+    queues: Vec<QueueUuid>,
+}
+
+impl Default for GuildData {
+    fn default() -> Self {
+        Self {
+            queues: Default::default()
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -208,20 +241,7 @@ struct MatchData {
     map_vote_end_time: Option<u64>,
     resolved: bool,
     name: String,
-}
-
-impl Default for MatchData {
-    fn default() -> Self {
-        Self {
-            result_votes: HashMap::new(),
-            channels: vec![],
-            members: vec![],
-            map_votes: HashMap::new(),
-            map_vote_end_time: None,
-            resolved: false,
-            name: "".to_string(),
-        }
-    }
+    queue: QueueUuid,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -327,9 +347,17 @@ impl Default for DerivedPlayerData {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
+enum QueueState {
+    None,
+    Queued,
+    InGame,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
 struct GlobalPlayerData {
     queue_enter_time: Option<DateTime<Utc>>,
     party: Option<GroupUuid>,
+    queue_state: QueueState,
 }
 
 impl Default for GlobalPlayerData {
@@ -337,28 +365,43 @@ impl Default for GlobalPlayerData {
         Self {
             queue_enter_time: None,
             party: None,
+            queue_state: QueueState::None,
         }
     }
 }
 
 async fn try_queue_player(
     data: Arc<Data>,
+    queue_id: &QueueUuid,
     user_id: UserId,
     http: Arc<Http>,
     guild_id: GuildId,
     queue_party: bool,
 ) -> Result<(), String> {
     {
-        let mut player_data = data.player_data.lock().unwrap();
+        let mut player_data = data.player_data.get_mut(&queue_id).unwrap();
         player_data
             .entry(user_id)
             .or_insert(DerivedPlayerData::default());
     }
-    if data.in_game_players.lock().unwrap().contains(&user_id) {
+    if matches!(
+        data.global_player_data
+            .lock()
+            .unwrap()
+            .entry(user_id)
+            .or_default()
+            .queue_state,
+        QueueState::InGame
+    ) {
         return Err("Cannot queue while in game!".to_string());
     }
-    if data.queued_players.lock().unwrap().contains(&user_id) {
-        return Err("You're already in queue!".to_string());
+    if data
+        .queued_players
+        .get(&queue_id)
+        .unwrap()
+        .contains(&user_id)
+    {
+        return Err("You're already in this queue!".to_string());
     }
     if let Some(group) = data
         .global_player_data
@@ -381,9 +424,19 @@ async fn try_queue_player(
             return Err("Cannot queue while your party has pending invites!".to_string());
         }
     }
-    update_bans(data.clone());
+    for queue in data
+        .guild_data
+        .lock()
+        .unwrap()
+        .get(&guild_id)
+        .unwrap()
+        .queues
+        .iter()
+    {
+        update_bans(data.clone(), queue);
+    }
     let game_categories = {
-        let config = data.configuration.lock().unwrap();
+        let config = data.configuration.get(&queue_id).unwrap();
         config.game_categories.clone()
     };
     let user_roles = guild_id.member(http.clone(), user_id).await.unwrap().roles;
@@ -402,9 +455,9 @@ async fn try_queue_player(
         })
         .collect();
     {
-        let mut player_data = data.player_data.lock().unwrap();
+        let mut player_data = data.player_data.get_mut(&queue_id).unwrap();
         player_data.get_mut(&user_id).unwrap().game_categories = player_categories;
-        if let Some(player_ban) = data.player_bans.lock().unwrap().get(&user_id) {
+        if let Some(player_ban) = data.player_bans.get(&queue_id).unwrap().get(&user_id) {
             if !player_ban.shadow_ban {
                 if let Some(ban_reason) = player_ban.reason.clone() {
                     return Err(format!(
@@ -418,7 +471,7 @@ async fn try_queue_player(
     }
     let party_id = {
         let mut global_player_data = data.global_player_data.lock().unwrap();
-        let mut queued_players = data.queued_players.lock().unwrap();
+        let mut queued_players = data.queued_players.get_mut(&queue_id).unwrap();
         let global_player_data = global_player_data
             .entry(user_id)
             .or_insert(GlobalPlayerData::default());
@@ -443,6 +496,7 @@ async fn try_queue_player(
             for player in party_members {
                 Box::pin(try_queue_player(
                     data.clone(),
+                    queue_id,
                     player,
                     http.clone(),
                     guild_id,
@@ -452,10 +506,11 @@ async fn try_queue_player(
             }
         }
     }
+    let queue_id = queue_id.clone();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs_f32(60.0 * 30.0)).await;
-            match ensure_wants_queue(data.clone(), http.clone(), &user_id).await {
+            match ensure_wants_queue(data.clone(), http.clone(), &user_id, &queue_id).await {
                 Ok(true) => break,
                 Ok(false) => {}
                 Err(err) => {
@@ -473,8 +528,9 @@ async fn ensure_wants_queue(
     data: Arc<Data>,
     http: Arc<Http>,
     user: &UserId,
+    queue_id: &QueueUuid,
 ) -> Result<bool, Error> {
-    if !data.queued_players.lock().unwrap().contains(user) {
+    if !data.queued_players.get(&queue_id).unwrap().contains(user) {
         return Ok(true);
     }
     let mut leaver_message_content =
@@ -482,7 +538,11 @@ async fn ensure_wants_queue(
     leaver_message_content += format!(
         "\nEnds <t:{}:R>, otherwise you will be kicked from queue",
         std::time::UNIX_EPOCH.elapsed().unwrap().as_secs()
-            + data.configuration.lock().unwrap().leaver_verification_time as u64
+            + data
+                .configuration
+                .get(&queue_id)
+                .unwrap()
+                .leaver_verification_time as u64
     )
     .as_str();
     let mut leaver_message = CreateMessage::default().content(leaver_message_content);
@@ -490,24 +550,31 @@ async fn ensure_wants_queue(
         CreateButton::new(format!("queue_check"))
             .label("Yes, I'm here.")
             .style(serenity::ButtonStyle::Primary),
-        CreateButton::new(format!("afk_leave_queue"))
+        CreateButton::new(format!("afk_leave_queue_{}", queue_id))
             .label("No, exit queue.")
             .style(serenity::ButtonStyle::Primary),
     ])]);
     let Ok(leaver_message) = user.direct_message(http.clone(), leaver_message).await else {
-        data.queued_players.lock().unwrap().remove(&user);
-        data.message_edit_notify.lock().unwrap().notify_one();
+        data.queued_players
+            .get_mut(&queue_id)
+            .unwrap()
+            .remove(&user);
+        data.message_edit_notify
+            .get(&queue_id)
+            .unwrap()
+            .notify_one();
         return Ok(true);
     };
     {
         let user = user.clone();
         let data = data.clone();
         let ctx1 = http.clone();
+        let queue_id = queue_id.clone();
         tokio::spawn(async move {
             let leaver_verification_time = data
                 .clone()
                 .configuration
-                .lock()
+                .get(&queue_id)
                 .unwrap()
                 .leaver_verification_time as u64;
             tokio::time::sleep(Duration::from_secs(leaver_verification_time)).await;
@@ -517,8 +584,14 @@ async fn ensure_wants_queue(
             else {
                 return;
             };
-            data.queued_players.lock().unwrap().remove(&user);
-            data.message_edit_notify.lock().unwrap().notify_one();
+            data.queued_players
+                .get_mut(&queue_id)
+                .unwrap()
+                .remove(&user);
+            data.message_edit_notify
+                .get(&queue_id)
+                .unwrap()
+                .notify_one();
             message.delete(ctx1.clone()).await.ok();
         });
     }
@@ -535,40 +608,74 @@ async fn handler(
     match event {
         serenity::FullEvent::Ready { .. } => {
             println!("Ready");
-            let notify2 = data.message_edit_notify.lock().unwrap().clone();
-            let http = ctx.http.clone();
-            tokio::spawn(async move {
-                loop {
-                    notify2.notified().await;
-                    update_queue_messages(data.clone(), http.clone()).await.ok();
-                    tokio::time::sleep(Duration::from_secs_f32(1.0)).await;
-                }
-            });
+            let notifies = data
+                .message_edit_notify
+                .iter()
+                .map(|p| (p.key().clone(), p.value().clone()))
+                .collect_vec();
+            for (queue, notify) in notifies {
+                let http = ctx.http.clone();
+                let data = data.clone();
+                tokio::spawn(async move {
+                    loop {
+                        notify.notified().await;
+                        update_queue_messages(data.clone(), http.clone(), &queue)
+                            .await
+                            .ok();
+                        tokio::time::sleep(Duration::from_secs_f32(1.0)).await;
+                    }
+                });
+            }
         }
         serenity::FullEvent::VoiceStateUpdate { old, new } => {
-            let mut player_added_to_queue = false;
+            let mut queues_player_added_to = vec![];
             {
-                {
-                    let config = data.configuration.lock().unwrap().clone();
-                    if let Some(old) = old {
-                        if let Some(channel_id) = old.channel_id {
-                            if config.queue_channels.contains(&channel_id) {
-                                {
-                                    let mut player_data = data.global_player_data.lock().unwrap();
-                                    let mut queued_players = data.queued_players.lock().unwrap();
-                                    player_data
-                                        .entry(new.user_id)
-                                        .or_insert(GlobalPlayerData::default())
-                                        .queue_enter_time = None;
-                                    queued_players.remove(&old.user_id);
-                                }
-                                data.message_edit_notify.lock().unwrap().notify_one();
+                if let Some(VoiceState {
+                    guild_id: Some(guild_id),
+                    channel_id: Some(channel_id),
+                    user_id,
+                    ..
+                }) = old {
+                    for queue in data
+                        .guild_data
+                        .lock()
+                        .unwrap()
+                        .entry(guild_id.clone())
+                        .or_default()
+                        .queues
+                        .clone()
+                    {
+                        let config = data.configuration.get(&queue).unwrap().clone();
+                        if config.queue_channels.contains(&channel_id) {
+                            {
+                                let mut player_data = data.global_player_data.lock().unwrap();
+                                let mut queued_players =
+                                    data.queued_players.get_mut(&queue).unwrap();
+                                player_data
+                                    .entry(new.user_id)
+                                    .or_insert(GlobalPlayerData::default())
+                                    .queue_enter_time = None;
+                                queued_players.remove(user_id);
                             }
+                            data.message_edit_notify
+                                .get_mut(&queue)
+                                .unwrap()
+                                .notify_one();
                         }
                     }
                 }
+            }
+            let queues = data
+                .guild_data
+                .lock()
+                .unwrap()
+                .get(&new.guild_id.unwrap())
+                .unwrap()
+                .queues
+                .clone();
+            for queue in queues {
                 let try_queueing = {
-                    let config = data.configuration.lock().unwrap();
+                    let config = data.configuration.get(&queue).unwrap();
                     if let Some(channel_id) = new.channel_id {
                         config.queue_channels.contains(&channel_id)
                     } else {
@@ -579,6 +686,7 @@ async fn handler(
                 if try_queueing {
                     match try_queue_player(
                         data.clone(),
+                        &queue,
                         new.user_id,
                         ctx.http.clone(),
                         new.guild_id.unwrap(),
@@ -587,8 +695,11 @@ async fn handler(
                     .await
                     {
                         Ok(()) => {
-                            player_added_to_queue = true;
-                            data.message_edit_notify.lock().unwrap().notify_one();
+                            queues_player_added_to.push(queue);
+                            data.message_edit_notify
+                                .get_mut(&queue)
+                                .unwrap()
+                                .notify_one();
                         }
                         Err(reason) => {
                             new.user_id
@@ -598,31 +709,38 @@ async fn handler(
                     }
                 }
             }
-            if player_added_to_queue {
-                matchmake(data.clone(), ctx.http.clone(), new.guild_id.unwrap()).await?;
+            for queue in queues_player_added_to {
+                matchmake(
+                    data.clone(),
+                    ctx.http.clone(),
+                    new.guild_id.unwrap(),
+                    &queue,
+                )
+                .await?;
             }
         }
         serenity::FullEvent::InteractionCreate { interaction } => {
             if let Some(message_component) = interaction.as_message_component() {
-                let required_votes = {
-                    let config = data.configuration.lock().unwrap();
-                    config.team_count * config.team_size / 2 + 1
-                };
                 let match_number = {
                     let match_channels = data.match_channels.lock().unwrap();
                     match_channels.get(&message_component.channel_id).cloned()
                 };
                 if let Some(match_number) = match_number {
-                    let is_user_in_match = {
+                    let (queue, required_votes, is_user_in_match) = {
                         let match_data = data.match_data.lock().unwrap();
                         let Some(match_data) = match_data.get(&match_number) else {
                             return Ok(());
                         };
-                        match_data
-                            .members
-                            .iter()
-                            .flatten()
-                            .contains(&message_component.user.id)
+                        let config = data.configuration.get(&match_data.queue).unwrap();
+                        (
+                            match_data.queue,
+                            config.team_count * config.team_size / 2 + 1,
+                            match_data
+                                .members
+                                .iter()
+                                .flatten()
+                                .contains(&message_component.user.id),
+                        )
                     };
                     let mut vote_type = VoteType::None;
                     {
@@ -754,7 +872,7 @@ async fn handler(
                         if let Some(vote_result) = vote_result {
                             let post_match_channel = data
                                 .configuration
-                                .lock()
+                                .get(&queue)
                                 .unwrap()
                                 .post_match_channel
                                 .clone();
@@ -766,13 +884,21 @@ async fn handler(
                                 (match_data.channels.clone(), match_data.members.clone())
                             };
 
-                            apply_match_results(data.clone(), vote_result, &players);
+                            apply_match_results(data.clone(), vote_result, &players, queue);
 
                             let guild_id = message_component.guild_id.unwrap();
                             for player in players.iter().flat_map(|t| t) {
-                                data.in_game_players.lock().unwrap().remove(player);
+                                data.global_player_data
+                                    .lock()
+                                    .unwrap()
+                                    .get_mut(player)
+                                    .unwrap()
+                                    .queue_state = QueueState::None;
                             }
-                            data.message_edit_notify.lock().unwrap().notify_one();
+                            data.message_edit_notify
+                                .get_mut(&queue)
+                                .unwrap()
+                                .notify_one();
                             if let Some(post_match_channel) = post_match_channel {
                                 future::join_all(
                                     players
@@ -908,8 +1034,8 @@ async fn handler(
                 {
                     let group_members = {
                         let mut group_data = data.group_data.lock().unwrap();
-                        let party =
-                            group_data.get_mut(&serde_json::from_str::<GroupUuid>(party_id).unwrap());
+                        let party = group_data
+                            .get_mut(&serde_json::from_str::<GroupUuid>(party_id).unwrap());
                         if let Some(party) = party {
                             party.pending_invites.remove(&message_component.user.id);
                             Some(party.players.clone())
@@ -1003,8 +1129,45 @@ async fn handler(
                     return Ok(());
                 }
                 if message_component.data.custom_id == "queue" {
+                    let queues = data
+                        .clone()
+                        .guild_data
+                        .lock()
+                        .unwrap()
+                        .entry(message_component.guild_id.unwrap())
+                        .or_default()
+                        .queues
+                        .clone();
+                    let Some(queue) = queues
+                        .iter()
+                        .filter(|queue| {
+                            data.clone()
+                                .configuration
+                                .get(&queue)
+                                .unwrap()
+                                .queue_messages
+                                .contains(&(
+                                    message_component.channel.clone().unwrap().id,
+                                    message_component.message.id,
+                                ))
+                        })
+                        .last()
+                    else {
+                        message_component
+                            .create_response(
+                                ctx.http(),
+                                CreateInteractionResponse::Message(
+                                    CreateInteractionResponseMessage::new()
+                                        .content("Could not find queue to join!")
+                                        .ephemeral(true),
+                                ),
+                            )
+                            .await?;
+                        return Ok(());
+                    };
                     match try_queue_player(
                         data.clone(),
+                        queue,
                         message_component.user.id,
                         ctx.http.clone(),
                         message_component.guild_id.unwrap(),
@@ -1023,11 +1186,15 @@ async fn handler(
                                     ),
                                 )
                                 .await?;
-                            data.message_edit_notify.lock().unwrap().notify_one();
+                            data.message_edit_notify
+                                .get_mut(queue)
+                                .unwrap()
+                                .notify_one();
                             matchmake(
                                 data.clone(),
                                 ctx.http.clone(),
                                 message_component.guild_id.unwrap(),
+                                queue,
                             )
                             .await?;
                         }
@@ -1047,8 +1214,44 @@ async fn handler(
                     return Ok(());
                 }
                 if message_component.data.custom_id == "leave_queue" {
+                    let queues = data
+                        .clone()
+                        .guild_data
+                        .lock()
+                        .unwrap()
+                        .get(&message_component.guild_id.unwrap())
+                        .unwrap()
+                        .queues
+                        .clone();
+                    let Some(queue) = queues
+                        .iter()
+                        .filter(|queue| {
+                            data.clone()
+                                .configuration
+                                .get(&queue)
+                                .unwrap()
+                                .queue_messages
+                                .contains(&(
+                                    message_component.channel.clone().unwrap().id,
+                                    message_component.message.id,
+                                ))
+                        })
+                        .last()
+                    else {
+                        message_component
+                            .create_response(
+                                ctx.http(),
+                                CreateInteractionResponse::Message(
+                                    CreateInteractionResponseMessage::new()
+                                        .content("Could not find queue to join!")
+                                        .ephemeral(true),
+                                ),
+                            )
+                            .await?;
+                        return Ok(());
+                    };
                     let response =
-                        player_leave_queue(data.clone(), message_component.user.id, true);
+                        player_leave_queue(data.clone(), message_component.user.id, true, queue);
                     message_component
                         .create_response(
                             ctx.http(),
@@ -1061,9 +1264,18 @@ async fn handler(
                         .await?;
                     return Ok(());
                 }
-                if message_component.data.custom_id == "afk_leave_queue" {
-                    let response =
-                        player_leave_queue(data.clone(), message_component.user.id, true);
+                if let Some(queue_id) = message_component
+                    .data
+                    .custom_id
+                    .strip_prefix("afk_leave_queue_")
+                {
+                    let queue_uuid = serde_json::from_str::<QueueUuid>(queue_id).unwrap();
+                    let response = player_leave_queue(
+                        data.clone(),
+                        message_component.user.id,
+                        true,
+                        &queue_uuid,
+                    );
                     message_component
                         .create_response(
                             ctx.http(),
@@ -1078,14 +1290,54 @@ async fn handler(
                     return Ok(());
                 }
                 if message_component.data.custom_id == "status" {
+                    let queues = data
+                        .clone()
+                        .guild_data
+                        .lock()
+                        .unwrap()
+                        .get(&message_component.guild_id.unwrap())
+                        .unwrap()
+                        .queues
+                        .clone();
+                    let Some(queue) = queues
+                        .iter()
+                        .filter(|queue| {
+                            data.clone()
+                                .configuration
+                                .get(&queue)
+                                .unwrap()
+                                .queue_messages
+                                .contains(&(
+                                    message_component.channel.clone().unwrap().id,
+                                    message_component.message.id,
+                                ))
+                        })
+                        .last()
+                    else {
+                        message_component
+                            .create_response(
+                                ctx.http(),
+                                CreateInteractionResponse::Message(
+                                    CreateInteractionResponseMessage::new()
+                                        .content("Could not find queue to join!")
+                                        .ephemeral(true),
+                                ),
+                            )
+                            .await?;
+                        return Ok(());
+                    };
                     let was_in_queue = {
-                        let queued_players = data.queued_players.lock().unwrap();
+                        let queued_players = data.queued_players.get(queue).unwrap();
                         queued_players.contains(&message_component.user.id)
                     };
-                    let was_in_game = {
-                        let gaming_players = data.in_game_players.lock().unwrap();
-                        gaming_players.contains(&message_component.user.id)
-                    };
+                    let player_state = data
+                        .global_player_data
+                        .lock()
+                        .unwrap()
+                        .get(&message_component.user.id)
+                        .unwrap()
+                        .queue_state
+                        .clone();
                     if was_in_queue {
                         message_component
                             .create_response(
@@ -1097,57 +1349,87 @@ async fn handler(
                                 ),
                             )
                             .await?;
-                    } else if was_in_game {
-                        message_component
-                            .create_response(
-                                ctx.http(),
-                                CreateInteractionResponse::Message(
-                                    CreateInteractionResponseMessage::new()
-                                        .content("You are in a game.")
-                                        .ephemeral(true),
-                                ),
-                            )
-                            .await?;
                     } else {
-                        message_component
-                            .create_response(
-                                ctx.http(),
-                                CreateInteractionResponse::Message(
-                                    CreateInteractionResponseMessage::new()
-                                        .content("You aren't in queue")
-                                        .ephemeral(true),
-                                ),
-                            )
-                            .await?;
+                        match player_state {
+                            QueueState::None => {
+                                message_component
+                                    .create_response(
+                                        ctx.http(),
+                                        CreateInteractionResponse::Message(
+                                            CreateInteractionResponseMessage::new()
+                                                .content("You are not in queue")
+                                                .ephemeral(true),
+                                        ),
+                                    )
+                                    .await?;
+                            }
+                            QueueState::Queued => {
+                                message_component
+                                    .create_response(
+                                        ctx.http(),
+                                        CreateInteractionResponse::Message(
+                                            CreateInteractionResponseMessage::new()
+                                                .content("You are queued in a different queue.")
+                                                .ephemeral(true),
+                                        ),
+                                    )
+                                    .await?;
+                            }
+                            QueueState::InGame => {
+                                message_component
+                                    .create_response(
+                                        ctx.http(),
+                                        CreateInteractionResponse::Message(
+                                            CreateInteractionResponseMessage::new()
+                                                .content("You are in a game.")
+                                                .ephemeral(true),
+                                        ),
+                                    )
+                                    .await?;
+                            }
+                        }
                     }
                     return Ok(());
                 }
             }
         }
         serenity::FullEvent::Message { new_message } => {
-            if data.configuration.lock().unwrap().log_chats {
-                let Some(match_id) = data
-                    .match_channels
-                    .lock()
-                    .unwrap()
-                    .get(&new_message.channel_id)
-                    .cloned()
-                else {
-                    return Ok(());
-                };
-                fs::create_dir_all("match_logs")?;
-                let mut file = OpenOptions::new()
-                    .append(true)
-                    .create(true)
-                    .open(format!("match_logs/match-{}.log", match_id))
-                    .unwrap();
-                if let Err(e) = writeln!(
-                    file,
-                    "{}:{}",
-                    new_message.author.mention(),
-                    new_message.content.clone(),
-                ) {
-                    eprintln!("Couldn't write to file: {}", e);
+            let Some(guild_id) = new_message.guild_id else {
+                return Ok(())
+            };
+            for queue in data
+                .guild_data
+                .lock()
+                .unwrap()
+                .entry(guild_id)
+                .or_default()
+                .queues
+                .iter()
+            {
+                if data.configuration.get(queue).unwrap().log_chats {
+                    let Some(match_id) = data
+                        .match_channels
+                        .lock()
+                        .unwrap()
+                        .get(&new_message.channel_id)
+                        .cloned()
+                    else {
+                        continue;
+                    };
+                    fs::create_dir_all("match_logs")?;
+                    let mut file = OpenOptions::new()
+                        .append(true)
+                        .create(true)
+                        .open(format!("match_logs/match-{}.log", match_id))
+                        .unwrap();
+                    if let Err(e) = writeln!(
+                        file,
+                        "{}:{}",
+                        new_message.author.mention(),
+                        new_message.content.clone(),
+                    ) {
+                        eprintln!("Couldn't write to file: {}", e);
+                    }
                 }
             }
         }
@@ -1159,18 +1441,30 @@ async fn handler(
     Ok(())
 }
 
-async fn update_queue_messages(data: Arc<Data>, http: Arc<Http>) -> Result<(), Error> {
+async fn update_queue_messages(
+    data: Arc<Data>,
+    http: Arc<Http>,
+    queue: &QueueUuid,
+) -> Result<(), Error> {
+    let in_game_player_count = data.current_games.get(queue).unwrap().len() * {
+        let config = data.configuration.get(queue).unwrap();
+        (config.team_count * config.team_size) as usize
+    };
     let response = {
-        let queued_players = data.queued_players.lock().unwrap();
-        let in_game_players = data.in_game_players.lock().unwrap();
+        let queued_players = data.queued_players.get(queue).unwrap();
         format!(
             "## Matchmaking Queue\n### {} people are playing right now\nThere are {} queued players: {}",
-            queued_players.len() + in_game_players.len(),
+            queued_players.len() + in_game_player_count,
             queued_players.len(),
             queued_players.iter().map(|c| c.mention()).join(", ")
         )
     };
-    let queue_messages = data.configuration.lock().unwrap().queue_messages.clone();
+    let queue_messages = data
+        .configuration
+        .get(queue)
+        .unwrap()
+        .queue_messages
+        .clone();
     for (message_channel, queue_message) in queue_messages {
         message_channel
             .edit_message(
@@ -1198,14 +1492,19 @@ fn log_match_results(_data: Arc<Data>, result: &MatchResult, match_data: &MatchD
     }
 }
 
-fn apply_match_results(data: Arc<Data>, result: MatchResult, players: &Vec<Vec<UserId>>) {
+fn apply_match_results(
+    data: Arc<Data>,
+    result: MatchResult,
+    players: &Vec<Vec<UserId>>,
+    queue_id: QueueUuid,
+) {
     let rating_config: WengLinConfig = WengLinConfig::default();
     if matches!(result, MatchResult::Cancel) {
         return;
     }
     let system = <WengLin as MultiTeamRatingSystem>::new(rating_config);
-    let mut player_data = data.player_data.lock().unwrap();
-    let config = data.configuration.lock().unwrap();
+    let mut player_data = data.player_data.get_mut(&queue_id).unwrap();
+    let config = data.configuration.get(&queue_id).unwrap();
     let outcome = players
         .iter()
         .enumerate()
@@ -1264,9 +1563,14 @@ fn apply_match_results(data: Arc<Data>, result: MatchResult, players: &Vec<Vec<U
     }
 }
 
-async fn matchmake(data: Arc<Data>, http: Arc<Http>, guild_id: GuildId) -> Result<(), Error> {
+async fn matchmake(
+    data: Arc<Data>,
+    http: Arc<Http>,
+    guild_id: GuildId,
+    queue_id: &QueueUuid,
+) -> Result<(), Error> {
     {
-        let mut guard = data.is_matchmaking.lock().unwrap();
+        let mut guard = data.is_matchmaking.get_mut(&queue_id).unwrap();
 
         if guard.is_some() {
             // If already running, return
@@ -1279,13 +1583,13 @@ async fn matchmake(data: Arc<Data>, http: Arc<Http>, guild_id: GuildId) -> Resul
 
     loop {
         // Actual task execution
-        let result = try_matchmaking(data.clone(), http.clone(), guild_id).await?;
+        let result = try_matchmaking(data.clone(), http.clone(), guild_id, queue_id).await?;
 
         if let Some(delay) = result {
             // Task failed, clear running state and retry after delay
-            *data.is_matchmaking.lock().unwrap() = None;
+            *data.is_matchmaking.get_mut(&queue_id).unwrap() = None;
             tokio::time::sleep(Duration::from_secs_f32(delay)).await;
-            let mut guard = data.is_matchmaking.lock().unwrap();
+            let mut guard = data.is_matchmaking.get_mut(&queue_id).unwrap();
 
             // If re-executed during sleep, exit loop
             if guard.is_some() {
@@ -1295,13 +1599,16 @@ async fn matchmake(data: Arc<Data>, http: Arc<Http>, guild_id: GuildId) -> Resul
             // Mark as running again
             *guard = Some(());
         } else {
-            data.message_edit_notify.lock().unwrap().notify_one();
+            data.message_edit_notify
+                .get(&queue_id)
+                .unwrap()
+                .notify_one();
             break;
         }
     }
 
     // Clear running state when done
-    *data.is_matchmaking.lock().unwrap() = None;
+    *data.is_matchmaking.get_mut(&queue_id).unwrap() = None;
     Ok(())
 }
 
@@ -1309,10 +1616,11 @@ async fn try_matchmaking(
     data: Arc<Data>,
     cache_http: Arc<Http>,
     guild_id: GuildId,
+    queue_id: &QueueUuid,
 ) -> Result<Option<f32>, Error> {
     let (team_count, total_player_count) = {
-        let configuration = data.configuration.lock().unwrap();
-        let queued_players = data.queued_players.lock().unwrap();
+        let configuration = data.configuration.get(&queue_id).unwrap();
+        let queued_players = data.queued_players.get(&queue_id).unwrap();
         let total_player_count = configuration.team_count * configuration.team_size;
         if (queued_players.len() as u32) < total_player_count {
             return Ok(None);
@@ -1320,26 +1628,26 @@ async fn try_matchmaking(
         (configuration.team_count, total_player_count)
     };
     let config = {
-        let config = data.configuration.lock().unwrap();
+        let config = data.configuration.get(&queue_id).unwrap();
         config.clone()
     };
     let Some(category) = config.category else {
         return Err(Error::from("No category"));
     };
-    let mut queued_players = data.queued_players.lock().unwrap().clone();
+    let mut queued_players = data.queued_players.get(&queue_id).unwrap().clone();
     {
-        let bans = data.player_bans.lock().unwrap();
+        let bans = data.player_bans.get(&queue_id).unwrap();
         queued_players.retain(|p| !bans.contains_key(p));
     }
     println!("Trying matchmaking");
-    let members = greedy_matchmaking(data.clone(), queued_players).await;
+    let members = greedy_matchmaking(data.clone(), queued_players, queue_id).await;
     let Some(members) = members else {
         println!("Could not find valid matchmaking");
         let delay = 10.0;
         return Ok(Some(delay));
     };
     let player_game_data = {
-        let player_data = data.player_data.lock().unwrap();
+        let player_data = data.player_data.get(&queue_id).unwrap();
         members
             .iter()
             .map(|team| {
@@ -1360,30 +1668,36 @@ async fn try_matchmaking(
             })
             .collect_vec()
     };
-    let cost_eval = evaluate_cost(data.clone(), &player_game_data, &global_player_data).await;
+    let cost_eval = evaluate_cost(
+        data.clone(),
+        &player_game_data,
+        &global_player_data,
+        queue_id,
+    )
+    .await;
     if cost_eval.0 > config.maximum_queue_cost {
         println!("Best option has cost of {}", cost_eval.0);
         let delay = (cost_eval.0 - config.maximum_queue_cost) / total_player_count as f32 + 1.0;
         return Ok(Some(delay));
     }
     let new_idx = {
-        let mut queue_idx = data.queue_idx.lock().unwrap();
+        let mut queue_idx = data.queue_idx.get_mut(&queue_id).unwrap();
         *queue_idx += 1;
         *queue_idx
     };
     let new_id = MatchUuid::new();
 
     {
+        let mut global_data = data.global_player_data.lock().unwrap();
         for team in members.iter() {
             for player in team {
-                data.queued_players.lock().unwrap().remove(player);
-                data.in_game_players.lock().unwrap().insert(player.clone());
-                data.global_player_data
-                    .lock()
+                data.queued_players
+                    .get_mut(&queue_id)
                     .unwrap()
-                    .get_mut(player)
-                    .unwrap()
-                    .queue_enter_time = None;
+                    .remove(player);
+                let global_data = global_data.get_mut(player).unwrap();
+                global_data.queue_enter_time = None;
+                global_data.queue_state = QueueState::InGame;
             }
         }
     }
@@ -1408,7 +1722,7 @@ async fn try_matchmaking(
     });
     for role in data
         .configuration
-        .lock()
+        .get(&queue_id)
         .unwrap()
         .visability_override_roles
         .iter()
@@ -1585,6 +1899,7 @@ async fn try_matchmaking(
                         map_vote_end_time,
                         resolved: false,
                         name: format!("#{}", new_idx),
+                        queue: queue_id.clone(),
                     },
                 );
             }
@@ -1625,9 +1940,10 @@ async fn evaluate_cost(
     data: Arc<Data>,
     player_data: &Vec<Vec<DerivedPlayerData>>,
     global_player_data: &Vec<Vec<GlobalPlayerData>>,
+    queue_id: &QueueUuid,
 ) -> (f32, HashMap<String, usize>) {
     let (team_size, game_categories, default_player_data) = {
-        let config = data.configuration.lock().unwrap();
+        let config = data.configuration.get(&queue_id).unwrap();
         (
             config.team_size,
             config.game_categories.clone(),
@@ -1726,9 +2042,13 @@ async fn evaluate_cost(
     )
 }
 
-async fn greedy_matchmaking(data: Arc<Data>, pool: HashSet<UserId>) -> Option<Vec<Vec<UserId>>> {
-    let team_size = data.configuration.lock().unwrap().team_size;
-    let team_count = data.configuration.lock().unwrap().team_count;
+async fn greedy_matchmaking(
+    data: Arc<Data>,
+    pool: HashSet<UserId>,
+    queue_id: &QueueUuid,
+) -> Option<Vec<Vec<UserId>>> {
+    let team_size = data.configuration.get(&queue_id).unwrap().team_size;
+    let team_count = data.configuration.get(&queue_id).unwrap().team_count;
     let total_players = team_size * team_count;
     let mut players = pool.clone();
     let mut result = vec![vec![]; team_count as usize];
@@ -1775,7 +2095,7 @@ async fn greedy_matchmaking(data: Arc<Data>, pool: HashSet<UserId>) -> Option<Ve
                 }
 
                 let player_game_data = {
-                    let player_data = data.player_data.lock().unwrap();
+                    let player_data = data.player_data.get(&queue_id).unwrap();
                     result_copy
                         .iter()
                         .map(|team| {
@@ -1796,9 +2116,14 @@ async fn greedy_matchmaking(data: Arc<Data>, pool: HashSet<UserId>) -> Option<Ve
                         })
                         .collect_vec()
                 };
-                let cost = evaluate_cost(data.clone(), &player_game_data, &global_player_data)
-                    .await
-                    .0;
+                let cost = evaluate_cost(
+                    data.clone(),
+                    &player_game_data,
+                    &global_player_data,
+                    queue_id,
+                )
+                .await
+                .0;
                 if cost < min_cost {
                     min_cost = cost;
                     best_next_result = result_copy;
@@ -1828,10 +2153,10 @@ async fn greedy_matchmaking(data: Arc<Data>, pool: HashSet<UserId>) -> Option<Ve
 )]
 async fn backup(ctx: Context<'_>) -> Result<(), Error> {
     {
-        let match_idx = ctx.data().queue_idx.lock().unwrap().clone();
+        let time_stamp = chrono::offset::Utc::now().naive_utc();
         let config = serde_json::to_string_pretty(ctx.data())?;
         println!("Starting backup...");
-        fs::write(format!("backups/backup_{}.json", match_idx), config)?;
+        fs::write(format!("backups/backup_{}.json", time_stamp.format("%Y_%m_%d_%H_%M_%S")), config)?;
         println!("Backup made!");
     }
     let response = format!("Backup made.");
@@ -1840,21 +2165,30 @@ async fn backup(ctx: Context<'_>) -> Result<(), Error> {
     Ok(())
 }
 
-/// Exports configuration
-#[poise::command(slash_command, prefix_command)]
-async fn export_config(ctx: Context<'_>) -> Result<(), Error> {
-    let config = serde_json::to_string_pretty(&ctx.data().configuration.lock().unwrap().clone())?;
-    let response = format!("Configuration: ```json\n{}\n```", config);
-    ctx.send(CreateReply::default().content(response).ephemeral(true))
-        .await?;
-    Ok(())
-}
-
 /// Join queue
 #[poise::command(slash_command, prefix_command)]
 async fn queue(ctx: Context<'_>) -> Result<(), Error> {
+    let queues = ctx
+        .data()
+        .guild_data
+        .lock()
+        .unwrap()
+        .get(&ctx.guild_id().unwrap())
+        .unwrap()
+        .queues
+        .clone();
+    let Some(queue) = queues.iter().last() else {
+        ctx.send(
+            CreateReply::default()
+                .content("Could not find queue to join!")
+                .ephemeral(true),
+        )
+        .await?;
+        return Ok(());
+    };
     match try_queue_player(
         ctx.data().clone(),
+        queue,
         ctx.author().id,
         ctx.serenity_context().http.clone(),
         ctx.guild_id().unwrap(),
@@ -1864,7 +2198,7 @@ async fn queue(ctx: Context<'_>) -> Result<(), Error> {
     {
         Ok(()) => {
             let response = {
-                let data_lock = ctx.data().queued_players.lock().unwrap();
+                let data_lock = ctx.data().queued_players.get(queue).unwrap();
                 format!(
                     "Queued players: {}",
                     data_lock.iter().map(|c| c.mention()).join(", ")
@@ -1872,11 +2206,16 @@ async fn queue(ctx: Context<'_>) -> Result<(), Error> {
             };
             ctx.send(CreateReply::default().content(response).ephemeral(true))
                 .await?;
-            ctx.data().message_edit_notify.lock().unwrap().notify_one();
+            ctx.data()
+                .message_edit_notify
+                .get(queue)
+                .unwrap()
+                .notify_one();
             matchmake(
                 ctx.data().clone(),
                 ctx.serenity_context().http.clone(),
                 ctx.guild_id().unwrap(),
+                queue,
             )
             .await?;
             Ok(())
@@ -1889,7 +2228,12 @@ async fn queue(ctx: Context<'_>) -> Result<(), Error> {
     }
 }
 
-fn player_leave_queue(data: Arc<Data>, user: UserId, queue_group: bool) -> String {
+fn player_leave_queue(
+    data: Arc<Data>,
+    user: UserId,
+    queue_group: bool,
+    queue: &QueueUuid,
+) -> String {
     if queue_group {
         if let Some(Some(party_members)) = data
             .global_player_data
@@ -1907,13 +2251,13 @@ fn player_leave_queue(data: Arc<Data>, user: UserId, queue_group: bool) -> Strin
             })
         {
             for user in party_members {
-                player_leave_queue(data.clone(), user, false);
+                player_leave_queue(data.clone(), user, false, queue);
             }
             return "Party left queue".to_string();
         }
     }
     let removed = {
-        let mut queued_players = data.queued_players.lock().unwrap();
+        let mut queued_players = data.queued_players.get_mut(queue).unwrap();
         let mut player_data = data.global_player_data.lock().unwrap();
         player_data
             .entry(user.clone())
@@ -1922,7 +2266,10 @@ fn player_leave_queue(data: Arc<Data>, user: UserId, queue_group: bool) -> Strin
         queued_players.remove(&user)
     };
     if removed {
-        data.message_edit_notify.lock().unwrap().notify_one();
+        data.message_edit_notify
+            .get_mut(queue)
+            .unwrap()
+            .notify_one();
         "You are no longer queueing!".to_string()
     } else {
         "You weren't queued!".to_string()
@@ -1932,25 +2279,47 @@ fn player_leave_queue(data: Arc<Data>, user: UserId, queue_group: bool) -> Strin
 /// Join queue
 #[poise::command(slash_command, prefix_command)]
 async fn leave_queue(ctx: Context<'_>) -> Result<(), Error> {
-    let response = player_leave_queue(ctx.data().clone(), ctx.author().id, true);
-    ctx.send(CreateReply::default().content(response).ephemeral(true))
-        .await?;
+    let queues = ctx
+        .data()
+        .guild_data
+        .lock()
+        .unwrap()
+        .get(&ctx.guild_id().unwrap())
+        .unwrap()
+        .queues
+        .clone();
+    for queue in queues {
+        let response = player_leave_queue(ctx.data().clone(), ctx.author().id, true, &queue);
+        ctx.send(CreateReply::default().content(response).ephemeral(true))
+            .await?;
+    }
     Ok(())
 }
 
 /// Lists queued players
 #[poise::command(slash_command, prefix_command)]
 async fn list_queued(ctx: Context<'_>) -> Result<(), Error> {
-    let response = {
-        let data_lock = ctx.data().queued_players.lock().unwrap();
-        format!(
-            "There are {} queued players: {}",
-            data_lock.len(),
-            data_lock.iter().map(|c| c.mention()).join(", ")
-        )
-    };
-    ctx.send(CreateReply::default().content(response).ephemeral(true))
-        .await?;
+    let queues = ctx
+        .data()
+        .guild_data
+        .lock()
+        .unwrap()
+        .get(&ctx.guild_id().unwrap())
+        .unwrap()
+        .queues
+        .clone();
+    for queue in queues {
+        let response = {
+            let data_lock = ctx.data().queued_players.get(&queue).unwrap();
+            format!(
+                "There are {} queued players: {}",
+                data_lock.len(),
+                data_lock.iter().map(|c| c.mention()).join(", ")
+            )
+        };
+        ctx.send(CreateReply::default().content(response).ephemeral(true))
+            .await?;
+    }
     Ok(())
 }
 
@@ -1973,30 +2342,41 @@ async fn stats(
     #[description = "User to get stats for"] user: Option<serenity::UserId>,
 ) -> Result<(), Error> {
     let user = user.unwrap_or(ctx.author().id);
-    let (stats, rating) = {
-        let mut player_data = ctx.data().player_data.lock().unwrap();
-        let config = ctx.data().configuration.lock().unwrap();
-        let player_data = player_data
-            .entry(user)
-            .or_insert(DerivedPlayerData::default());
-        (
-            player_data.stats.clone(),
-            player_data
-                .rating
-                .unwrap_or(config.default_player_data.rating),
-        )
-    };
-    let response = format!(
-        "{}'s mmr is {}, with uncertainty {}\nScore: {}-{}-{}",
-        user.mention(),
-        rating.rating,
-        rating.uncertainty,
-        stats.wins,
-        stats.losses,
-        stats.draws
-    );
-    ctx.send(CreateReply::default().content(response).ephemeral(true))
-        .await?;
+    let queues = ctx
+        .data()
+        .guild_data
+        .lock()
+        .unwrap()
+        .get(&ctx.guild_id().unwrap())
+        .unwrap()
+        .queues
+        .clone();
+    for queue in queues {
+        let (stats, rating) = {
+            let mut player_data = ctx.data().player_data.get_mut(&queue).unwrap();
+            let config = ctx.data().configuration.get(&queue).unwrap();
+            let player_data = player_data
+                .entry(user)
+                .or_insert(DerivedPlayerData::default());
+            (
+                player_data.stats.clone(),
+                player_data
+                    .rating
+                    .unwrap_or(config.default_player_data.rating),
+            )
+        };
+        let response = format!(
+            "{}'s mmr is {}, with uncertainty {}\nScore: {}-{}-{}",
+            user.mention(),
+            rating.rating,
+            rating.uncertainty,
+            stats.wins,
+            stats.losses,
+            stats.draws
+        );
+        ctx.send(CreateReply::default().content(response).ephemeral(true))
+            .await?;
+    }
     Ok(())
 }
 
@@ -2006,43 +2386,40 @@ async fn party_invite(
     ctx: Context<'_>,
     #[description = "Invite player to party"] user: UserId,
 ) -> Result<(), Error> {
-    if ctx
+    let queue_state = ctx
         .data()
-        .queued_players
+        .global_player_data
         .lock()
         .unwrap()
-        .contains(&ctx.author().id)
-    {
-        ctx.send(
-            CreateReply::default()
-                .content(format!("Cannot invite players to party while in queue"))
-                .ephemeral(true),
-        )
-        .await?;
-        return Ok(());
-    }
-
-    if ctx
-        .data()
-        .in_game_players
-        .lock()
-        .unwrap()
-        .contains(&ctx.author().id)
-    {
-        ctx.send(
-            CreateReply::default()
-                .content(format!("Cannot invite players to party while in game"))
-                .ephemeral(true),
-        )
-        .await?;
-        return Ok(());
+        .entry(ctx.author().id)
+        .or_default()
+        .queue_state
+        .clone();
+    match queue_state {
+        QueueState::Queued => {
+            ctx.send(
+                CreateReply::default()
+                    .content(format!("Cannot invite players to party while in queue"))
+                    .ephemeral(true),
+            )
+            .await?;
+            return Ok(());
+        }
+        QueueState::InGame => {
+            ctx.send(
+                CreateReply::default()
+                    .content(format!("Cannot invite players to party while in game"))
+                    .ephemeral(true),
+            )
+            .await?;
+            return Ok(());
+        }
+        QueueState::None => {}
     }
 
     let party = {
         let mut user_data = ctx.data().global_player_data.lock().unwrap();
-        let user_data = user_data
-            .entry(ctx.author().id)
-            .or_insert(GlobalPlayerData::default());
+        let user_data = user_data.entry(ctx.author().id).or_default();
         if user_data.party.is_none() {
             user_data.party = Some(GroupUuid::new());
         }
@@ -2230,39 +2607,57 @@ async fn party(_: Context<'_>) -> Result<(), Error> {
 /// Displays a leaderboard
 #[poise::command(slash_command, prefix_command)]
 async fn leaderboard(ctx: Context<'_>) -> Result<(), Error> {
-    let default_rating = ctx
+    let queues = ctx
         .data()
-        .configuration
+        .guild_data
         .lock()
         .unwrap()
-        .default_player_data
-        .rating;
-    let mut player_data = ctx
-        .data()
-        .player_data
-        .lock()
+        .get(&ctx.guild_id().unwrap())
         .unwrap()
-        .iter()
-        .map(|(id, data)| (id.mention(), data.rating.unwrap_or(default_rating).rating))
-        .collect_vec();
-    player_data.sort_by(|(_, rating_a), (_, rating_b)| rating_b.partial_cmp(rating_a).unwrap());
-    let mut response = "## Leaderboard\n".to_string();
-    for (idx, (player, rating)) in player_data.iter().enumerate().take(10) {
-        response += format!("#{} {}: {}\n", idx + 1, player, rating).as_str();
+        .queues
+        .clone();
+    for queue in queues {
+        let mut player_data = ctx
+            .data()
+            .player_data
+            .get(&queue)
+            .unwrap()
+            .iter()
+            .map(|(id, data)| {
+                (
+                    id.mention(),
+                    data.rating
+                        .unwrap_or_else(|| {
+                            ctx.data()
+                                .configuration
+                                .get(&queue)
+                                .unwrap()
+                                .default_player_data
+                                .rating
+                        })
+                        .rating,
+                )
+            })
+            .collect_vec();
+        player_data.sort_by(|(_, rating_a), (_, rating_b)| rating_b.partial_cmp(rating_a).unwrap());
+        let mut response = "## Leaderboard\n".to_string();
+        for (idx, (player, rating)) in player_data.iter().enumerate().take(10) {
+            response += format!("#{} {}: {}\n", idx + 1, player, rating).as_str();
+        }
+        ctx.send(
+            CreateReply::default()
+                .content(response)
+                .ephemeral(true)
+                .allowed_mentions(CreateAllowedMentions::new().all_users(false)),
+        )
+        .await?;
     }
-    ctx.send(
-        CreateReply::default()
-            .content(response)
-            .ephemeral(true)
-            .allowed_mentions(CreateAllowedMentions::new().all_users(false)),
-    )
-    .await?;
     Ok(())
 }
 
-fn update_bans(data: Arc<Data>) {
+fn update_bans(data: Arc<Data>, queue_id: &QueueUuid) {
     let now = chrono::offset::Utc::now();
-    data.player_bans.lock().unwrap().retain(
+    data.player_bans.get_mut(&queue_id).unwrap().retain(
         |_,
          BanData {
              end_time,
@@ -2335,7 +2730,7 @@ async fn mark_leaver(
             + ctx
                 .data()
                 .configuration
-                .lock()
+                .get_mut(&match_data.queue)
                 .unwrap()
                 .leaver_verification_time as u64
     )
@@ -2357,7 +2752,7 @@ async fn mark_leaver(
             let leaver_verification_time = data
                 .clone()
                 .configuration
-                .lock()
+                .get_mut(&match_data.queue)
                 .unwrap()
                 .leaver_verification_time as u64;
             tokio::time::sleep(Duration::from_secs(leaver_verification_time)).await;
@@ -2372,7 +2767,12 @@ async fn mark_leaver(
                 .edit(ctx1, EditMember::new().disconnect_member())
                 .await
                 .ok();
-            *data.leaver_data.lock().unwrap().entry(player).or_insert(0) += 1;
+            *data
+                .leaver_data
+                .get_mut(&match_data.queue)
+                .unwrap()
+                .entry(player)
+                .or_insert(0) += 1;
         });
     }
 
@@ -2452,6 +2852,23 @@ async fn no_ping(ctx: Context<'_>, #[rest] text: String) -> Result<(), Error> {
     Ok(())
 }
 
+/// Lists queues for this server
+#[poise::command(slash_command, prefix_command)]
+async fn list_queues(ctx: Context<'_>) -> Result<(), Error> {
+    let queues = ctx
+        .data()
+        .guild_data
+        .lock()
+        .unwrap()
+        .entry(ctx.guild_id().unwrap())
+        .or_default()
+        .queues
+        .clone();
+    ctx.send(CreateReply::default().content(format!("Queues: {:?}", queues)).ephemeral(true))
+        .await?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
     let token = std::env::var("DISCORD_BOT_TOKEN").expect("missing DISCORD_BOT_TOKEN");
@@ -2484,6 +2901,8 @@ async fn main() {
                 no_ping(),
                 player_config(),
                 ping_non_voters(),
+                list_queues(),
+                create_queue(),
             ],
             ..Default::default()
         })
