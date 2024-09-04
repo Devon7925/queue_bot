@@ -60,7 +60,7 @@ async fn ban_player(
                 .send_message(
                     ctx.http(),
                     CreateMessage::new()
-                        .content(ban_text)
+                        .content(format!("{}: {}", ctx.author().mention(), ban_text))
                         .allowed_mentions(CreateAllowedMentions::new().all_users(false)),
                 )
                 .await?;
@@ -95,7 +95,7 @@ async fn unban_player(
                     .send_message(
                         ctx.http(),
                         CreateMessage::new()
-                            .content(format!("Unbanned {}.", player.mention()))
+                            .content(format!("{} unbanned {}.", ctx.author().mention(), player.mention()))
                             .allowed_mentions(CreateAllowedMentions::new().all_users(false)),
                     )
                     .await?;
