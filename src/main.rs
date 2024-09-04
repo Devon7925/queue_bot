@@ -248,6 +248,8 @@ struct MatchData {
 struct PlayerQueueingConfig {
     cost_per_avg_mmr_differential: f32,
     acceptable_mmr_differential: f32,
+    cost_per_mmr_std_differential: f32,
+    acceptable_mmr_std_differential: f32,
     cost_per_mmr_range: f32,
     acceptable_mmr_range: f32,
     wrong_game_category_cost: HashMap<String, f32>,
@@ -257,6 +259,8 @@ struct PlayerQueueingConfig {
 struct DerivedPlayerQueueingConfig {
     cost_per_avg_mmr_differential: Option<f32>,
     acceptable_mmr_differential: Option<f32>,
+    cost_per_mmr_std_differential: Option<f32>,
+    acceptable_mmr_std_differential: Option<f32>,
     cost_per_mmr_range: Option<f32>,
     acceptable_mmr_range: Option<f32>,
     wrong_game_category_cost: Option<HashMap<String, f32>>,
@@ -271,6 +275,12 @@ impl DerivedPlayerQueueingConfig {
             acceptable_mmr_differential: self
                 .acceptable_mmr_differential
                 .unwrap_or(base.acceptable_mmr_differential),
+            cost_per_mmr_std_differential: self
+                .cost_per_mmr_std_differential
+                .unwrap_or(base.cost_per_mmr_std_differential),
+            acceptable_mmr_std_differential: self
+                .acceptable_mmr_std_differential
+                .unwrap_or(base.acceptable_mmr_std_differential),
             cost_per_mmr_range: self.cost_per_mmr_range.unwrap_or(base.cost_per_mmr_range),
             acceptable_mmr_range: self
                 .acceptable_mmr_range
@@ -279,6 +289,20 @@ impl DerivedPlayerQueueingConfig {
                 .wrong_game_category_cost
                 .clone()
                 .unwrap_or(base.wrong_game_category_cost.clone()),
+        }
+    }
+}
+
+impl Default for DerivedPlayerQueueingConfig {
+    fn default() -> DerivedPlayerQueueingConfig {
+        DerivedPlayerQueueingConfig {
+            cost_per_avg_mmr_differential: None,
+            acceptable_mmr_differential: None,
+            cost_per_mmr_std_differential: None,
+            acceptable_mmr_std_differential: None,
+            cost_per_mmr_range: None,
+            acceptable_mmr_range: None,
+            wrong_game_category_cost: None,
         }
     }
 }
@@ -295,9 +319,11 @@ impl Default for PlayerData {
             rating: WengLinRating::default(),
             player_queueing_config: PlayerQueueingConfig {
                 cost_per_avg_mmr_differential: 0.04,
-                acceptable_mmr_differential: 50.0,
+                acceptable_mmr_differential: 1.0,
+                cost_per_mmr_std_differential: 0.02,
+                acceptable_mmr_std_differential: 2.0,
                 cost_per_mmr_range: 0.02,
-                acceptable_mmr_range: 300.0,
+                acceptable_mmr_range: 3.0,
                 wrong_game_category_cost: HashMap::new(),
             },
         }
@@ -333,13 +359,7 @@ impl Default for DerivedPlayerData {
     fn default() -> Self {
         Self {
             rating: None,
-            player_queueing_config: DerivedPlayerQueueingConfig {
-                cost_per_avg_mmr_differential: None,
-                acceptable_mmr_differential: None,
-                cost_per_mmr_range: None,
-                acceptable_mmr_range: None,
-                wrong_game_category_cost: None,
-            },
+            player_queueing_config: DerivedPlayerQueueingConfig::default(),
             game_categories: HashMap::new(),
             stats: PlayerStats::default(),
         }
@@ -669,8 +689,8 @@ async fn handler(
                 .guild_data
                 .lock()
                 .unwrap()
-                .get(&new.guild_id.unwrap())
-                .unwrap()
+                .entry(new.guild_id.unwrap())
+                .or_default()
                 .queues
                 .clone();
             for queue in queues {
@@ -1957,7 +1977,19 @@ async fn evaluate_cost(
             .sum::<f32>()
             / team_size as f32
     });
+    let team_mmr_stds = player_data.iter().zip(team_mmrs.clone()).map(|(team, team_mmr)| {
+        team.iter()
+            .map(|player| player.rating.unwrap_or(default_player_data.rating).rating as f32 - team_mmr)
+            .map(|rating| rating * rating)
+            .sum::<f32>()
+            / team_size as f32
+    }).map(|team_variance| team_variance.sqrt());
     let mmr_differential = match team_mmrs.minmax() {
+        MinMaxResult::NoElements => 0.0,
+        MinMaxResult::OneElement(_) => 0.0,
+        MinMaxResult::MinMax(min, max) => max - min,
+    };
+    let mmr_std_differential = match team_mmr_stds.minmax() {
         MinMaxResult::NoElements => 0.0,
         MinMaxResult::OneElement(_) => 0.0,
         MinMaxResult::MinMax(min, max) => max - min,
@@ -2025,6 +2057,9 @@ async fn evaluate_cost(
                 player_cost += (mmr_differential - queue_config.acceptable_mmr_differential)
                     .max(0.0)
                     * queue_config.cost_per_avg_mmr_differential;
+                player_cost += (mmr_std_differential - queue_config.acceptable_mmr_std_differential)
+                    .max(0.0)
+                    * queue_config.cost_per_mmr_std_differential;
                 player_cost += (mmr_range - queue_config.acceptable_mmr_range).max(0.0)
                     * queue_config.cost_per_mmr_range;
                 player_cost += queue_config
