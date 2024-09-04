@@ -1771,7 +1771,7 @@ async fn try_matchmaking(
                     members_message += format!("{}\n", player.mention()).as_str();
                 }
             }
-            match_channel
+            let members_message_id = match_channel
                 .send_message(
                     cache_http_copy.clone(),
                     CreateMessage::default()
@@ -1783,6 +1783,7 @@ async fn try_matchmaking(
                         .content(members_message),
                 )
                 .await?;
+            match_channel.pin(cache_http_copy.clone(), members_message_id.id).await?;
             let mut map_vote_end_time = None;
             if config.map_vote_count > 0 {
                 let mut map_vote_message_content = "# Map Vote".to_string();
@@ -2913,6 +2914,9 @@ async fn main() {
                         serde_json::from_str(read.as_str()).expect("Failed to parse config file")
                     });
                 if let Some(data) = config_data {
+                    for config in data.configuration.iter() {
+                        data.message_edit_notify.insert(config.key().clone(), Arc::new(Notify::new()));
+                    }
                     return Ok(data);
                 }
                 Ok(Arc::new(Data::default()))
