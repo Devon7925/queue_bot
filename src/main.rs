@@ -90,6 +90,8 @@ struct Data {
     #[serde(default)]
     match_data: Mutex<HashMap<MatchUuid, MatchData>>,
     #[serde(default)]
+    historical_match_data: Mutex<HashMap<MatchUuid, MatchData>>,
+    #[serde(default)]
     group_data: Mutex<HashMap<GroupUuid, QueueGroup>>,
     #[serde(default)]
     guild_data: Mutex<HashMap<GuildId, GuildData>>,
@@ -121,6 +123,7 @@ impl Default for Data {
             global_player_data: Mutex::new(HashMap::new()),
             match_channels: Mutex::new(HashMap::new()),
             match_data: Mutex::new(HashMap::new()),
+            historical_match_data: Mutex::new(HashMap::new()),
             group_data: Mutex::new(HashMap::new()),
             guild_data: Mutex::new(HashMap::new()),
             configuration: DashMap::new(),
@@ -151,7 +154,7 @@ struct GuildData {
 impl Default for GuildData {
     fn default() -> Self {
         Self {
-            queues: Default::default()
+            queues: Default::default(),
         }
     }
 }
@@ -186,6 +189,7 @@ struct QueueConfiguration {
     maximum_queue_cost: f32,
     game_categories: HashMap<String, Vec<RoleId>>,
     log_chats: bool,
+    max_lobby_keep_time: u64,
 }
 
 impl Default for QueueConfiguration {
@@ -207,6 +211,7 @@ impl Default for QueueConfiguration {
             maximum_queue_cost: 50.0,
             game_categories: HashMap::new(),
             log_chats: true,
+            max_lobby_keep_time: 15 * 60,
         }
     }
 }
@@ -238,7 +243,9 @@ struct MatchData {
     map_votes: HashMap<UserId, String>,
     channels: Vec<ChannelId>,
     members: Vec<Vec<UserId>>,
+    host: Option<UserId>,
     map_vote_end_time: Option<u64>,
+    match_end_time: Option<u64>,
     resolved: bool,
     name: String,
     queue: QueueUuid,
@@ -353,6 +360,7 @@ struct DerivedPlayerData {
     player_queueing_config: DerivedPlayerQueueingConfig,
     game_categories: HashMap<String, Vec<usize>>,
     stats: PlayerStats,
+    game_history: Vec<MatchUuid>,
 }
 
 impl Default for DerivedPlayerData {
@@ -362,6 +370,7 @@ impl Default for DerivedPlayerData {
             player_queueing_config: DerivedPlayerQueueingConfig::default(),
             game_categories: HashMap::new(),
             stats: PlayerStats::default(),
+            game_history: vec![],
         }
     }
 }
@@ -655,7 +664,8 @@ async fn handler(
                     channel_id: Some(channel_id),
                     user_id,
                     ..
-                }) = old {
+                }) = old
+                {
                     for queue in data
                         .guild_data
                         .lock()
@@ -778,6 +788,56 @@ async fn handler(
                                 )
                                 .await?;
                             return Ok(());
+                        }
+                        if message_component
+                            .data
+                            .custom_id
+                            .eq_ignore_ascii_case("volunteer_host")
+                        {
+                            let already_hosted = 'host_button_block: {
+                                let mut match_data = data.match_data.lock().unwrap();
+                                let match_data = match_data.get_mut(&match_number).unwrap();
+                                if match_data.host.is_some() {
+                                    break 'host_button_block true;
+                                }
+                                match_data.host = Some(message_component.user.id);
+                                false
+                            };
+                            if already_hosted {
+                                message_component
+                                    .create_response(
+                                        ctx,
+                                        serenity::CreateInteractionResponse::Message(
+                                            CreateInteractionResponseMessage::new()
+                                                .content(format!(
+                                                    "There is already a host for this lobby."
+                                                ))
+                                                .ephemeral(true),
+                                        ),
+                                    )
+                                    .await?;
+                                return Ok(());
+                            } else {
+                                let mut current_content = message_component.message.content.clone();
+                                current_content +=
+                                    format!("\n## Host: {}", message_component.user.id.mention())
+                                        .as_str();
+                                ctx.http
+                                    .clone()
+                                    .get_message(
+                                        message_component.channel_id,
+                                        message_component.message.id,
+                                    )
+                                    .await?
+                                    .edit(
+                                        ctx,
+                                        EditMessage::new()
+                                            .components(vec![])
+                                            .content(current_content),
+                                    )
+                                    .await?;
+                                return Ok(());
+                            }
                         }
                         let mut match_data = data.match_data.lock().unwrap();
                         if let Some(map) = message_component.data.custom_id.strip_prefix("map_") {
@@ -960,7 +1020,19 @@ async fn handler(
                             }
                             {
                                 let mut match_data = data.match_data.lock().unwrap();
-                                match_data.remove(&match_number);
+                                let finished_match = match_data.remove(&match_number);
+                                if let Some(mut finished_match) = finished_match {
+                                    finished_match.match_end_time =
+                                        Some(std::time::UNIX_EPOCH.elapsed().unwrap().as_secs());
+                                    let mut user_data = data.player_data.get_mut(&finished_match.queue).unwrap();
+                                    for user in finished_match.members.iter().flat_map(|team| team.iter()) {
+                                        user_data.get_mut(user).unwrap().game_history.push(match_number);
+                                    }
+                                    data.historical_match_data
+                                        .lock()
+                                        .unwrap()
+                                        .insert(match_number, finished_match);
+                                }
                             }
                             return Ok(());
                         }
@@ -1415,7 +1487,7 @@ async fn handler(
         }
         serenity::FullEvent::Message { new_message } => {
             let Some(guild_id) = new_message.guild_id else {
-                return Ok(())
+                return Ok(());
             };
             for queue in data
                 .guild_data
@@ -1688,16 +1760,17 @@ async fn try_matchmaking(
             })
             .collect_vec()
     };
-    let cost_eval = evaluate_cost(
+    let (cost_eval, match_categories, host) = evaluate_cost(
         data.clone(),
+        &members,
         &player_game_data,
         &global_player_data,
         queue_id,
     )
     .await;
-    if cost_eval.0 > config.maximum_queue_cost {
-        println!("Best option has cost of {}", cost_eval.0);
-        let delay = (cost_eval.0 - config.maximum_queue_cost) / total_player_count as f32 + 1.0;
+    if cost_eval > config.maximum_queue_cost {
+        println!("Best option has cost of {}", cost_eval);
+        let delay = (cost_eval - config.maximum_queue_cost) / total_player_count as f32 + 1.0;
         return Ok(Some(delay));
     }
     let new_idx = {
@@ -1776,7 +1849,7 @@ async fn try_matchmaking(
         async {
             let mut members_message = String::new();
             members_message += format!("# Queue#{}\n", new_idx).as_str();
-            for (category_name, value) in cost_eval.1 {
+            for (category_name, value) in match_categories {
                 members_message += format!(
                     "{}: {}\n",
                     category_name,
@@ -1791,19 +1864,29 @@ async fn try_matchmaking(
                     members_message += format!("{}\n", player.mention()).as_str();
                 }
             }
-            let members_message_id = match_channel
-                .send_message(
-                    cache_http_copy.clone(),
-                    CreateMessage::default()
-                        .allowed_mentions(
-                            CreateAllowedMentions::default()
-                                .all_roles(false)
-                                .all_users(true),
-                        )
-                        .content(members_message),
+            if let Some(host) = host {
+                members_message += format!("## Host: {}\n", host.mention()).as_str();
+            }
+            let mut message = CreateMessage::default()
+                .allowed_mentions(
+                    CreateAllowedMentions::default()
+                        .all_roles(false)
+                        .all_users(true),
                 )
+                .content(members_message);
+            if host.is_none() {
+                message = message.button(
+                    CreateButton::new("volunteer_host")
+                        .label("Volunteer to host")
+                        .style(serenity::ButtonStyle::Primary),
+                );
+            }
+            let members_message_id = match_channel
+                .send_message(cache_http_copy.clone(), message)
                 .await?;
-            match_channel.pin(cache_http_copy.clone(), members_message_id.id).await?;
+            match_channel
+                .pin(cache_http_copy.clone(), members_message_id.id)
+                .await?;
             let mut map_vote_end_time = None;
             if config.map_vote_count > 0 {
                 let mut map_vote_message_content = "# Map Vote".to_string();
@@ -1916,8 +1999,10 @@ async fn try_matchmaking(
                         result_votes: HashMap::new(),
                         channels,
                         members: members_copy,
+                        host,
                         map_votes: HashMap::new(),
                         map_vote_end_time,
+                        match_end_time: None,
                         resolved: false,
                         name: format!("#{}", new_idx),
                         queue: queue_id.clone(),
@@ -1959,17 +2044,50 @@ async fn try_matchmaking(
 
 async fn evaluate_cost(
     data: Arc<Data>,
+    player_ids: &Vec<Vec<UserId>>,
     player_data: &Vec<Vec<DerivedPlayerData>>,
     global_player_data: &Vec<Vec<GlobalPlayerData>>,
     queue_id: &QueueUuid,
-) -> (f32, HashMap<String, usize>) {
-    let (team_size, game_categories, default_player_data) = {
+) -> (f32, HashMap<String, usize>, Option<UserId>) {
+    let (team_size, game_categories, default_player_data, max_lobby_keep_time) = {
         let config = data.configuration.get(&queue_id).unwrap();
         (
             config.team_size,
             config.game_categories.clone(),
             config.default_player_data.clone(),
+            config.max_lobby_keep_time.clone(),
         )
+    };
+
+    let host = {
+        let historical_matches = data.historical_match_data.lock().unwrap();
+        let current_time = std::time::UNIX_EPOCH.elapsed().unwrap().as_secs();
+        player_data
+            .iter()
+            .flat_map(|team| {
+                team.iter()
+                    .filter_map(|player| player.game_history.last())
+                    .filter_map(|game| historical_matches.get(game))
+                    .filter(|game| {
+                        if let Some(end_time) = game.match_end_time {
+                            current_time - end_time <= max_lobby_keep_time
+                        } else {
+                            false
+                        }
+                    })
+                    .filter_map(|game| game.host)
+                    .filter(|host| {
+                        player_ids
+                            .iter()
+                            .flat_map(|team| team.iter())
+                            .contains(host)
+                    })
+            })
+            .counts()
+            .iter()
+            .max_by(|(_host, count), (_host2, count2)| count.cmp(count2))
+            .map(|(host, _count)| host)
+            .cloned()
     };
     let team_mmrs = player_data.iter().map(|team| {
         team.iter()
@@ -1977,13 +2095,19 @@ async fn evaluate_cost(
             .sum::<f32>()
             / team_size as f32
     });
-    let team_mmr_stds = player_data.iter().zip(team_mmrs.clone()).map(|(team, team_mmr)| {
-        team.iter()
-            .map(|player| player.rating.unwrap_or(default_player_data.rating).rating as f32 - team_mmr)
-            .map(|rating| rating * rating)
-            .sum::<f32>()
-            / team_size as f32
-    }).map(|team_variance| team_variance.sqrt());
+    let team_mmr_stds = player_data
+        .iter()
+        .zip(team_mmrs.clone())
+        .map(|(team, team_mmr)| {
+            team.iter()
+                .map(|player| {
+                    player.rating.unwrap_or(default_player_data.rating).rating as f32 - team_mmr
+                })
+                .map(|rating| rating * rating)
+                .sum::<f32>()
+                / team_size as f32
+        })
+        .map(|team_variance| team_variance.sqrt());
     let mmr_differential = match team_mmrs.minmax() {
         MinMaxResult::NoElements => 0.0,
         MinMaxResult::OneElement(_) => 0.0,
@@ -2057,9 +2181,9 @@ async fn evaluate_cost(
                 player_cost += (mmr_differential - queue_config.acceptable_mmr_differential)
                     .max(0.0)
                     * queue_config.cost_per_avg_mmr_differential;
-                player_cost += (mmr_std_differential - queue_config.acceptable_mmr_std_differential)
-                    .max(0.0)
-                    * queue_config.cost_per_mmr_std_differential;
+                player_cost +=
+                    (mmr_std_differential - queue_config.acceptable_mmr_std_differential).max(0.0)
+                        * queue_config.cost_per_mmr_std_differential;
                 player_cost += (mmr_range - queue_config.acceptable_mmr_range).max(0.0)
                     * queue_config.cost_per_mmr_range;
                 player_cost += queue_config
@@ -2075,6 +2199,7 @@ async fn evaluate_cost(
             })
             .sum(),
         game_categories,
+        host,
     )
 }
 
@@ -2154,6 +2279,7 @@ async fn greedy_matchmaking(
                 };
                 let cost = evaluate_cost(
                     data.clone(),
+                    &result_copy,
                     &player_game_data,
                     &global_player_data,
                     queue_id,
@@ -2192,7 +2318,13 @@ async fn backup(ctx: Context<'_>) -> Result<(), Error> {
         let time_stamp = chrono::offset::Utc::now().naive_utc();
         let config = serde_json::to_string_pretty(ctx.data())?;
         println!("Starting backup...");
-        fs::write(format!("backups/backup_{}.json", time_stamp.format("%Y_%m_%d_%H_%M_%S")), config)?;
+        fs::write(
+            format!(
+                "backups/backup_{}.json",
+                time_stamp.format("%Y_%m_%d_%H_%M_%S")
+            ),
+            config,
+        )?;
         println!("Backup made!");
     }
     let response = format!("Backup made.");
@@ -2900,8 +3032,12 @@ async fn list_queues(ctx: Context<'_>) -> Result<(), Error> {
         .or_default()
         .queues
         .clone();
-    ctx.send(CreateReply::default().content(format!("Queues: {:?}", queues)).ephemeral(true))
-        .await?;
+    ctx.send(
+        CreateReply::default()
+            .content(format!("Queues: {:?}", queues))
+            .ephemeral(true),
+    )
+    .await?;
     Ok(())
 }
 
@@ -2950,7 +3086,8 @@ async fn main() {
                     });
                 if let Some(data) = config_data {
                     for config in data.configuration.iter() {
-                        data.message_edit_notify.insert(config.key().clone(), Arc::new(Notify::new()));
+                        data.message_edit_notify
+                            .insert(config.key().clone(), Arc::new(Notify::new()));
                     }
                     return Ok(data);
                 }
