@@ -259,6 +259,7 @@ struct PlayerQueueingConfig {
     acceptable_mmr_std_differential: f32,
     cost_per_mmr_range: f32,
     acceptable_mmr_range: f32,
+    new_lobby_host_cost: f32,
     wrong_game_category_cost: HashMap<String, f32>,
 }
 
@@ -270,6 +271,7 @@ struct DerivedPlayerQueueingConfig {
     acceptable_mmr_std_differential: Option<f32>,
     cost_per_mmr_range: Option<f32>,
     acceptable_mmr_range: Option<f32>,
+    new_lobby_host_cost: Option<f32>,
     wrong_game_category_cost: Option<HashMap<String, f32>>,
 }
 
@@ -292,6 +294,9 @@ impl DerivedPlayerQueueingConfig {
             acceptable_mmr_range: self
                 .acceptable_mmr_range
                 .unwrap_or(base.acceptable_mmr_range),
+            new_lobby_host_cost: self
+                .new_lobby_host_cost
+                .unwrap_or(base.acceptable_mmr_range),
             wrong_game_category_cost: self
                 .wrong_game_category_cost
                 .clone()
@@ -309,6 +314,7 @@ impl Default for DerivedPlayerQueueingConfig {
             acceptable_mmr_std_differential: None,
             cost_per_mmr_range: None,
             acceptable_mmr_range: None,
+            new_lobby_host_cost: None,
             wrong_game_category_cost: None,
         }
     }
@@ -331,6 +337,7 @@ impl Default for PlayerData {
                 acceptable_mmr_std_differential: 2.0,
                 cost_per_mmr_range: 0.02,
                 acceptable_mmr_range: 3.0,
+                new_lobby_host_cost: 5.0,
                 wrong_game_category_cost: HashMap::new(),
             },
         }
@@ -2059,35 +2066,44 @@ async fn evaluate_cost(
         )
     };
 
-    let host = {
+    let (host_cost, host) = {
         let historical_matches = data.historical_match_data.lock().unwrap();
         let current_time = std::time::UNIX_EPOCH.elapsed().unwrap().as_secs();
-        player_data
+        let costs_and_last_hosts = player_data
             .iter()
             .flat_map(|team| {
                 team.iter()
-                    .filter_map(|player| player.game_history.last())
-                    .filter_map(|game| historical_matches.get(game))
-                    .filter(|game| {
+                    .filter_map(|player| player.game_history.last().map(|history| (player.player_queueing_config.new_lobby_host_cost.unwrap_or(default_player_data.player_queueing_config.new_lobby_host_cost), history)))
+                    .filter_map(|(wrong_host_cost, game_id)| historical_matches.get(game_id).map(|game| (wrong_host_cost, game)))
+                    .filter(|(_, game)| {
                         if let Some(end_time) = game.match_end_time {
                             current_time - end_time <= max_lobby_keep_time
                         } else {
                             false
                         }
                     })
-                    .filter_map(|game| game.host)
-                    .filter(|host| {
-                        player_ids
-                            .iter()
-                            .flat_map(|team| team.iter())
-                            .contains(host)
-                    })
+                    .filter_map(|(wrong_host_cost, game)| game.host.map(|host| (wrong_host_cost, host)))
+            }).collect_vec();
+        let lobby_host = costs_and_last_hosts
+            .iter()
+            .map(|(_, host)| host)
+            .filter(|host| {
+                player_ids
+                    .iter()
+                    .flat_map(|team| team.iter())
+                    .contains(host)
             })
             .counts()
             .iter()
             .max_by(|(_host, count), (_host2, count2)| count.cmp(count2))
-            .map(|(host, _count)| host)
-            .cloned()
+            .map(|(host, _count)| *host)
+            .cloned();
+        let host_cost = if let Some(lobby_host) = lobby_host {
+            costs_and_last_hosts.iter().filter(|(_, host)| host != &lobby_host).map(|(cost, _)| cost).sum::<f32>() - data.player_data.get(queue_id).unwrap().get(&lobby_host).unwrap().player_queueing_config.new_lobby_host_cost.unwrap_or(default_player_data.player_queueing_config.new_lobby_host_cost)
+        } else {
+            0.0
+        };
+        (host_cost, lobby_host)
     };
     let team_mmrs = player_data.iter().map(|team| {
         team.iter()
@@ -2164,7 +2180,7 @@ async fn evaluate_cost(
         .collect();
     let now = chrono::offset::Utc::now();
     (
-        player_data
+        host_cost + player_data
             .iter()
             .flat_map(|team| team.iter())
             .zip(global_player_data.iter().flat_map(|team| team.iter()))
@@ -2197,7 +2213,7 @@ async fn evaluate_cost(
                 player_cost -= time_in_queue as f32;
                 player_cost
             })
-            .sum(),
+            .sum::<f32>(),
         game_categories,
         host,
     )

@@ -63,6 +63,7 @@ impl PlayerVariableModifiers {
     configure_player_variable!(configure_player_acceptable_mmr_std_differential, acceptable_mmr_std_differential, "acceptable_mmr_std_differential", "Acceptable mmr variation difference", "Sets the acceptable difference in mmr std between the teams before cost starts increasing");
     configure_player_variable!(configure_player_cost_per_mmr_range, cost_per_mmr_range, "cost_per_mmr_range", "Cost for mmr range", "Sets the cost for the difference in mmr between the highest and lowest rated players");
     configure_player_variable!(configure_player_acceptable_mmr_range, acceptable_mmr_range, "acceptable_mmr_range", "Acceptable mmr range", "Sets acceptable difference in mmr between the highest and lowest rated players before adding cost");
+    configure_player_variable!(configure_new_lobby_host_cost, new_lobby_host_cost, "new_lobby_host_cost", "Cost for new lobby host", "Sets cost for getting a different lobby host");
 }
 
 /// Displays your or another user's account creation date
@@ -76,6 +77,7 @@ impl PlayerVariableModifiers {
         "PlayerVariableModifiers::configure_player_acceptable_mmr_std_differential",
         "PlayerVariableModifiers::configure_player_cost_per_mmr_range",
         "PlayerVariableModifiers::configure_player_acceptable_mmr_range",
+        "PlayerVariableModifiers::configure_new_lobby_host_cost",
     )
 )]
 pub async fn player_config(_: Context<'_>) -> Result<(), Error> {
