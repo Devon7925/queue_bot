@@ -1864,11 +1864,34 @@ async fn try_matchmaking(
                 )
                 .as_str();
             }
-            for (team_idx, team) in members_copy.iter().enumerate() {
-                members_message += format!("## Team {}\n", team_idx + 1).as_str();
-                let team_copy = team.clone();
-                for player in team_copy {
-                    members_message += format!("{}\n", player.mention()).as_str();
+            if let Some(previous_members) = host.map(|host| get_previous_game_members(&data, queue_id, host)).flatten() {
+                let sorted_members: Vec<Vec<(UserId, bool)>> = previous_members.iter().zip(members_copy.iter()).map(|(prev_team, new_team)| {
+                    let mut sorted_team = prev_team.iter().map(|member| new_team.contains(member).then(|| (member.clone(), true))).collect_vec();
+                    let mut remaining_members = new_team.iter().filter(|member| !sorted_team.iter().filter_map(|sorted_member| sorted_member.map(|(sorted_member, _)| sorted_member)).contains(*member)).collect_vec();
+                    for member in sorted_team.iter_mut() {
+                        if matches!(member, None) {
+                            *member = Some((*remaining_members.pop().unwrap(), false));
+                        }
+                    }
+                    assert!(remaining_members.is_empty());
+                    assert!(sorted_team.iter().all(|member| member.is_some()));
+                    sorted_team.into_iter().map(Option::unwrap).collect_vec()
+                }).collect_vec();
+
+                for (team_idx, team) in sorted_members.iter().enumerate() {
+                    members_message += format!("## Team {}\n", team_idx + 1).as_str();
+                    let team_copy = team.clone();
+                    for (player, unchanged) in team_copy {
+                        members_message += format!("{} {}\n", player.mention(), if unchanged {""} else {"*"}).as_str();
+                    }
+                }
+            } else {
+                for (team_idx, team) in members_copy.iter().enumerate() {
+                    members_message += format!("## Team {}\n", team_idx + 1).as_str();
+                    let team_copy = team.clone();
+                    for player in team_copy {
+                        members_message += format!("{}\n", player.mention()).as_str();
+                    }
                 }
             }
             if let Some(host) = host {
@@ -2047,6 +2070,13 @@ async fn try_matchmaking(
     .await
     .0?;
     Ok(None)
+}
+
+fn get_previous_game_members(data: &Arc<Data>, queue_id: &QueueUuid, host: UserId) -> Option<Vec<Vec<UserId>>> {
+    let host_last_game = data.player_data.get(queue_id).unwrap().get(&host).unwrap().game_history.last().cloned();
+    host_last_game.map(|host_last_game| {
+        data.historical_match_data.lock().unwrap().get(&host_last_game).unwrap().members.clone()
+    })
 }
 
 async fn evaluate_cost(
