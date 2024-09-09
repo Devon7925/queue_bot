@@ -29,7 +29,15 @@ async fn ban_player(
     #[description = "Hours"] hours: Option<u32>,
     #[description = "Is shadow ban"] is_shadow_ban: Option<bool>,
 ) -> Result<(), Error> {
-    let queues = ctx.data().guild_data.lock().unwrap().get(&ctx.guild_id().unwrap()).unwrap().queues.clone();
+    let queues = ctx
+        .data()
+        .guild_data
+        .lock()
+        .unwrap()
+        .get(&ctx.guild_id().unwrap())
+        .unwrap()
+        .queues
+        .clone();
     for queue in queues {
         update_bans(ctx.data().clone(), &queue);
         let ban_seconds = 60 * 60 * (24 * days.unwrap_or(0) as i64 + hours.unwrap_or(0) as i64);
@@ -67,7 +75,7 @@ async fn ban_player(
         }
         ctx.send(CreateReply::default().content(response).ephemeral(true))
             .await?;
-        }
+    }
     Ok(())
 }
 
@@ -77,7 +85,15 @@ async fn unban_player(
     ctx: Context<'_>,
     #[description = "Player"] player: UserId,
 ) -> Result<(), Error> {
-    let queues = ctx.data().guild_data.lock().unwrap().get(&ctx.guild_id().unwrap()).unwrap().queues.clone();
+    let queues = ctx
+        .data()
+        .guild_data
+        .lock()
+        .unwrap()
+        .get(&ctx.guild_id().unwrap())
+        .unwrap()
+        .queues
+        .clone();
     for queue in queues {
         update_bans(ctx.data().clone(), &queue);
         let was_banned = ctx
@@ -95,7 +111,11 @@ async fn unban_player(
                     .send_message(
                         ctx.http(),
                         CreateMessage::new()
-                            .content(format!("{} unbanned {}.", ctx.author().mention(), player.mention()))
+                            .content(format!(
+                                "{} unbanned {}.",
+                                ctx.author().mention(),
+                                player.mention()
+                            ))
                             .allowed_mentions(CreateAllowedMentions::new().all_users(false)),
                     )
                     .await?;
@@ -117,7 +137,15 @@ async fn unban_player(
     default_member_permissions = "BAN_MEMBERS"
 )]
 pub async fn list_bans(ctx: Context<'_>) -> Result<(), Error> {
-    let queues = ctx.data().guild_data.lock().unwrap().get(&ctx.guild_id().unwrap()).unwrap().queues.clone();
+    let queues = ctx
+        .data()
+        .guild_data
+        .lock()
+        .unwrap()
+        .get(&ctx.guild_id().unwrap())
+        .unwrap()
+        .queues
+        .clone();
     for queue in queues {
         update_bans(ctx.data().clone(), &queue);
         let ban_data = ctx
@@ -157,7 +185,15 @@ async fn get_player(
     ctx: Context<'_>,
     #[description = "Player"] player: UserId,
 ) -> Result<(), Error> {
-    let queues = ctx.data().guild_data.lock().unwrap().get(&ctx.guild_id().unwrap()).unwrap().queues.clone();
+    let queues = ctx
+        .data()
+        .guild_data
+        .lock()
+        .unwrap()
+        .get(&ctx.guild_id().unwrap())
+        .unwrap()
+        .queues
+        .clone();
     for queue in queues {
         let player_data = ctx
             .data()
@@ -197,7 +233,15 @@ pub async fn manage_player(_: Context<'_>) -> Result<(), Error> {
     default_member_permissions = "BAN_MEMBERS"
 )]
 pub async fn list_leavers(ctx: Context<'_>) -> Result<(), Error> {
-    let queues = ctx.data().guild_data.lock().unwrap().get(&ctx.guild_id().unwrap()).unwrap().queues.clone();
+    let queues = ctx
+        .data()
+        .guild_data
+        .lock()
+        .unwrap()
+        .get(&ctx.guild_id().unwrap())
+        .unwrap()
+        .queues
+        .clone();
     for queue in queues {
         let leave_data = ctx
             .data()
@@ -258,7 +302,14 @@ async fn force_result(ctx: Context<'_>, result: MatchResult) -> Result<(), Error
         .await?;
         return Ok(());
     };
-    let queue_id = ctx.data().match_data.lock().unwrap().get(&match_number).unwrap().queue;
+    let queue_id = ctx
+        .data()
+        .match_data
+        .lock()
+        .unwrap()
+        .get(&match_number)
+        .unwrap()
+        .queue;
     let post_match_channel = ctx
         .data()
         .configuration
@@ -278,7 +329,13 @@ async fn force_result(ctx: Context<'_>, result: MatchResult) -> Result<(), Error
     let guild_id = ctx.guild_id().unwrap();
     if let Some(post_match_channel) = post_match_channel {
         for player in players.iter().flat_map(|t| t) {
-            ctx.data().global_player_data.lock().unwrap().get_mut(player).unwrap().queue_state = QueueState::None;
+            ctx.data()
+                .global_player_data
+                .lock()
+                .unwrap()
+                .get_mut(player)
+                .unwrap()
+                .queue_state = QueueState::None;
             ctx.http()
                 .get_member(guild_id, *player)
                 .await?
@@ -301,14 +358,22 @@ async fn force_result(ctx: Context<'_>, result: MatchResult) -> Result<(), Error
     Ok(())
 }
 
-/// Displays or sets number of maps for the vote
+/// Creates a message players can enter queue with
 #[poise::command(
     slash_command,
     prefix_command,
     default_member_permissions = "MANAGE_CHANNELS"
 )]
 pub async fn create_queue_message(ctx: Context<'_>) -> Result<(), Error> {
-    let queues = ctx.data().guild_data.lock().unwrap().get(&ctx.guild_id().unwrap()).unwrap().queues.clone();
+    let queues = ctx
+        .data()
+        .guild_data
+        .lock()
+        .unwrap()
+        .get(&ctx.guild_id().unwrap())
+        .unwrap()
+        .queues
+        .clone();
     for queue in queues {
         let msg = ctx
             .send(
@@ -336,6 +401,73 @@ pub async fn create_queue_message(ctx: Context<'_>) -> Result<(), Error> {
             .get_mut(&queue)
             .unwrap()
             .queue_messages
+            .push((ctx.channel_id(), msg));
+    }
+
+    Ok(())
+}
+
+/// Creates a message where players can register to queue with an mmr
+#[poise::command(
+    slash_command,
+    prefix_command,
+    default_member_permissions = "MANAGE_CHANNELS"
+)]
+pub async fn create_register_message(
+    ctx: Context<'_>,
+    #[description = "Register message data"]
+    #[rest]
+    register_message_data: String,
+) -> Result<(), Error> {
+    let Ok(buttons_data) = register_message_data.split(",").map(|button_data| {
+        let split_button_data = button_data.split(":").collect_vec();
+        if split_button_data.len() != 2 {
+            return Err(())
+        }
+        let button_name = split_button_data[0];
+        let Ok(button_mmr) = split_button_data[1].parse::<f64>() else {
+            return Err(())
+        };
+        Ok(
+            CreateButton::new(format!("register_{}", button_mmr))
+            .label(button_name)
+            .style(serenity::ButtonStyle::Secondary)
+        )
+    }).collect::<Result<Vec<CreateButton>, ()>>() else {
+        ctx.send(
+            CreateReply::default()
+                .content("Invalid data")
+                .ephemeral(true),
+        )
+        .await?;
+        return Ok(());
+    };
+    let queues = ctx
+        .data()
+        .guild_data
+        .lock()
+        .unwrap()
+        .get(&ctx.guild_id().unwrap())
+        .unwrap()
+        .queues
+        .clone();
+    for queue in queues {
+        let msg = ctx
+            .send(
+                CreateReply::default()
+                    .content("## Register for queue")
+                    .components(vec![CreateActionRow::Buttons(buttons_data.clone())])
+                    .ephemeral(false),
+            )
+            .await?
+            .into_message()
+            .await?
+            .id;
+        ctx.data()
+            .configuration
+            .get_mut(&queue)
+            .unwrap()
+            .register_messages
             .push((ctx.channel_id(), msg));
     }
 

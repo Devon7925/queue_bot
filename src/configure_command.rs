@@ -503,6 +503,56 @@ async fn configure_audit_channel(
     Ok(())
 }
 
+/// Sets the role for registered players
+#[poise::command(slash_command, prefix_command, rename = "register_role")]
+async fn configure_register_role(
+    ctx: Context<'_>,
+    #[description = "Queue to change"] queue: String,
+    #[description = "Register role"]
+    new_value: Option<serenity::RoleId>,
+) -> Result<(), Error> {
+    let queue_uuid: QueueUuid = QueueUuid(Uuid::parse_str(&queue.as_str())?);
+    //ensure queue is part of server
+    if !ctx
+        .data()
+        .guild_data
+        .lock()
+        .unwrap()
+        .get(&ctx.guild_id().unwrap())
+        .unwrap()
+        .queues
+        .contains(&queue_uuid)
+    {
+        ctx.send(
+            CreateReply::default()
+                .content(format!(
+                    "Queue id {} is not part of this server",
+                    queue_uuid
+                ))
+                .ephemeral(true),
+        )
+        .await?;
+    }
+    let response = if let Some(new_value) = new_value {
+        let mut data_lock = ctx.data().configuration.get_mut(&queue_uuid).unwrap();
+        data_lock.register_role = Some(new_value);
+        format!("Register role changed to {}", new_value.to_string())
+    } else {
+        let data_lock = ctx.data().configuration.get(&queue_uuid).unwrap();
+        format!(
+            "Register role is {}",
+            data_lock
+                .register_role
+                .as_ref()
+                .map(|c| format!("{}", c.mention()))
+                .unwrap_or("not set".to_string())
+        )
+    };
+    ctx.send(CreateReply::default().content(response).ephemeral(true))
+        .await?;
+    Ok(())
+}
+
 /// Sets whether or not match chat messages are logged
 #[poise::command(slash_command, prefix_command, rename = "log_chats")]
 async fn configure_log_chats(
@@ -619,6 +669,7 @@ async fn configure_visability_override_roles(
         "configure_map_vote_count",
         "configure_map_vote_time",
         "configure_maximum_queue_cost",
+        "configure_register_role",
         "configure_audit_channel",
         "configure_log_chats",
         "configure_visability_override_roles",
