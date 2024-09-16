@@ -23,7 +23,11 @@ use itertools::{Itertools, MinMaxResult};
 use player_config_commands::player_config;
 use poise::{
     serenity_prelude::{
-        self as serenity, futures::future, Builder, CacheHttp, ChannelId, ChannelType, CreateActionRow, CreateAllowedMentions, CreateButton, CreateChannel, CreateInteractionResponse, CreateInteractionResponseMessage, CreateMessage, EditInteractionResponse, EditMember, EditMessage, GuildId, Http, Mentionable, MessageId, PermissionOverwrite, PermissionOverwriteType, Permissions, RoleId, UserId, VoiceState
+        self as serenity, futures::future, Builder, CacheHttp, ChannelId, ChannelType,
+        CreateActionRow, CreateAllowedMentions, CreateButton, CreateChannel,
+        CreateInteractionResponse, CreateInteractionResponseMessage, CreateMessage,
+        EditInteractionResponse, EditMember, EditMessage, GuildId, Http, Mentionable, MessageId,
+        PermissionOverwrite, PermissionOverwriteType, Permissions, RoleId, UserId, VoiceState,
     },
     CreateReply,
 };
@@ -416,6 +420,7 @@ async fn try_queue_player(
     http: Arc<Http>,
     guild_id: GuildId,
     queue_party: bool,
+    is_bot: bool,
 ) -> Result<(), String> {
     {
         let mut player_data = data.player_data.get_mut(&queue_id).unwrap();
@@ -478,7 +483,11 @@ async fn try_queue_player(
         let config = data.configuration.get(&queue_id).unwrap();
         config.game_categories.clone()
     };
-    let user_roles = guild_id.member(http.clone(), user_id).await.unwrap().roles;
+    let user_roles = if is_bot {
+        vec![]
+    } else {
+        guild_id.member(http.clone(), user_id).await.unwrap().roles
+    };
     let player_categories: HashMap<String, Vec<usize>> = game_categories
         .iter()
         .map(|(category_name, category_roles)| {
@@ -540,6 +549,7 @@ async fn try_queue_player(
                     http.clone(),
                     guild_id,
                     false,
+                    is_bot
                 ))
                 .await?;
             }
@@ -731,6 +741,7 @@ async fn handler(
                         ctx.http.clone(),
                         new.guild_id.unwrap(),
                         true,
+                        false
                     )
                     .await
                     {
@@ -1281,6 +1292,7 @@ async fn handler(
                         ctx.http.clone(),
                         message_component.guild_id.unwrap(),
                         true,
+                        false,
                     )
                     .await
                     {
@@ -1389,8 +1401,7 @@ async fn handler(
                     message_component
                         .edit_response(
                             ctx.http(),
-                            EditInteractionResponse::new()
-                                    .content("Registered!"),
+                            EditInteractionResponse::new().content("Registered!"),
                         )
                         .await?;
                     return Ok(());
@@ -2570,6 +2581,7 @@ async fn queue(ctx: Context<'_>) -> Result<(), Error> {
         ctx.serenity_context().http.clone(),
         ctx.guild_id().unwrap(),
         true,
+        false,
     )
     .await
     {
@@ -2603,6 +2615,69 @@ async fn queue(ctx: Context<'_>) -> Result<(), Error> {
             Ok(())
         }
     }
+}
+
+/// Add fake players to queue to stress test
+#[poise::command(
+    slash_command,
+    prefix_command,
+    default_member_permissions = "MANAGE_CHANNELS"
+)]
+async fn queue_many(ctx: Context<'_>, count: u32) -> Result<(), Error> {
+    let queues = ctx
+        .data()
+        .guild_data
+        .lock()
+        .unwrap()
+        .get(&ctx.guild_id().unwrap())
+        .unwrap()
+        .queues
+        .clone();
+    let Some(queue) = queues.iter().last() else {
+        ctx.send(
+            CreateReply::default()
+                .content("Could not find queue to join!")
+                .ephemeral(true),
+        )
+        .await?;
+        return Ok(());
+    };
+    for i in 0..count {
+        match try_queue_player(
+            ctx.data().clone(),
+            queue,
+            UserId::new((i+1) as u64),
+            ctx.serenity_context().http.clone(),
+            ctx.guild_id().unwrap(),
+            true,
+            true,
+        )
+        .await
+        {
+            Ok(()) => {
+            }
+            Err(reason) => {
+                ctx.send(CreateReply::default().content(reason).ephemeral(true))
+                    .await?;
+                return Ok(())
+            }
+        }
+    }
+    let response = {
+        let data_lock = ctx.data().queued_players.get(queue).unwrap();
+        format!(
+            "Queued players: {}",
+            data_lock.iter().map(|c| c.mention()).join(", ")
+        )
+    };
+    ctx.send(CreateReply::default().content(response).ephemeral(true))
+        .await?;
+    ctx.data()
+        .message_edit_notify
+        .get(queue)
+        .unwrap()
+        .notify_one();
+    Ok(())
 }
 
 fn player_leave_queue(
@@ -3268,6 +3343,7 @@ async fn main() {
                 export_config(),
                 import_config(),
                 queue(),
+                queue_many(),
                 leave_queue(),
                 list_queued(),
                 stats(),
