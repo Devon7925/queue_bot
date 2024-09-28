@@ -1051,8 +1051,8 @@ async fn handler(
                                         finished_match.members.iter().flat_map(|team| team.iter())
                                     {
                                         user_data
-                                            .get_mut(user)
-                                            .unwrap()
+                                            .entry(*user)
+                                            .or_default()
                                             .game_history
                                             .push(match_number);
                                     }
@@ -1488,8 +1488,8 @@ async fn handler(
                         .guild_data
                         .lock()
                         .unwrap()
-                        .get(&message_component.guild_id.unwrap())
-                        .unwrap()
+                        .entry(message_component.guild_id.unwrap())
+                        .or_default()
                         .queues
                         .clone();
                     let Some(queue) = queues
@@ -1527,8 +1527,8 @@ async fn handler(
                         .global_player_data
                         .lock()
                         .unwrap()
-                        .get(&message_component.user.id)
-                        .unwrap()
+                        .entry(message_component.user.id)
+                        .or_default()
                         .queue_state
                         .clone();
                     if was_in_queue {
@@ -2476,12 +2476,12 @@ async fn greedy_matchmaking(
                 }
 
                 let player_game_data = {
-                    let player_data = data.player_data.get(&queue_id).unwrap();
+                    let mut player_data = data.player_data.get_mut(&queue_id).unwrap();
                     result_copy
                         .iter()
                         .map(|team| {
                             team.iter()
-                                .map(|player| player_data.get(player).unwrap().clone())
+                                .map(|player| player_data.entry(*player).or_default().clone())
                                 .collect_vec()
                         })
                         .collect_vec()
