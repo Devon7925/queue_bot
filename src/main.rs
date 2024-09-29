@@ -72,12 +72,6 @@ impl GroupUuid {
 #[derive(Serialize, Deserialize, Eq, PartialEq, Debug, Clone, Hash, Copy)]
 struct QueueUuid(uuid::Uuid);
 
-impl Display for QueueUuid {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
 impl QueueUuid {
     fn new() -> Self {
         QueueUuid(uuid::Uuid::new_v4())
@@ -599,7 +593,7 @@ async fn ensure_wants_queue(
         CreateButton::new(format!("queue_check"))
             .label("Yes, I'm here.")
             .style(serenity::ButtonStyle::Primary),
-        CreateButton::new(format!("afk_leave_queue_{}", queue_id))
+        CreateButton::new(format!("afk_leave_queue_{}", serde_json::to_string(queue_id).unwrap()))
             .label("No, exit queue.")
             .style(serenity::ButtonStyle::Primary),
     ])]);
@@ -627,7 +621,7 @@ async fn ensure_wants_queue(
                 .unwrap()
                 .leaver_verification_time as u64;
             tokio::time::sleep(Duration::from_secs(leaver_verification_time)).await;
-            let Ok(message) = ctx1
+            let Ok(mut message) = ctx1
                 .get_message(leaver_message.channel_id, leaver_message.id)
                 .await
             else {
@@ -641,7 +635,7 @@ async fn ensure_wants_queue(
                 .get(&queue_id)
                 .unwrap()
                 .notify_one();
-            message.delete(ctx1.clone()).await.ok();
+            message.edit(ctx1.clone(), EditMessage::new().content("Removed from queue for inactivity.")).await.ok();
         });
     }
 
@@ -1033,7 +1027,8 @@ async fn handler(
                                 )
                                 .await
                                 .into_iter()
-                                .collect::<Result<(), _>>()?;
+                                .collect::<Result<(), _>>()
+                                .ok();
                             }
                             for channel in channels {
                                 data.match_channels.lock().unwrap().remove(&channel);
@@ -1076,28 +1071,32 @@ async fn handler(
                 if let Some(party_id) = message_component.data.custom_id.strip_prefix("join_party_")
                 {
                     let party_uuid = serde_json::from_str::<GroupUuid>(party_id).unwrap();
-                    let group_members = {
+                    let group_members = 'group_members: {
                         let mut group_data = data.group_data.lock().unwrap();
                         let party = group_data.get_mut(&party_uuid);
-                        if let Some(party) = party {
-                            party.pending_invites.remove(&message_component.user.id);
-                            party.players.insert(message_component.user.id);
-                            Some(party.players.clone())
-                        } else {
-                            None
+                        let Some(party) = party else {
+                            break 'group_members Err("Party no longer exists.")
+                        };
+                        if !party.pending_invites.remove(&message_component.user.id) {
+                            break 'group_members Err("Party invite no longer valid.")
                         }
+                        party.players.insert(message_component.user.id);
+                        Ok(party.players.clone())
                     };
-                    let Some(group_members) = group_members else {
-                        message_component
-                            .create_response(
-                                ctx,
-                                serenity::CreateInteractionResponse::Message(
-                                    CreateInteractionResponseMessage::new()
-                                        .content(format!("Party no longer exists.")),
-                                ),
-                            )
-                            .await?;
-                        return Ok(());
+                    let group_members = match group_members {
+                        Ok(group_members) => group_members,
+                        Err(e) => {
+                            message_component
+                                .create_response(
+                                    ctx,
+                                    serenity::CreateInteractionResponse::Message(
+                                        CreateInteractionResponseMessage::new()
+                                            .content(format!("{}", e)),
+                                    ),
+                                )
+                                .await?;
+                            return Ok(());
+                        }
                     };
                     let old_party = {
                         let mut player_data = data.global_player_data.lock().unwrap();
@@ -1462,7 +1461,7 @@ async fn handler(
                     .custom_id
                     .strip_prefix("afk_leave_queue_")
                 {
-                    let queue_uuid = serde_json::from_str::<QueueUuid>(queue_id).unwrap();
+                    let queue_uuid = serde_json::from_str::<QueueUuid>(queue_id)?;
                     let response = player_leave_queue(
                         data.clone(),
                         message_component.user.id,
@@ -2035,7 +2034,8 @@ async fn try_matchmaking(
                 .await?;
             match_channel
                 .pin(cache_http_copy.clone(), members_message_id.id)
-                .await?;
+                .await
+                .ok();
             let mut map_vote_end_time = None;
             if config.map_vote_count > 0 {
                 let mut map_vote_message_content = "# Map Vote".to_string();

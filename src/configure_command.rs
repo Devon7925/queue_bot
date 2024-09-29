@@ -35,7 +35,7 @@ async fn configure_team_size(
             CreateReply::default()
                 .content(format!(
                     "Queue id {} is not part of this server",
-                    queue_uuid
+                    queue_uuid.0
                 ))
                 .ephemeral(true),
         )
@@ -79,7 +79,7 @@ async fn configure_team_count(
             CreateReply::default()
                 .content(format!(
                     "Queue id {} is not part of this server",
-                    queue_uuid
+                    queue_uuid.0
                 ))
                 .ephemeral(true),
         )
@@ -123,7 +123,7 @@ async fn configure_queue_category(
             CreateReply::default()
                 .content(format!(
                     "Queue id {} is not part of this server",
-                    queue_uuid
+                    queue_uuid.0
                 ))
                 .ephemeral(true),
         )
@@ -181,7 +181,7 @@ async fn configure_queue_channels(
             CreateReply::default()
                 .content(format!(
                     "Queue id {} is not part of this server",
-                    queue_uuid
+                    queue_uuid.0
                 ))
                 .ephemeral(true),
         )
@@ -240,7 +240,7 @@ async fn configure_maps(
             CreateReply::default()
                 .content(format!(
                     "Queue id {} is not part of this server",
-                    queue_uuid
+                    queue_uuid.0
                 ))
                 .ephemeral(true),
         )
@@ -293,7 +293,7 @@ async fn configure_map_vote_count(
             CreateReply::default()
                 .content(format!(
                     "Queue id {} is not part of this server",
-                    queue_uuid
+                    queue_uuid.0
                 ))
                 .ephemeral(true),
         )
@@ -337,7 +337,7 @@ async fn configure_map_vote_time(
             CreateReply::default()
                 .content(format!(
                     "Queue id {} is not part of this server",
-                    queue_uuid
+                    queue_uuid.0
                 ))
                 .ephemeral(true),
         )
@@ -379,7 +379,7 @@ async fn configure_maximum_queue_cost(
             CreateReply::default()
                 .content(format!(
                     "Queue id {} is not part of this server",
-                    queue_uuid
+                    queue_uuid.0
                 ))
                 .ephemeral(true),
         )
@@ -426,7 +426,7 @@ async fn configure_post_match_channel(
             CreateReply::default()
                 .content(format!(
                     "Queue id {} is not part of this server",
-                    queue_uuid
+                    queue_uuid.0
                 ))
                 .ephemeral(true),
         )
@@ -477,7 +477,7 @@ async fn configure_audit_channel(
             CreateReply::default()
                 .content(format!(
                     "Queue id {} is not part of this server",
-                    queue_uuid
+                    queue_uuid.0
                 ))
                 .ephemeral(true),
         )
@@ -527,7 +527,7 @@ async fn configure_register_role(
             CreateReply::default()
                 .content(format!(
                     "Queue id {} is not part of this server",
-                    queue_uuid
+                    queue_uuid.0
                 ))
                 .ephemeral(true),
         )
@@ -576,7 +576,7 @@ async fn configure_log_chats(
             CreateReply::default()
                 .content(format!(
                     "Queue id {} is not part of this server",
-                    queue_uuid
+                    queue_uuid.0
                 ))
                 .ephemeral(true),
         )
@@ -620,7 +620,7 @@ async fn configure_visability_override_roles(
                 CreateReply::default()
                     .content(format!(
                         "Queue id {} is not part of this server",
-                        queue_uuid
+                        queue_uuid.0
                     ))
                     .ephemeral(true),
             )
@@ -701,7 +701,7 @@ pub async fn create_queue(
 
     ctx.data().guild_data.lock().unwrap().entry(ctx.guild_id().unwrap()).or_default().queues.push(queue_uuid);
     //ensure queue is part of server
-    let response = format!("Created new queue with uuid: `{}`", queue_uuid);
+    let response = format!("Created new queue with uuid: `{}`", queue_uuid.0);
     ctx.send(CreateReply::default().content(response).ephemeral(true))
         .await?;
     Ok(())
@@ -734,7 +734,7 @@ pub async fn import_config(
             CreateReply::default()
                 .content(format!(
                     "Queue id {} is not part of this server",
-                    queue_uuid
+                    queue_uuid.0
                 ))
                 .ephemeral(true),
         )
@@ -771,7 +771,7 @@ pub async fn export_config(
             CreateReply::default()
                 .content(format!(
                     "Queue id {} is not part of this server",
-                    queue_uuid
+                    queue_uuid.0
                 ))
                 .ephemeral(true),
         )
