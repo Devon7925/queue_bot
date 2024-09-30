@@ -406,6 +406,25 @@ impl Default for GlobalPlayerData {
         }
     }
 }
+async fn on_error(error: poise::FrameworkError<'_, Arc<Data>, Error>) {
+    // This is our custom error handler
+    // They are many errors that can occur, so we only handle the ones we want to customize
+    // and forward the rest to the default handler
+    match error {
+        poise::FrameworkError::Setup { error, .. } => panic!("Failed to start bot: {:?}", error),
+        poise::FrameworkError::Command { error, ctx, .. } => {
+            println!("Error in command `{}`: {:?}", ctx.command().name, error,);
+        }
+        poise::FrameworkError::EventHandler { error, event, .. } => {
+            println!("Error in event `{}`: {:?}", event.snake_case_name(), error,);
+        }
+        error => {
+            if let Err(e) = poise::builtins::on_error(error).await {
+                println!("Error while handling error: {}", e)
+            }
+        }
+    }
+}
 
 async fn try_queue_player(
     data: Arc<Data>,
@@ -543,7 +562,7 @@ async fn try_queue_player(
                     http.clone(),
                     guild_id,
                     false,
-                    is_bot
+                    is_bot,
                 ))
                 .await?;
             }
@@ -593,9 +612,12 @@ async fn ensure_wants_queue(
         CreateButton::new(format!("queue_check"))
             .label("Yes, I'm here.")
             .style(serenity::ButtonStyle::Primary),
-        CreateButton::new(format!("afk_leave_queue_{}", serde_json::to_string(queue_id).unwrap()))
-            .label("No, exit queue.")
-            .style(serenity::ButtonStyle::Primary),
+        CreateButton::new(format!(
+            "afk_leave_queue_{}",
+            serde_json::to_string(queue_id).unwrap()
+        ))
+        .label("No, exit queue.")
+        .style(serenity::ButtonStyle::Primary),
     ])]);
     let Ok(leaver_message) = user.direct_message(http.clone(), leaver_message).await else {
         data.queued_players
@@ -635,7 +657,13 @@ async fn ensure_wants_queue(
                 .get(&queue_id)
                 .unwrap()
                 .notify_one();
-            message.edit(ctx1.clone(), EditMessage::new().content("Removed from queue for inactivity.")).await.ok();
+            message
+                .edit(
+                    ctx1.clone(),
+                    EditMessage::new().content("Removed from queue for inactivity."),
+                )
+                .await
+                .ok();
         });
     }
 
@@ -735,7 +763,7 @@ async fn handler(
                         ctx.http.clone(),
                         new.guild_id.unwrap(),
                         true,
-                        false
+                        false,
                     )
                     .await
                     {
@@ -1075,10 +1103,10 @@ async fn handler(
                         let mut group_data = data.group_data.lock().unwrap();
                         let party = group_data.get_mut(&party_uuid);
                         let Some(party) = party else {
-                            break 'group_members Err("Party no longer exists.")
+                            break 'group_members Err("Party no longer exists.");
                         };
                         if !party.pending_invites.remove(&message_component.user.id) {
-                            break 'group_members Err("Party invite no longer valid.")
+                            break 'group_members Err("Party invite no longer valid.");
                         }
                         party.players.insert(message_component.user.id);
                         Ok(party.players.clone())
@@ -2646,7 +2674,7 @@ async fn queue_many(ctx: Context<'_>, count: u32) -> Result<(), Error> {
         match try_queue_player(
             ctx.data().clone(),
             queue,
-            UserId::new((i+1) as u64),
+            UserId::new((i + 1) as u64),
             ctx.serenity_context().http.clone(),
             ctx.guild_id().unwrap(),
             true,
@@ -2654,12 +2682,11 @@ async fn queue_many(ctx: Context<'_>, count: u32) -> Result<(), Error> {
         )
         .await
         {
-            Ok(()) => {
-            }
+            Ok(()) => {}
             Err(reason) => {
                 ctx.send(CreateReply::default().content(reason).ephemeral(true))
                     .await?;
-                return Ok(())
+                return Ok(());
             }
         }
     }
@@ -3362,6 +3389,7 @@ async fn main() {
                 list_queues(),
                 create_queue(),
             ],
+            on_error: |error| Box::pin(on_error(error)),
             ..Default::default()
         })
         .setup(|_ctx, _ready, _framework| {
