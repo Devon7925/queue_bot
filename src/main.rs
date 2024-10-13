@@ -530,6 +530,7 @@ async fn try_queue_player(
             }
         }
     }
+    let queue_enter_time = chrono::offset::Utc::now();
     let party_id = {
         let mut global_player_data = data.global_player_data.lock().unwrap();
         let mut queued_players = data.queued_players.get_mut(&queue_id).unwrap();
@@ -537,7 +538,7 @@ async fn try_queue_player(
             .entry(user_id)
             .or_insert(GlobalPlayerData::default());
 
-        global_player_data.queue_enter_time = Some(chrono::offset::Utc::now());
+        global_player_data.queue_enter_time = Some(queue_enter_time.clone());
         queued_players.insert(user_id);
 
         global_player_data.party
@@ -572,7 +573,7 @@ async fn try_queue_player(
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs_f32(60.0 * 30.0)).await;
-            match ensure_wants_queue(data.clone(), http.clone(), &user_id, &queue_id).await {
+            match ensure_wants_queue(data.clone(), http.clone(), &user_id, &queue_id, queue_enter_time).await {
                 Ok(true) => break,
                 Ok(false) => {}
                 Err(err) => {
@@ -591,8 +592,12 @@ async fn ensure_wants_queue(
     http: Arc<Http>,
     user: &UserId,
     queue_id: &QueueUuid,
+    queue_enter_time: DateTime<Utc>,
 ) -> Result<bool, Error> {
     if !data.queued_players.get(&queue_id).unwrap().contains(user) {
+        return Ok(true);
+    }
+    if data.global_player_data.lock().unwrap().get(user).unwrap().queue_enter_time.unwrap() == queue_enter_time {
         return Ok(true);
     }
     let mut leaver_message_content =
