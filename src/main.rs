@@ -23,11 +23,7 @@ use itertools::{Itertools, MinMaxResult};
 use player_config_commands::player_config;
 use poise::{
     serenity_prelude::{
-        self as serenity, futures::future, Builder, CacheHttp, ChannelId, ChannelType,
-        CreateActionRow, CreateAllowedMentions, CreateButton, CreateChannel,
-        CreateInteractionResponse, CreateInteractionResponseMessage, CreateMessage,
-        EditInteractionResponse, EditMember, EditMessage, GuildId, Http, Mentionable, MessageId,
-        PermissionOverwrite, PermissionOverwriteType, Permissions, RoleId, UserId, VoiceState,
+        self as serenity, futures::future, Builder, CacheHttp, ChannelId, ChannelType, CreateActionRow, CreateAllowedMentions, CreateButton, CreateChannel, CreateInteractionResponse, CreateInteractionResponseFollowup, CreateInteractionResponseMessage, CreateMessage, EditInteractionResponse, EditMember, EditMessage, GuildId, Http, Mentionable, MessageId, PermissionOverwrite, PermissionOverwriteType, Permissions, RoleId, UserId, VoiceState
     },
     CreateReply,
 };
@@ -555,18 +551,15 @@ async fn try_queue_player(
                 .players
                 .clone();
 
-            for player in party_members {
-                Box::pin(try_queue_player(
+            future::join_all(party_members.iter().map(|group_member_id| try_queue_player(
                     data.clone(),
                     queue_id,
-                    player,
+                    group_member_id.clone(),
                     http.clone(),
                     guild_id,
                     false,
                     is_bot,
-                ))
-                .await?;
-            }
+            ))).await.into_iter().collect::<Result<(), String>>()?;
         }
     }
     let queue_id = queue_id.clone();
@@ -597,7 +590,7 @@ async fn ensure_wants_queue(
     if !data.queued_players.get(&queue_id).unwrap().contains(user) {
         return Ok(true);
     }
-    if data.global_player_data.lock().unwrap().get(user).unwrap().queue_enter_time.unwrap() == queue_enter_time {
+    if data.global_player_data.lock().unwrap().get(user).unwrap().queue_enter_time.unwrap() != queue_enter_time {
         return Ok(true);
     }
     let mut leaver_message_content =
@@ -1282,7 +1275,6 @@ async fn handler(
                 }
                 if message_component.data.custom_id == "queue" {
                     let queues = data
-                        .clone()
                         .guild_data
                         .lock()
                         .unwrap()
@@ -1317,6 +1309,9 @@ async fn handler(
                             .await?;
                         return Ok(());
                     };
+                    message_component
+                        .defer_ephemeral(ctx.http())
+                        .await?;
                     match try_queue_player(
                         data.clone(),
                         queue,
@@ -1330,13 +1325,11 @@ async fn handler(
                     {
                         Ok(()) => {
                             message_component
-                                .create_response(
+                                .create_followup(
                                     ctx.http(),
-                                    CreateInteractionResponse::Message(
-                                        CreateInteractionResponseMessage::new()
-                                            .content("Joined queue!")
-                                            .ephemeral(true),
-                                    ),
+                                    CreateInteractionResponseFollowup::new()
+                                        .content("Joined queue!")
+                                        .ephemeral(true),
                                 )
                                 .await?;
                             data.message_edit_notify
@@ -1555,21 +1548,23 @@ async fn handler(
                         let queued_players = data.queued_players.get(queue).unwrap();
                         queued_players.contains(&message_component.user.id)
                     };
-                    let player_state = data
-                        .global_player_data
-                        .lock()
-                        .unwrap()
-                        .entry(message_component.user.id)
-                        .or_default()
-                        .queue_state
-                        .clone();
+                    let (player_state, q_entry_time) = {
+                        let mut global_data = data
+                            .global_player_data
+                            .lock()
+                            .unwrap();
+                        let player_data = global_data
+                            .entry(message_component.user.id)
+                            .or_default();
+                        (player_data.queue_state.clone(), player_data.queue_enter_time.clone())
+                    };
                     if was_in_queue {
                         message_component
                             .create_response(
                                 ctx.http(),
                                 CreateInteractionResponse::Message(
                                     CreateInteractionResponseMessage::new()
-                                        .content("You are in queue.")
+                                        .content(format!("You'e been in queue since <t:{}:R>.", q_entry_time.unwrap().timestamp()))
                                         .ephemeral(true),
                                 ),
                             )
