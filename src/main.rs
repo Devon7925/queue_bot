@@ -23,7 +23,7 @@ use itertools::{Itertools, MinMaxResult};
 use player_config_commands::player_config;
 use poise::{
     serenity_prelude::{
-        self as serenity, futures::future, Builder, CacheHttp, ChannelId, ChannelType, CreateActionRow, CreateAllowedMentions, CreateButton, CreateChannel, CreateInteractionResponse, CreateInteractionResponseFollowup, CreateInteractionResponseMessage, CreateMessage, EditInteractionResponse, EditMember, EditMessage, GuildId, Http, Mentionable, MessageId, PermissionOverwrite, PermissionOverwriteType, Permissions, RoleId, UserId, VoiceState
+        self as serenity, futures::future, Builder, CacheHttp, ChannelId, ChannelType, ComponentInteraction, CreateActionRow, CreateAllowedMentions, CreateButton, CreateChannel, CreateInteractionResponse, CreateInteractionResponseMessage, CreateMessage, EditInteractionResponse, EditMember, EditMessage, GuildId, Http, Mentionable, MessageId, PermissionOverwrite, PermissionOverwriteType, Permissions, RoleId, UserId, VoiceState
     },
     CreateReply,
 };
@@ -551,7 +551,8 @@ async fn try_queue_player(
                 .players
                 .clone();
 
-            future::join_all(party_members.iter().map(|group_member_id| try_queue_player(
+            future::join_all(party_members.iter().map(|group_member_id| {
+                try_queue_player(
                     data.clone(),
                     queue_id,
                     group_member_id.clone(),
@@ -559,14 +560,26 @@ async fn try_queue_player(
                     guild_id,
                     false,
                     is_bot,
-            ))).await.into_iter().collect::<Result<(), String>>()?;
+                )
+            }))
+            .await
+            .into_iter()
+            .collect::<Result<(), String>>()?;
         }
     }
     let queue_id = queue_id.clone();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs_f32(60.0 * 30.0)).await;
-            match ensure_wants_queue(data.clone(), http.clone(), &user_id, &queue_id, queue_enter_time).await {
+            match ensure_wants_queue(
+                data.clone(),
+                http.clone(),
+                &user_id,
+                &queue_id,
+                queue_enter_time,
+            )
+            .await
+            {
                 Ok(true) => break,
                 Ok(false) => {}
                 Err(err) => {
@@ -590,7 +603,16 @@ async fn ensure_wants_queue(
     if !data.queued_players.get(&queue_id).unwrap().contains(user) {
         return Ok(true);
     }
-    if data.global_player_data.lock().unwrap().get(user).unwrap().queue_enter_time.unwrap() != queue_enter_time {
+    if data
+        .global_player_data
+        .lock()
+        .unwrap()
+        .get(user)
+        .unwrap()
+        .queue_enter_time
+        .unwrap()
+        != queue_enter_time
+    {
         return Ok(true);
     }
     let mut leaver_message_content =
@@ -792,6 +814,7 @@ async fn handler(
         }
         serenity::FullEvent::InteractionCreate { interaction } => {
             if let Some(message_component) = interaction.as_message_component() {
+                log_interaction(message_component);
                 let match_number = {
                     let match_channels = data.match_channels.lock().unwrap();
                     match_channels.get(&message_component.channel_id).cloned()
@@ -1309,9 +1332,7 @@ async fn handler(
                             .await?;
                         return Ok(());
                     };
-                    message_component
-                        .defer_ephemeral(ctx.http())
-                        .await?;
+                    message_component.defer_ephemeral(ctx.http()).await?;
                     match try_queue_player(
                         data.clone(),
                         queue,
@@ -1325,11 +1346,9 @@ async fn handler(
                     {
                         Ok(()) => {
                             message_component
-                                .create_followup(
+                                .edit_response(
                                     ctx.http(),
-                                    CreateInteractionResponseFollowup::new()
-                                        .content("Joined queue!")
-                                        .ephemeral(true),
+                                    EditInteractionResponse::new().content("Joined queue!"),
                                 )
                                 .await?;
                             data.message_edit_notify
@@ -1346,13 +1365,9 @@ async fn handler(
                         }
                         Err(reason) => {
                             message_component
-                                .create_response(
+                                .edit_response(
                                     ctx.http(),
-                                    CreateInteractionResponse::Message(
-                                        CreateInteractionResponseMessage::new()
-                                            .content(reason)
-                                            .ephemeral(true),
-                                    ),
+                                    EditInteractionResponse::new().content(reason),
                                 )
                                 .await?;
                         }
@@ -1549,14 +1564,12 @@ async fn handler(
                         queued_players.contains(&message_component.user.id)
                     };
                     let (player_state, q_entry_time) = {
-                        let mut global_data = data
-                            .global_player_data
-                            .lock()
-                            .unwrap();
-                        let player_data = global_data
-                            .entry(message_component.user.id)
-                            .or_default();
-                        (player_data.queue_state.clone(), player_data.queue_enter_time.clone())
+                        let mut global_data = data.global_player_data.lock().unwrap();
+                        let player_data = global_data.entry(message_component.user.id).or_default();
+                        (
+                            player_data.queue_state.clone(),
+                            player_data.queue_enter_time.clone(),
+                        )
                     };
                     if was_in_queue {
                         message_component
@@ -1564,7 +1577,10 @@ async fn handler(
                                 ctx.http(),
                                 CreateInteractionResponse::Message(
                                     CreateInteractionResponseMessage::new()
-                                        .content(format!("You'e been in queue since <t:{}:R>.", q_entry_time.unwrap().timestamp()))
+                                        .content(format!(
+                                            "You'e been in queue since <t:{}:R>.",
+                                            q_entry_time.unwrap().timestamp()
+                                        ))
                                         .ephemeral(true),
                                 ),
                             )
@@ -1707,6 +1723,38 @@ fn log_match_results(_data: Arc<Data>, result: &MatchResult, match_data: &MatchD
         file,
         "match {}:{:?}\nresult:{}",
         match_data.name, match_data, result
+    ) {
+        eprintln!("Couldn't write to file: {}", e);
+    }
+}
+
+fn log_command(ctx: &Context) {
+    let mut file = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open("commands.log")
+        .unwrap();
+    if let Err(e) = writeln!(
+        file,
+        "{}: {}",
+        ctx.author().mention(),
+        ctx.invocation_string(),
+    ) {
+        eprintln!("Couldn't write to file: {}", e);
+    }
+}
+
+fn log_interaction(interaction: &ComponentInteraction) {
+    let mut file = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open("commands.log")
+        .unwrap();
+    if let Err(e) = writeln!(
+        file,
+        "{}: {}",
+        interaction.user.mention(),
+        interaction.data.custom_id,
     ) {
         eprintln!("Couldn't write to file: {}", e);
     }
@@ -3362,6 +3410,11 @@ async fn main() {
         .options(poise::FrameworkOptions {
             event_handler: |ctx, event, framework, data| {
                 Box::pin(handler(ctx, event, framework, data.clone()))
+            },
+            pre_command: |ctx| {
+                Box::pin(async move {
+                    log_command(&ctx);
+                })
             },
             commands: vec![
                 register(),
