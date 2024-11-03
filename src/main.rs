@@ -172,7 +172,6 @@ enum VoteType {
 
 #[derive(Serialize, Deserialize, Clone)]
 struct RoleConfiguration {
-    id: String,
     name: String,
     description: String,
 }
@@ -201,8 +200,9 @@ struct QueueConfiguration {
     leaver_verification_time: u32,
     default_player_data: PlayerData,
     maximum_queue_cost: f32,
+    incorrect_roles_cost: f32,
     game_categories: HashMap<String, Vec<RoleId>>,
-    roles: Vec<RoleConfiguration>,
+    roles: HashMap<String, RoleConfiguration>,
     role_combinations: Vec<(Vec<String>, f32)>,
     log_chats: bool,
     max_lobby_keep_time: u64,
@@ -226,8 +226,9 @@ impl Default for QueueConfiguration {
             leaver_verification_time: 30,
             default_player_data: PlayerData::default(),
             maximum_queue_cost: 50.0,
+            incorrect_roles_cost: 10.0,
             game_categories: HashMap::new(),
-            roles: vec![],
+            roles: HashMap::new(),
             role_combinations: vec![],
             log_chats: true,
             max_lobby_keep_time: 15 * 60,
@@ -1970,8 +1971,7 @@ async fn try_matchmaking(
                 .map(|game_role| {
                     config
                         .roles
-                        .iter()
-                        .find(|role| role.id == *game_role)
+                        .get(game_role)
                         .map(|role| role.name.clone())
                         .unwrap()
                 })
@@ -2366,7 +2366,7 @@ fn evaluate_cost(
     global_player_data: &Vec<Vec<GlobalPlayerData>>,
     queue_id: &QueueUuid,
 ) -> LobbyEvaluation {
-    let (team_size, game_categories, default_player_data, max_lobby_keep_time, role_combinations) = {
+    let (team_size, game_categories, default_player_data, max_lobby_keep_time, role_combinations, incorrect_roles_cost) = {
         let config = data.configuration.get(&queue_id).unwrap();
         (
             config.team_size,
@@ -2374,6 +2374,7 @@ fn evaluate_cost(
             config.default_player_data.clone(),
             config.max_lobby_keep_time.clone(),
             config.role_combinations.clone(),
+            config.incorrect_roles_cost,
         )
     };
 
@@ -2563,7 +2564,7 @@ fn evaluate_cost(
                     })
                     .collect_vec();
                 let mut correct_edges = matching(&edges);
-                if correct_edges.len() == team_roles.len() {
+                if correct_edges.len() == team_roles.len().min(role_combination.len()) {
                     correct_edges.sort_by_key(|(player_idx, _)| *player_idx);
                     role_cost += combination_cost;
                     return correct_edges
@@ -2573,7 +2574,7 @@ fn evaluate_cost(
                         .collect_vec();
                 }
             }
-            role_cost += 10.0;
+            role_cost += incorrect_roles_cost;
             team_roles.iter().map(|_| "".to_string()).collect_vec()
         })
         .collect_vec();

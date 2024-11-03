@@ -434,8 +434,8 @@ pub async fn create_roles_message(ctx: Context<'_>) -> Result<(), Error> {
                             serenity::CreateSelectMenuKind::String {
                                 options: roles
                                     .iter()
-                                    .map(|role| {
-                                        CreateSelectMenuOption::new(role.name.clone(), role.id.clone())
+                                    .map(|(role_id, role)| {
+                                        CreateSelectMenuOption::new(role.name.clone(), role_id.clone())
                                             .description(role.description.clone())
                                             .default_selection(true)
                                     })

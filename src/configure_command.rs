@@ -1,4 +1,7 @@
-use std::{collections::{HashMap, HashSet}, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use itertools::Itertools;
 use poise::{
@@ -6,22 +9,11 @@ use poise::{
     CreateReply,
 };
 use tokio::sync::Notify;
-use uuid::Uuid;
 
-use crate::{Context, Error, QueueConfiguration, QueueUuid};
+use crate::{Context, Error, QueueConfiguration, QueueUuid, RoleConfiguration};
 
-/// Displays or sets team size
-#[poise::command(slash_command, prefix_command, rename = "team_size")]
-async fn configure_team_size(
-    ctx: Context<'_>,
-    #[description = "Queue to change"] queue: String,
-    #[description = "New value"]
-    #[min = 1]
-    new_value: Option<u32>,
-) -> Result<(), Error> {
-    let queue_uuid: QueueUuid = QueueUuid(Uuid::parse_str(&queue.as_str())?);
-    //ensure queue is part of server
-    if !ctx
+fn get_queue_uuid(ctx: &Context, queue_idx: Option<u32>) -> Result<QueueUuid, String> {
+    let queues = ctx
         .data()
         .guild_data
         .lock()
@@ -29,106 +21,136 @@ async fn configure_team_size(
         .get(&ctx.guild_id().unwrap())
         .unwrap()
         .queues
-        .contains(&queue_uuid)
-    {
-        ctx.send(
-            CreateReply::default()
-                .content(format!(
-                    "Queue id {} is not part of this server",
-                    queue_uuid.0
-                ))
-                .ephemeral(true),
-        )
-        .await?;
+        .clone();
+    if queues.len() == 0 {
+        return Err("No queues available.".to_string());
+    } else if let Some(queue_idx) = queue_idx {
+        if let Some(queue) = queues.get(queue_idx as usize) {
+            Ok(queue.clone())
+        } else {
+            return Err("Invalid queue idx.".to_string());
+        }
+    } else if queues.len() == 1 {
+        Ok(queues.get(0).unwrap().clone())
+    } else {
+        return Err(
+            "Multiple queues available: you must specify which queue you want to use".to_string(),
+        );
     }
+}
+
+macro_rules! configure_server_parameter {
+    ($func_name:ident, $prop:ident, $prop_type:ty, $rename:expr, $name:expr, $doc:expr$(, $limits:meta)?) => {
+#[doc=$doc]
+#[poise::command(slash_command, rename=$rename)]
+pub async fn $func_name(
+    ctx: Context<'_>,
+    #[description = "New value"]
+    $(#[$limits])?
+    new_value: Option<$prop_type>,
+    #[description = "Queue index"]
+    #[min = 0]
+    queue_idx: Option<u32>,
+) -> Result<(), Error> {
+    let queue_uuid = match get_queue_uuid(&ctx, queue_idx) {
+        Ok(queue_uuid) => queue_uuid,
+        Err(error) => {
+            ctx.send(CreateReply::default().content(error).ephemeral(true))
+                .await?;
+            return Ok(())
+        }
+    };
     let response = if let Some(new_value) = new_value {
         let mut data_lock = ctx.data().configuration.get_mut(&queue_uuid).unwrap();
-        data_lock.team_size = new_value;
-        format!("Team size set to {}", new_value)
+        data_lock.$prop = new_value;
+        format!("{} set to {}", $name, new_value)
     } else {
         let data_lock = ctx.data().configuration.get(&queue_uuid).unwrap();
-        format!("Team size is currently {}", data_lock.team_size)
+        format!("{} is currently {}", $name, data_lock.$prop)
     };
     ctx.send(CreateReply::default().content(response).ephemeral(true))
         .await?;
     Ok(())
 }
-
-/// Displays or sets team count
-#[poise::command(slash_command, prefix_command, rename = "team_count")]
-async fn configure_team_count(
-    ctx: Context<'_>,
-    #[description = "Queue to change"] queue: String,
-    #[description = "New value"]
-    #[min = 1]
-    new_value: Option<u32>,
-) -> Result<(), Error> {
-    let queue_uuid: QueueUuid = QueueUuid(Uuid::parse_str(&queue.as_str())?);
-    //ensure queue is part of server
-    if !ctx
-        .data()
-        .guild_data
-        .lock()
-        .unwrap()
-        .get(&ctx.guild_id().unwrap())
-        .unwrap()
-        .queues
-        .contains(&queue_uuid)
-    {
-        ctx.send(
-            CreateReply::default()
-                .content(format!(
-                    "Queue id {} is not part of this server",
-                    queue_uuid.0
-                ))
-                .ephemeral(true),
-        )
-        .await?;
-    }
-    let response = if let Some(new_value) = new_value {
-        let mut data_lock = ctx.data().configuration.get_mut(&queue_uuid).unwrap();
-        data_lock.team_count = new_value;
-        format!("Team count set to {}", new_value)
-    } else {
-        let data_lock = ctx.data().configuration.get(&queue_uuid).unwrap();
-        format!("Team count is currently {}", data_lock.team_count)
     };
-    ctx.send(CreateReply::default().content(response).ephemeral(true))
-        .await?;
-    Ok(())
+}
+
+struct ConfigurationModifiers;
+impl ConfigurationModifiers {
+    configure_server_parameter!(
+        configure_team_size,
+        team_size,
+        u32,
+        "team_size",
+        "Team size",
+        "Displays or sets team size",
+        min = 1
+    );
+    configure_server_parameter!(
+        configure_team_count,
+        team_count,
+        u32,
+        "team_count",
+        "Team count",
+        "Displays or sets team count",
+        min = 1
+    );
+    configure_server_parameter!(
+        configure_map_vote_count,
+        map_vote_count,
+        u32,
+        "map_vote_count",
+        "Map vote count",
+        "Displays or sets number of maps for the vote",
+        min = 1
+    );
+    configure_server_parameter!(
+        configure_map_vote_time,
+        map_vote_time,
+        u32,
+        "map_vote_time",
+        "Map vote time",
+        "Displays or sets time maps for the vote (0 for no timeout)",
+        min = 0
+    );
+    configure_server_parameter!(
+        configure_maximum_queue_cost,
+        maximum_queue_cost,
+        f32,
+        "maximum_queue_cost",
+        "Max queue cost",
+        "Displays or sets maximum cost it will allow for a match to be created"
+    );
+    configure_server_parameter!(
+        configure_incorrect_roles_cost,
+        incorrect_roles_cost,
+        f32,
+        "incorrect_roles_cost",
+        "Incorrect roles cost",
+        "Displays or sets cost for not assigning roles",
+        min = 0
+    );
 }
 
 /// Displays or sets queue category
 #[poise::command(slash_command, prefix_command, rename = "queue_category")]
 async fn configure_queue_category(
     ctx: Context<'_>,
-    #[description = "Queue to change"] queue: String,
     #[description = "Queue category"]
     #[channel_types("Category")]
     new_value: Option<serenity::Channel>,
+    #[description = "Queue index"]
+    #[min = 0]
+    queue_idx: Option<u32>,
 ) -> Result<(), Error> {
-    let queue_uuid: QueueUuid = QueueUuid(Uuid::parse_str(&queue.as_str())?);
-    //ensure queue is part of server
-    if !ctx
-        .data()
-        .guild_data
-        .lock()
-        .unwrap()
-        .get(&ctx.guild_id().unwrap())
-        .unwrap()
-        .queues
-        .contains(&queue_uuid)
-    {
-        ctx.send(
-            CreateReply::default()
-                .content(format!(
-                    "Queue id {} is not part of this server",
-                    queue_uuid.0
-                ))
-                .ephemeral(true),
-        )
-        .await?;
-    }
+    let queue_uuid = match get_queue_uuid(&ctx, queue_idx) {
+        Ok(queue_uuid) => queue_uuid,
+        Err(error) => {
+            ctx.send(CreateReply::default().content(error).ephemeral(true))
+                .await?;
+            return Ok(());
+        }
+    };
     let response = if let Some(new_value) = new_value {
         if new_value.clone().category().is_none() {
             format!(
@@ -159,34 +181,22 @@ async fn configure_queue_category(
 #[poise::command(slash_command, prefix_command, rename = "queue_channels")]
 async fn configure_queue_channels(
     ctx: Context<'_>,
-    #[description = "Queue to change"] queue: String,
     #[flag] remove: bool,
     #[description = "Queue channel"]
     #[channel_types("Voice")]
     channel: Option<serenity::ChannelId>,
+    #[description = "Queue index"]
+    #[min = 0]
+    queue_idx: Option<u32>,
 ) -> Result<(), Error> {
-    let queue_uuid: QueueUuid = QueueUuid(Uuid::parse_str(&queue.as_str())?);
-    //ensure queue is part of server
-    if !ctx
-        .data()
-        .guild_data
-        .lock()
-        .unwrap()
-        .get(&ctx.guild_id().unwrap())
-        .unwrap()
-        .queues
-        .contains(&queue_uuid)
-    {
-        ctx.send(
-            CreateReply::default()
-                .content(format!(
-                    "Queue id {} is not part of this server",
-                    queue_uuid.0
-                ))
-                .ephemeral(true),
-        )
-        .await?;
-    }
+    let queue_uuid = match get_queue_uuid(&ctx, queue_idx) {
+        Ok(queue_uuid) => queue_uuid,
+        Err(error) => {
+            ctx.send(CreateReply::default().content(error).ephemeral(true))
+                .await?;
+            return Ok(());
+        }
+    };
     let response = {
         let mut data_lock = ctx.data().configuration.get_mut(&queue_uuid).unwrap();
         if let Some(value) = channel {
@@ -220,32 +230,20 @@ async fn configure_queue_channels(
 #[poise::command(slash_command, prefix_command, rename = "maps")]
 async fn configure_maps(
     ctx: Context<'_>,
-    #[description = "Queue to change"] queue: String,
     #[flag] remove: bool,
     #[description = "Map"] map: Option<String>,
+    #[description = "Queue index"]
+    #[min = 0]
+    queue_idx: Option<u32>,
 ) -> Result<(), Error> {
-    let queue_uuid: QueueUuid = QueueUuid(Uuid::parse_str(&queue.as_str())?);
-    //ensure queue is part of server
-    if !ctx
-        .data()
-        .guild_data
-        .lock()
-        .unwrap()
-        .get(&ctx.guild_id().unwrap())
-        .unwrap()
-        .queues
-        .contains(&queue_uuid)
-    {
-        ctx.send(
-            CreateReply::default()
-                .content(format!(
-                    "Queue id {} is not part of this server",
-                    queue_uuid.0
-                ))
-                .ephemeral(true),
-        )
-        .await?;
-    }
+    let queue_uuid = match get_queue_uuid(&ctx, queue_idx) {
+        Ok(queue_uuid) => queue_uuid,
+        Err(error) => {
+            ctx.send(CreateReply::default().content(error).ephemeral(true))
+                .await?;
+            return Ok(());
+        }
+    };
     let response = {
         let mut data_lock = ctx.data().configuration.get_mut(&queue_uuid).unwrap();
         if let Some(value) = map {
@@ -268,132 +266,105 @@ async fn configure_maps(
     Ok(())
 }
 
-/// Displays or sets number of maps for the vote
-#[poise::command(slash_command, prefix_command, rename = "map_vote_count")]
-async fn configure_map_vote_count(
+// Displays or adds roles
+#[poise::command(slash_command, prefix_command, rename = "roles")]
+async fn configure_roles(
     ctx: Context<'_>,
-    #[description = "Queue to change"] queue: String,
-    #[description = "New value"]
+    #[flag] remove: bool,
+    #[description = "Role"] role_id: Option<String>,
+    #[description = "Role name"] role_name: Option<String>,
+    #[description = "Role description"] role_description: Option<String>,
+    #[description = "Queue index"]
     #[min = 0]
-    new_value: Option<u32>,
+    queue_idx: Option<u32>,
 ) -> Result<(), Error> {
-    let queue_uuid: QueueUuid = QueueUuid(Uuid::parse_str(&queue.as_str())?);
-    //ensure queue is part of server
-    if !ctx
-        .data()
-        .guild_data
-        .lock()
-        .unwrap()
-        .get(&ctx.guild_id().unwrap())
-        .unwrap()
-        .queues
-        .contains(&queue_uuid)
-    {
-        ctx.send(
-            CreateReply::default()
-                .content(format!(
-                    "Queue id {} is not part of this server",
-                    queue_uuid.0
-                ))
-                .ephemeral(true),
-        )
-        .await?;
-    }
-    let response = if let Some(new_value) = new_value {
+    let queue_uuid = match get_queue_uuid(&ctx, queue_idx) {
+        Ok(queue_uuid) => queue_uuid,
+        Err(error) => {
+            ctx.send(CreateReply::default().content(error).ephemeral(true))
+                .await?;
+            return Ok(());
+        }
+    };
+    let response = 'response: {
         let mut data_lock = ctx.data().configuration.get_mut(&queue_uuid).unwrap();
-        data_lock.map_vote_count = new_value;
-        format!("Map vote count set to {}", new_value)
-    } else {
-        let data_lock = ctx.data().configuration.get(&queue_uuid).unwrap();
-        format!("Map vote count is currently {}", data_lock.map_vote_count)
+        let Some(role_id) = role_id else {
+            break 'response format!(
+                "Roles:\n{}",
+                data_lock
+                    .roles
+                    .values()
+                    .map(|role| format!("* {}: {}", role.name, role.description))
+                    .join("\n")
+            );
+        };
+        if remove {
+            break 'response if let Some(role) = data_lock.roles.remove(&role_id) {
+                data_lock.role_combinations.retain(|(combination, _)| !combination.contains(&role_id));
+                format!("{}(id: {}) removed as role", role.name, role_id)
+            } else {
+                format!("{} wasn't a role", role_id)
+            };
+        }
+        if role_name.is_none() {
+            break 'response "Role name missing".to_string();
+        }
+        data_lock.roles.insert(
+            role_id.clone(),
+            RoleConfiguration {
+                name: role_name.unwrap(),
+                description: role_description.unwrap_or("".to_string()),
+            },
+        );
+        format!("{} added as role", role_id)
     };
     ctx.send(CreateReply::default().content(response).ephemeral(true))
         .await?;
     Ok(())
 }
 
-/// Displays or sets time maps for the vote (0 for no timeout)
-#[poise::command(slash_command, prefix_command, rename = "map_vote_time")]
-async fn configure_map_vote_time(
+// Displays or adds role combinations
+#[poise::command(slash_command, prefix_command, rename = "role_combinations")]
+async fn configure_role_combinations(
     ctx: Context<'_>,
-    #[description = "Queue to change"] queue: String,
-    #[description = "New value"]
+    #[description = "Role combinations"] role_combinations: Option<String>,
+    #[description = "Queue index"]
     #[min = 0]
-    new_value: Option<u32>,
+    queue_idx: Option<u32>,
 ) -> Result<(), Error> {
-    let queue_uuid: QueueUuid = QueueUuid(Uuid::parse_str(&queue.as_str())?);
-    //ensure queue is part of server
-    if !ctx
-        .data()
-        .guild_data
-        .lock()
-        .unwrap()
-        .get(&ctx.guild_id().unwrap())
-        .unwrap()
-        .queues
-        .contains(&queue_uuid)
-    {
-        ctx.send(
-            CreateReply::default()
-                .content(format!(
-                    "Queue id {} is not part of this server",
-                    queue_uuid.0
-                ))
-                .ephemeral(true),
-        )
-        .await?;
-    }
-    let response = if let Some(new_value) = new_value {
-        let mut data_lock = ctx.data().configuration.get_mut(&queue_uuid).unwrap();
-        data_lock.map_vote_time = new_value;
-        format!("Map vote time set to {}", new_value)
-    } else {
-        let data_lock = ctx.data().configuration.get(&queue_uuid).unwrap();
-        format!("Map vote time is currently {}", data_lock.map_vote_time)
+    let queue_uuid = match get_queue_uuid(&ctx, queue_idx) {
+        Ok(queue_uuid) => queue_uuid,
+        Err(error) => {
+            ctx.send(CreateReply::default().content(error).ephemeral(true))
+                .await?;
+            return Ok(());
+        }
     };
-    ctx.send(CreateReply::default().content(response).ephemeral(true))
-        .await?;
-    Ok(())
-}
-
-/// Displays or sets number of maps for the vote
-#[poise::command(slash_command, prefix_command, rename = "maximum_queue_cost")]
-async fn configure_maximum_queue_cost(
-    ctx: Context<'_>,
-    #[description = "Queue to change"] queue: String,
-    #[description = "New value"] new_value: Option<f32>,
-) -> Result<(), Error> {
-    let queue_uuid: QueueUuid = QueueUuid(Uuid::parse_str(&queue.as_str())?);
-    //ensure queue is part of server
-    if !ctx
-        .data()
-        .guild_data
-        .lock()
-        .unwrap()
-        .get(&ctx.guild_id().unwrap())
-        .unwrap()
-        .queues
-        .contains(&queue_uuid)
-    {
-        ctx.send(
-            CreateReply::default()
-                .content(format!(
-                    "Queue id {} is not part of this server",
-                    queue_uuid.0
-                ))
-                .ephemeral(true),
-        )
-        .await?;
-    }
-    let response = if let Some(new_value) = new_value {
+    let response = if let Some(role_combinations) = role_combinations {
+        let Ok(role_combinations) = serde_json::from_str::<Vec<(Vec<String>, f32)>>(&role_combinations.as_str()) else {
+            ctx.send(CreateReply::default().content("Invalid combinations").ephemeral(true))
+                .await?;
+            return Ok(())
+        };
         let mut data_lock = ctx.data().configuration.get_mut(&queue_uuid).unwrap();
-        data_lock.maximum_queue_cost = new_value;
-        format!("Max queue cost set to {}", new_value)
+        data_lock.role_combinations = role_combinations;
+        format!(
+            "Role combinations updated to:\n{}",
+            data_lock
+                .role_combinations
+                .iter()
+                .map(|(combination, cost)| format!("{:?} - {}", combination, cost))
+                .join("\n")
+        )
     } else {
         let data_lock = ctx.data().configuration.get(&queue_uuid).unwrap();
         format!(
-            "Max queue cost is currently {}",
-            data_lock.maximum_queue_cost
+            "Role combinations:\n{}",
+            data_lock
+                .role_combinations
+                .iter()
+                .map(|(combination, cost)| format!("{:?} - {}", combination, cost))
+                .join("\n")
         )
     };
     ctx.send(CreateReply::default().content(response).ephemeral(true))
@@ -405,33 +376,21 @@ async fn configure_maximum_queue_cost(
 #[poise::command(slash_command, prefix_command, rename = "post_match_channel")]
 async fn configure_post_match_channel(
     ctx: Context<'_>,
-    #[description = "Queue to change"] queue: String,
     #[description = "Post match channel"]
     #[channel_types("Voice")]
     new_value: Option<serenity::Channel>,
+    #[description = "Queue index"]
+    #[min = 0]
+    queue_idx: Option<u32>,
 ) -> Result<(), Error> {
-    let queue_uuid: QueueUuid = QueueUuid(Uuid::parse_str(&queue.as_str())?);
-    //ensure queue is part of server
-    if !ctx
-        .data()
-        .guild_data
-        .lock()
-        .unwrap()
-        .get(&ctx.guild_id().unwrap())
-        .unwrap()
-        .queues
-        .contains(&queue_uuid)
-    {
-        ctx.send(
-            CreateReply::default()
-                .content(format!(
-                    "Queue id {} is not part of this server",
-                    queue_uuid.0
-                ))
-                .ephemeral(true),
-        )
-        .await?;
-    }
+    let queue_uuid = match get_queue_uuid(&ctx, queue_idx) {
+        Ok(queue_uuid) => queue_uuid,
+        Err(error) => {
+            ctx.send(CreateReply::default().content(error).ephemeral(true))
+                .await?;
+            return Ok(());
+        }
+    };
     let response = if let Some(new_value) = new_value {
         let mut data_lock = ctx.data().configuration.get_mut(&queue_uuid).unwrap();
         data_lock.post_match_channel = Some(new_value.id());
@@ -452,37 +411,25 @@ async fn configure_post_match_channel(
     Ok(())
 }
 
-/// Sets the channel to move members to after the end of the game
+/// Sets the channel to send logs of moderation actions to
 #[poise::command(slash_command, prefix_command, rename = "audit_channel")]
 async fn configure_audit_channel(
     ctx: Context<'_>,
-    #[description = "Queue to change"] queue: String,
     #[description = "Audit channel"]
     #[channel_types("Text")]
     new_value: Option<serenity::Channel>,
+    #[description = "Queue index"]
+    #[min = 0]
+    queue_idx: Option<u32>,
 ) -> Result<(), Error> {
-    let queue_uuid: QueueUuid = QueueUuid(Uuid::parse_str(&queue.as_str())?);
-    //ensure queue is part of server
-    if !ctx
-        .data()
-        .guild_data
-        .lock()
-        .unwrap()
-        .get(&ctx.guild_id().unwrap())
-        .unwrap()
-        .queues
-        .contains(&queue_uuid)
-    {
-        ctx.send(
-            CreateReply::default()
-                .content(format!(
-                    "Queue id {} is not part of this server",
-                    queue_uuid.0
-                ))
-                .ephemeral(true),
-        )
-        .await?;
-    }
+    let queue_uuid = match get_queue_uuid(&ctx, queue_idx) {
+        Ok(queue_uuid) => queue_uuid,
+        Err(error) => {
+            ctx.send(CreateReply::default().content(error).ephemeral(true))
+                .await?;
+            return Ok(());
+        }
+    };
     let response = if let Some(new_value) = new_value {
         let mut data_lock = ctx.data().configuration.get_mut(&queue_uuid).unwrap();
         data_lock.audit_channel = Some(new_value.id());
@@ -507,32 +454,19 @@ async fn configure_audit_channel(
 #[poise::command(slash_command, prefix_command, rename = "register_role")]
 async fn configure_register_role(
     ctx: Context<'_>,
-    #[description = "Queue to change"] queue: String,
-    #[description = "Register role"]
-    new_value: Option<serenity::RoleId>,
+    #[description = "Register role"] new_value: Option<serenity::RoleId>,
+    #[description = "Queue index"]
+    #[min = 0]
+    queue_idx: Option<u32>,
 ) -> Result<(), Error> {
-    let queue_uuid: QueueUuid = QueueUuid(Uuid::parse_str(&queue.as_str())?);
-    //ensure queue is part of server
-    if !ctx
-        .data()
-        .guild_data
-        .lock()
-        .unwrap()
-        .get(&ctx.guild_id().unwrap())
-        .unwrap()
-        .queues
-        .contains(&queue_uuid)
-    {
-        ctx.send(
-            CreateReply::default()
-                .content(format!(
-                    "Queue id {} is not part of this server",
-                    queue_uuid.0
-                ))
-                .ephemeral(true),
-        )
-        .await?;
-    }
+    let queue_uuid = match get_queue_uuid(&ctx, queue_idx) {
+        Ok(queue_uuid) => queue_uuid,
+        Err(error) => {
+            ctx.send(CreateReply::default().content(error).ephemeral(true))
+                .await?;
+            return Ok(());
+        }
+    };
     let response = if let Some(new_value) = new_value {
         let mut data_lock = ctx.data().configuration.get_mut(&queue_uuid).unwrap();
         data_lock.register_role = Some(new_value);
@@ -557,31 +491,19 @@ async fn configure_register_role(
 #[poise::command(slash_command, prefix_command, rename = "log_chats")]
 async fn configure_log_chats(
     ctx: Context<'_>,
-    #[description = "Queue to change"] queue: String,
     #[description = "Log chats"] new_value: Option<bool>,
+    #[description = "Queue index"]
+    #[min = 0]
+    queue_idx: Option<u32>,
 ) -> Result<(), Error> {
-    let queue_uuid: QueueUuid = QueueUuid(Uuid::parse_str(&queue.as_str())?);
-    //ensure queue is part of server
-    if !ctx
-        .data()
-        .guild_data
-        .lock()
-        .unwrap()
-        .get(&ctx.guild_id().unwrap())
-        .unwrap()
-        .queues
-        .contains(&queue_uuid)
-    {
-        ctx.send(
-            CreateReply::default()
-                .content(format!(
-                    "Queue id {} is not part of this server",
-                    queue_uuid.0
-                ))
-                .ephemeral(true),
-        )
-        .await?;
-    }
+    let queue_uuid = match get_queue_uuid(&ctx, queue_idx) {
+        Ok(queue_uuid) => queue_uuid,
+        Err(error) => {
+            ctx.send(CreateReply::default().content(error).ephemeral(true))
+                .await?;
+            return Ok(());
+        }
+    };
     let response = if let Some(new_value) = new_value {
         let mut data_lock = ctx.data().configuration.get_mut(&queue_uuid).unwrap();
         data_lock.log_chats = new_value;
@@ -599,33 +521,21 @@ async fn configure_log_chats(
 #[poise::command(slash_command, prefix_command, rename = "visability_override_roles")]
 async fn configure_visability_override_roles(
     ctx: Context<'_>,
-    #[description = "Queue to change"] queue: String,
     #[flag] remove: bool,
     #[description = "Override role"] channel: Option<serenity::RoleId>,
+    #[description = "Queue index"]
+    #[min = 0]
+    queue_idx: Option<u32>,
 ) -> Result<(), Error> {
-    let response = {
-        let queue_uuid: QueueUuid = QueueUuid(Uuid::parse_str(&queue.as_str())?);
-        //ensure queue is part of server
-        if !ctx
-            .data()
-            .guild_data
-            .lock()
-            .unwrap()
-            .get(&ctx.guild_id().unwrap())
-            .unwrap()
-            .queues
-            .contains(&queue_uuid)
-        {
-            ctx.send(
-                CreateReply::default()
-                    .content(format!(
-                        "Queue id {} is not part of this server",
-                        queue_uuid.0
-                    ))
-                    .ephemeral(true),
-            )
-            .await?;
+    let queue_uuid = match get_queue_uuid(&ctx, queue_idx) {
+        Ok(queue_uuid) => queue_uuid,
+        Err(error) => {
+            ctx.send(CreateReply::default().content(error).ephemeral(true))
+                .await?;
+            return Ok(());
         }
+    };
+    let response = {
         let mut data_lock = ctx.data().configuration.get_mut(&queue_uuid).unwrap();
         if let Some(value) = channel {
             if remove {
@@ -660,15 +570,18 @@ async fn configure_visability_override_roles(
     prefix_command,
     default_member_permissions = "MANAGE_CHANNELS",
     subcommands(
-        "configure_team_size",
+        "ConfigurationModifiers::configure_team_size",
+        "ConfigurationModifiers::configure_team_count",
         "configure_queue_category",
         "configure_queue_channels",
-        "configure_team_count",
         "configure_post_match_channel",
         "configure_maps",
-        "configure_map_vote_count",
-        "configure_map_vote_time",
-        "configure_maximum_queue_cost",
+        "configure_roles",
+        "configure_role_combinations",
+        "ConfigurationModifiers::configure_map_vote_count",
+        "ConfigurationModifiers::configure_map_vote_time",
+        "ConfigurationModifiers::configure_maximum_queue_cost",
+        "ConfigurationModifiers::configure_incorrect_roles_cost",
         "configure_register_role",
         "configure_audit_channel",
         "configure_log_chats",
@@ -685,21 +598,36 @@ pub async fn configure(_: Context<'_>) -> Result<(), Error> {
     prefix_command,
     default_member_permissions = "MANAGE_CHANNELS"
 )]
-pub async fn create_queue(
-    ctx: Context<'_>,
-) -> Result<(), Error> {
+pub async fn create_queue(ctx: Context<'_>) -> Result<(), Error> {
     let queue_uuid: QueueUuid = QueueUuid::new();
-    ctx.data().configuration.insert(queue_uuid, QueueConfiguration::default());
-    ctx.data().current_games.insert(queue_uuid, HashSet::default());
-    ctx.data().is_matchmaking.insert(queue_uuid, Option::default());
-    ctx.data().leaver_data.insert(queue_uuid, HashMap::default());
-    ctx.data().message_edit_notify.insert(queue_uuid, Arc::new(Notify::new()));
+    ctx.data()
+        .configuration
+        .insert(queue_uuid, QueueConfiguration::default());
+    ctx.data()
+        .current_games
+        .insert(queue_uuid, HashSet::default());
+    ctx.data()
+        .is_matchmaking
+        .insert(queue_uuid, Option::default());
+    ctx.data()
+        .leaver_data
+        .insert(queue_uuid, HashMap::default());
+    ctx.data()
+        .message_edit_notify
+        .insert(queue_uuid, Arc::new(Notify::new()));
     ctx.data().player_bans.insert(queue_uuid, HashMap::new());
     ctx.data().player_data.insert(queue_uuid, HashMap::new());
     ctx.data().queue_idx.insert(queue_uuid, 0);
     ctx.data().queued_players.insert(queue_uuid, HashSet::new());
 
-    ctx.data().guild_data.lock().unwrap().entry(ctx.guild_id().unwrap()).or_default().queues.push(queue_uuid);
+    ctx.data()
+        .guild_data
+        .lock()
+        .unwrap()
+        .entry(ctx.guild_id().unwrap())
+        .or_default()
+        .queues
+        .push(queue_uuid);
     //ensure queue is part of server
     let response = format!("Created new queue with uuid: `{}`", queue_uuid.0);
     ctx.send(CreateReply::default().content(response).ephemeral(true))
@@ -715,31 +643,19 @@ pub async fn create_queue(
 )]
 pub async fn import_config(
     ctx: Context<'_>,
-    #[description = "Queue to change"] queue: String,
     #[description = "New config"] new_config: String,
+    #[description = "Queue index"]
+    #[min = 0]
+    queue_idx: Option<u32>,
 ) -> Result<(), Error> {
-    let queue_uuid: QueueUuid = QueueUuid(Uuid::parse_str(&queue.as_str())?);
-    //ensure queue is part of server
-    if !ctx
-        .data()
-        .guild_data
-        .lock()
-        .unwrap()
-        .get(&ctx.guild_id().unwrap())
-        .unwrap()
-        .queues
-        .contains(&queue_uuid)
-    {
-        ctx.send(
-            CreateReply::default()
-                .content(format!(
-                    "Queue id {} is not part of this server",
-                    queue_uuid.0
-                ))
-                .ephemeral(true),
-        )
-        .await?;
-    }
+    let queue_uuid = match get_queue_uuid(&ctx, queue_idx) {
+        Ok(queue_uuid) => queue_uuid,
+        Err(error) => {
+            ctx.send(CreateReply::default().content(error).ephemeral(true))
+                .await?;
+            return Ok(());
+        }
+    };
     let new_config: QueueConfiguration = serde_json::from_str(&new_config.as_str())?;
     *ctx.data().configuration.get_mut(&queue_uuid).unwrap() = new_config;
     let config = serde_json::to_string_pretty(ctx.data())?;
@@ -753,30 +669,18 @@ pub async fn import_config(
 #[poise::command(slash_command, prefix_command)]
 pub async fn export_config(
     ctx: Context<'_>,
-    #[description = "Queue to change"] queue: String,
+    #[description = "Queue index"]
+    #[min = 0]
+    queue_idx: Option<u32>,
 ) -> Result<(), Error> {
-    let queue_uuid: QueueUuid = QueueUuid(Uuid::parse_str(&queue.as_str())?);
-    //ensure queue is part of server
-    if !ctx
-        .data()
-        .guild_data
-        .lock()
-        .unwrap()
-        .get(&ctx.guild_id().unwrap())
-        .unwrap()
-        .queues
-        .contains(&queue_uuid)
-    {
-        ctx.send(
-            CreateReply::default()
-                .content(format!(
-                    "Queue id {} is not part of this server",
-                    queue_uuid.0
-                ))
-                .ephemeral(true),
-        )
-        .await?;
-    }
+    let queue_uuid = match get_queue_uuid(&ctx, queue_idx) {
+        Ok(queue_uuid) => queue_uuid,
+        Err(error) => {
+            ctx.send(CreateReply::default().content(error).ephemeral(true))
+                .await?;
+            return Ok(());
+        }
+    };
     let config =
         serde_json::to_string_pretty(&ctx.data().configuration.get(&queue_uuid).unwrap().clone())?;
     let response = format!("Configuration: ```json\n{}\n```", config);

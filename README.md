@@ -22,8 +22,10 @@ Configurable parameters:
 * Voice channel to move players to after game conclusion
 * Maps & map voting
 * Number of maps for a map vote
-* Parameters for skill based matchmaking
+* Parameters for skill based matchmaking (configurable per player)
 * Region based matchmaking(based on discord role)
+* Roles players can queue with
+* Valid role combinations for a queue
 
 ## Future plans
 
@@ -44,4 +46,18 @@ This bot is currently under testing by the Overwatch [6v6 Adjustments](https://g
 
 ## How to setup bot for your discord server
 
-* TODO
+Note: You will need the manage channels permission to run config commands
+
+* Use `/create_queue` to generate a queue on your server
+* Use `/configure` subcommands to change parameters
+* Use `/create_register_message` to create a message that allows players to set their mmr
+    * By default players can use this to set their mmr *at any time* which is likely not what you want.
+    * This can also be configured to give a role via `/configure register_role`. This role in turn can be used to give access to queue channels and removes access from the register channel.
+    * TODO: Document format
+* Use `/create_queue_message` to create a message that allows people to join and leave queue
+    * You can also use `/configure queue_channels` to set voice channels that queue people
+    * Or players can queue with `/queue` and `/leave_queue`
+* Use `/create_roles_message` to create a message that allows players to configure their queue roles
+    * TODO: Document how to set up roles
+
+
