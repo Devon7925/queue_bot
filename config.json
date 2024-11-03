@@ -1,1 +1,258 @@
-{}
+{
+    "global_player_data": {},
+    "match_channels": {},
+    "match_data": {},
+    "group_data": {},
+    "guild_data": {
+        "1193287684978905139": {
+            "queues": [
+                "23de9354-51d4-41b9-a502-7e453cef0a46"
+            ]
+        },
+        "1269122202121273498": {
+            "queues": [
+                "926758e5-f816-4f0e-b304-7d6179b16753"
+            ]
+        }
+    },
+    "configuration": {
+        "926758e5-f816-4f0e-b304-7d6179b16753": {
+            "team_size": 6,
+            "team_count": 2,
+            "category": "1269161295022919773",
+            "queue_channels": [
+                "1269326057224536115"
+            ],
+            "visability_override_roles": [],
+            "post_match_channel": null,
+            "queue_messages": [],
+            "register_messages": [],
+            "audit_channel": null,
+            "maps": [],
+            "map_vote_count": 0,
+            "map_vote_time": 0,
+            "leaver_verification_time": 30,
+            "default_player_data": {
+                "rating": {
+                    "rating": 25.0,
+                    "uncertainty": 8.333333333333334
+                },
+                "player_queueing_config": {
+                    "cost_per_avg_mmr_differential": 0.04,
+                    "acceptable_mmr_differential": 50.0,
+                    "cost_per_mmr_std_differential": 1.0,
+                    "acceptable_mmr_std_differential": 2.0,
+                    "cost_per_mmr_range": 0.02,
+                    "acceptable_mmr_range": 300.0,
+                    "new_lobby_host_cost": 5.0,
+                    "wrong_game_category_cost": {},
+                    "active_roles": [
+                        "main_tank",
+                        "off_tank",
+                        "damage",
+                        "flex_support",
+                        "main_support"
+                    ]
+                }
+            },
+            "maximum_queue_cost": 50.0,
+            "game_categories": {},
+            "log_chats": true,
+            "max_lobby_keep_time": 900,
+            "roles": [
+                {
+                    "id": "main_tank",
+                    "name": "Main Tank",
+                    "description": "Reinhardt, Winston, etc."
+                },
+                {
+                    "id": "off_tank",
+                    "name": "Off Tank",
+                    "description": "Zarya, D.Va, Sigma, etc."
+                },
+                {
+                    "id": "damage",
+                    "name": "Damage",
+                    "description": "All damage heroes"
+                },
+                {
+                    "id": "flex_support",
+                    "name": "Flex Support",
+                    "description": "Ana, Baptiste, Moira, etc."
+                },
+                {
+                    "id": "main_support",
+                    "name": "Main Support",
+                    "description": "Lucio, Mercy, Brig, etc."
+                }
+            ],
+            "role_combinations": [
+                [["main_tank", "off_tank", "damage", "damage", "main_support", "flex_support"], 0.0],
+                [["main_tank", "main_tank", "damage", "damage", "main_support", "flex_support"], 2.0],
+                [["off_tank", "off_tank", "damage", "damage", "main_support", "flex_support"], 2.0],
+                [["main_tank", "off_tank", "damage", "damage", "flex_support", "flex_support"], 2.0],
+                [["main_tank", "off_tank", "damage", "damage", "main_support", "main_support"], 3.0],
+                [["off_tank", "off_tank", "damage", "damage", "main_support", "main_support"], 3.0],
+                [["off_tank", "off_tank", "damage", "damage", "flex_support", "flex_support"], 3.0],
+                [["main_tank", "main_tank", "damage", "damage", "flex_support", "flex_support"], 3.0],
+                [["main_tank", "main_tank", "damage", "damage", "main_support", "main_support"], 6.0]
+            ]
+        },
+        "23de9354-51d4-41b9-a502-7e453cef0a46": {
+            "team_size": 6,
+            "team_count": 2,
+            "category": "1270231681626017863",
+            "queue_channels": [
+                "1271643772811345960",
+                "1271555892478738582"
+            ],
+            "visability_override_roles": [
+                "1264743322862223400",
+                "1193325979859419207"
+            ],
+            "post_match_channel": "1272438262212067365",
+            "queue_messages": [
+                [
+                    "1271623762760175759",
+                    "1271636922833440770"
+                ]
+            ],
+            "register_messages": [],
+            "audit_channel": "1268326013209677845",
+            "maps": [
+                "New Junk City",
+                "Numbani",
+                "Runasapi",
+                "Shambali Monastery",
+                "Watchpoint: Gibraltar",
+                "Midtown",
+                "Hollywood",
+                "Havana",
+                "Blizzard World",
+                "Paraíso",
+                "Lijiang Tower",
+                "Circuit Royal",
+                "Busan",
+                "Nepal",
+                "Ilios",
+                "Route 66",
+                "King's Row",
+                "New Queen Street",
+                "Suravasa",
+                "Colosseo",
+                "Oasis",
+                "Samoa",
+                "Dorado",
+                "Esperança",
+                "Junkertown",
+                "Antarctic Peninsula",
+                "Rialto",
+                "Eichenwalde"
+            ],
+            "map_vote_count": 2,
+            "map_vote_time": 45,
+            "leaver_verification_time": 30,
+            "default_player_data": {
+                "rating": {
+                    "rating": 25.0,
+                    "uncertainty": 8.333333333333334
+                },
+                "player_queueing_config": {
+                    "cost_per_avg_mmr_differential": 4.0,
+                    "acceptable_mmr_differential": 1.0,
+                    "cost_per_mmr_std_differential": 1.0,
+                    "acceptable_mmr_std_differential": 2.0,
+                    "cost_per_mmr_range": 2.0,
+                    "acceptable_mmr_range": 3.0,
+                    "new_lobby_host_cost": 5.0,
+                    "wrong_game_category_cost": {
+                        "Region": 10.0
+                    },
+                    "active_roles": [
+                        "main_tank",
+                        "off_tank",
+                        "damage",
+                        "flex_support",
+                        "main_support"
+                    ]
+                }
+            },
+            "maximum_queue_cost": 50.0,
+            "game_categories": {
+                "Region": [
+                    "1193629712879206420",
+                    "1193629742449049690",
+                    "1193629758999769228"
+                ]
+            },
+            "log_chats": true,
+            "max_lobby_keep_time": 900,
+            "roles": [
+                {
+                    "id": "main_tank",
+                    "name": "Main Tank",
+                    "description": "Reinhardt, Winston, etc."
+                },
+                {
+                    "id": "off_tank",
+                    "name": "Off Tank",
+                    "description": "Zarya, D.Va, Sigma, etc."
+                },
+                {
+                    "id": "damage",
+                    "name": "Damage",
+                    "description": "All damage heroes"
+                },
+                {
+                    "id": "flex_support",
+                    "name": "Flex Support",
+                    "description": "Ana, Baptiste, Moira, etc."
+                },
+                {
+                    "id": "main_support",
+                    "name": "Main Support",
+                    "description": "Lucio, Mercy, Brig, etc."
+                }
+            ],
+            "role_combinations": [
+                [["main_tank", "off_tank", "damage", "damage", "main_support", "flex_support"], 0.0],
+                [["main_tank", "main_tank", "damage", "damage", "main_support", "flex_support"], 2.0],
+                [["off_tank", "off_tank", "damage", "damage", "main_support", "flex_support"], 2.0],
+                [["main_tank", "off_tank", "damage", "damage", "flex_support", "flex_support"], 2.0],
+                [["main_tank", "off_tank", "damage", "damage", "main_support", "main_support"], 3.0],
+                [["off_tank", "off_tank", "damage", "damage", "main_support", "main_support"], 3.0],
+                [["off_tank", "off_tank", "damage", "damage", "flex_support", "flex_support"], 3.0],
+                [["main_tank", "main_tank", "damage", "damage", "flex_support", "flex_support"], 3.0],
+                [["main_tank", "main_tank", "damage", "damage", "main_support", "main_support"], 6.0]
+            ]
+        }
+    },
+    "queued_players": {
+        "926758e5-f816-4f0e-b304-7d6179b16753": [],
+        "23de9354-51d4-41b9-a502-7e453cef0a46": []
+    },
+    "current_games": {
+        "23de9354-51d4-41b9-a502-7e453cef0a46": [],
+        "926758e5-f816-4f0e-b304-7d6179b16753": []
+    },
+    "queue_idx": {
+        "23de9354-51d4-41b9-a502-7e453cef0a46": 0,
+        "926758e5-f816-4f0e-b304-7d6179b16753": 0
+    },
+    "player_bans": {
+        "926758e5-f816-4f0e-b304-7d6179b16753": {},
+        "23de9354-51d4-41b9-a502-7e453cef0a46": {}
+    },
+    "leaver_data": {
+        "23de9354-51d4-41b9-a502-7e453cef0a46": {},
+        "926758e5-f816-4f0e-b304-7d6179b16753": {}
+    },
+    "player_data": {
+        "23de9354-51d4-41b9-a502-7e453cef0a46": {},
+        "926758e5-f816-4f0e-b304-7d6179b16753": {}
+    },
+    "is_matchmaking": {
+        "23de9354-51d4-41b9-a502-7e453cef0a46": null,
+        "926758e5-f816-4f0e-b304-7d6179b16753": null
+    }
+  }

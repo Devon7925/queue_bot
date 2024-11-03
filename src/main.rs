@@ -13,17 +13,23 @@ use std::{
 };
 
 use admin_commands::{
-    create_queue_message, create_register_message, force_outcome, list_leavers, manage_player,
-    register,
+    create_queue_message, create_register_message, create_roles_message, force_outcome,
+    list_leavers, manage_player, register,
 };
 use chrono::{DateTime, Utc};
 use configure_command::{configure, create_queue, export_config, import_config};
 use dashmap::DashMap;
+use hopcroft_karp::matching;
 use itertools::{Itertools, MinMaxResult};
 use player_config_commands::player_config;
 use poise::{
     serenity_prelude::{
-        self as serenity, futures::future, Builder, CacheHttp, ChannelId, ChannelType, ComponentInteraction, CreateActionRow, CreateAllowedMentions, CreateButton, CreateChannel, CreateInteractionResponse, CreateInteractionResponseMessage, CreateMessage, EditInteractionResponse, EditMember, EditMessage, GuildId, Http, Mentionable, MessageId, PermissionOverwrite, PermissionOverwriteType, Permissions, RoleId, UserId, VoiceState
+        self as serenity, futures::future, Builder, CacheHttp, ChannelId, ChannelType,
+        ComponentInteraction, ComponentInteractionDataKind, CreateActionRow, CreateAllowedMentions,
+        CreateButton, CreateChannel, CreateInteractionResponse, CreateInteractionResponseMessage,
+        CreateMessage, EditInteractionResponse, EditMember, EditMessage, GuildId, Http,
+        Mentionable, MessageId, PermissionOverwrite, PermissionOverwriteType, Permissions, RoleId,
+        UserId, VoiceState,
     },
     CreateReply,
 };
@@ -165,6 +171,20 @@ enum VoteType {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
+struct RoleConfiguration {
+    id: String,
+    name: String,
+    description: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+enum QueueMessageType {
+    Queue,
+    Roles,
+    Register,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
 struct QueueConfiguration {
     team_size: u32,
     team_count: u32,
@@ -172,8 +192,7 @@ struct QueueConfiguration {
     queue_channels: HashSet<ChannelId>,
     visability_override_roles: HashSet<RoleId>,
     post_match_channel: Option<ChannelId>,
-    queue_messages: Vec<(ChannelId, MessageId)>,
-    register_messages: Vec<(ChannelId, MessageId)>,
+    queue_messages: Vec<(ChannelId, MessageId, QueueMessageType)>,
     register_role: Option<RoleId>,
     audit_channel: Option<ChannelId>,
     maps: HashSet<String>,
@@ -183,6 +202,8 @@ struct QueueConfiguration {
     default_player_data: PlayerData,
     maximum_queue_cost: f32,
     game_categories: HashMap<String, Vec<RoleId>>,
+    roles: Vec<RoleConfiguration>,
+    role_combinations: Vec<(Vec<String>, f32)>,
     log_chats: bool,
     max_lobby_keep_time: u64,
 }
@@ -197,7 +218,6 @@ impl Default for QueueConfiguration {
             visability_override_roles: HashSet::new(),
             post_match_channel: None,
             queue_messages: vec![],
-            register_messages: vec![],
             register_role: None,
             audit_channel: None,
             maps: HashSet::new(),
@@ -207,6 +227,8 @@ impl Default for QueueConfiguration {
             default_player_data: PlayerData::default(),
             maximum_queue_cost: 50.0,
             game_categories: HashMap::new(),
+            roles: vec![],
+            role_combinations: vec![],
             log_chats: true,
             max_lobby_keep_time: 15 * 60,
         }
@@ -258,6 +280,7 @@ struct PlayerQueueingConfig {
     acceptable_mmr_range: f32,
     new_lobby_host_cost: f32,
     wrong_game_category_cost: HashMap<String, f32>,
+    active_roles: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -270,6 +293,7 @@ struct DerivedPlayerQueueingConfig {
     acceptable_mmr_range: Option<f32>,
     new_lobby_host_cost: Option<f32>,
     wrong_game_category_cost: Option<HashMap<String, f32>>,
+    active_roles: Option<Vec<String>>,
 }
 
 impl DerivedPlayerQueueingConfig {
@@ -298,6 +322,10 @@ impl DerivedPlayerQueueingConfig {
                 .wrong_game_category_cost
                 .clone()
                 .unwrap_or(base.wrong_game_category_cost.clone()),
+            active_roles: self
+                .active_roles
+                .clone()
+                .unwrap_or(base.active_roles.clone()),
         }
     }
 }
@@ -313,6 +341,7 @@ impl Default for DerivedPlayerQueueingConfig {
             acceptable_mmr_range: None,
             new_lobby_host_cost: None,
             wrong_game_category_cost: None,
+            active_roles: None,
         }
     }
 }
@@ -336,6 +365,7 @@ impl Default for PlayerData {
                 acceptable_mmr_range: 3.0,
                 new_lobby_host_cost: 5.0,
                 wrong_game_category_cost: HashMap::new(),
+                active_roles: vec![],
             },
         }
     }
@@ -433,9 +463,7 @@ async fn try_queue_player(
 ) -> Result<(), String> {
     {
         let mut player_data = data.player_data.get_mut(&queue_id).unwrap();
-        player_data
-            .entry(user_id)
-            .or_insert(DerivedPlayerData::default());
+        player_data.entry(user_id).or_default();
     }
     if matches!(
         data.global_player_data
@@ -474,7 +502,7 @@ async fn try_queue_player(
             .len()
             > 0
         {
-            return Err("Cannot queue while your party has pending invites!".to_string());
+            return Err("Cannot queue while your party has pending invites! Do `/party leave` to exit party.".to_string());
         }
     }
     for queue in data
@@ -485,8 +513,9 @@ async fn try_queue_player(
         .unwrap()
         .queues
         .iter()
+        .cloned()
     {
-        update_bans(data.clone(), queue);
+        update_bans(data.clone(), &queue);
     }
     let game_categories = {
         let config = data.configuration.get(&queue_id).unwrap();
@@ -527,15 +556,18 @@ async fn try_queue_player(
         }
     }
     let queue_enter_time = chrono::offset::Utc::now();
+    {
+        let mut queued_players = data.queued_players.get_mut(&queue_id).unwrap();
+        queued_players.insert(user_id);
+    }
     let party_id = {
         let mut global_player_data = data.global_player_data.lock().unwrap();
-        let mut queued_players = data.queued_players.get_mut(&queue_id).unwrap();
         let global_player_data = global_player_data
             .entry(user_id)
             .or_insert(GlobalPlayerData::default());
 
         global_player_data.queue_enter_time = Some(queue_enter_time.clone());
-        queued_players.insert(user_id);
+        global_player_data.queue_state = QueueState::Queued;
 
         global_player_data.party
     };
@@ -549,7 +581,10 @@ async fn try_queue_player(
                 .get(&party)
                 .unwrap()
                 .players
-                .clone();
+                .iter()
+                .filter(|id| **id != user_id)
+                .cloned()
+                .collect::<Vec<_>>();
 
             future::join_all(party_members.iter().map(|group_member_id| {
                 try_queue_player(
@@ -669,18 +704,13 @@ async fn ensure_wants_queue(
             else {
                 return;
             };
-            data.queued_players
-                .get_mut(&queue_id)
-                .unwrap()
-                .remove(&user);
-            data.message_edit_notify
-                .get(&queue_id)
-                .unwrap()
-                .notify_one();
+            player_leave_queue(data.clone(), user, true, &queue_id);
             message
                 .edit(
                     ctx1.clone(),
-                    EditMessage::new().content("Removed from queue for inactivity."),
+                    EditMessage::new()
+                        .content("Removed from queue for inactivity.")
+                        .components(vec![]),
                 )
                 .await
                 .ok();
@@ -720,40 +750,25 @@ async fn handler(
         }
         serenity::FullEvent::VoiceStateUpdate { old, new } => {
             let mut queues_player_added_to = vec![];
+            if let Some(VoiceState {
+                guild_id: Some(guild_id),
+                channel_id: Some(channel_id),
+                user_id,
+                ..
+            }) = old
             {
-                if let Some(VoiceState {
-                    guild_id: Some(guild_id),
-                    channel_id: Some(channel_id),
-                    user_id,
-                    ..
-                }) = old
+                for queue in data
+                    .guild_data
+                    .lock()
+                    .unwrap()
+                    .entry(guild_id.clone())
+                    .or_default()
+                    .queues
+                    .clone()
                 {
-                    for queue in data
-                        .guild_data
-                        .lock()
-                        .unwrap()
-                        .entry(guild_id.clone())
-                        .or_default()
-                        .queues
-                        .clone()
-                    {
-                        let config = data.configuration.get(&queue).unwrap().clone();
-                        if config.queue_channels.contains(&channel_id) {
-                            {
-                                let mut player_data = data.global_player_data.lock().unwrap();
-                                let mut queued_players =
-                                    data.queued_players.get_mut(&queue).unwrap();
-                                player_data
-                                    .entry(new.user_id)
-                                    .or_insert(GlobalPlayerData::default())
-                                    .queue_enter_time = None;
-                                queued_players.remove(user_id);
-                            }
-                            data.message_edit_notify
-                                .get_mut(&queue)
-                                .unwrap()
-                                .notify_one();
-                        }
+                    let config = data.configuration.get(&queue).unwrap().clone();
+                    if config.queue_channels.contains(&channel_id) {
+                        player_leave_queue(data.clone(), user_id.clone(), true, &queue);
                     }
                 }
             }
@@ -1119,6 +1134,28 @@ async fn handler(
                 }
                 if let Some(party_id) = message_component.data.custom_id.strip_prefix("join_party_")
                 {
+                    if let Err(e) = {
+                        let mut player_data = data.global_player_data.lock().unwrap();
+                        let player_data = player_data
+                            .entry(message_component.user.id)
+                            .or_insert(GlobalPlayerData::default());
+                        match player_data.queue_state {
+                            QueueState::None => Ok(()),
+                            QueueState::Queued => Err("Cannot join party while queued!"),
+                            QueueState::InGame => Err("Cannot join party while in game!"),
+                        }
+                    } {
+                        message_component
+                            .create_response(
+                                ctx,
+                                serenity::CreateInteractionResponse::Message(
+                                    CreateInteractionResponseMessage::new()
+                                        .content(format!("{}", e)),
+                                ),
+                            )
+                            .await?;
+                        return Ok(());
+                    }
                     let party_uuid = serde_json::from_str::<GroupUuid>(party_id).unwrap();
                     let group_members = 'group_members: {
                         let mut group_data = data.group_data.lock().unwrap();
@@ -1297,29 +1334,7 @@ async fn handler(
                     return Ok(());
                 }
                 if message_component.data.custom_id == "queue" {
-                    let queues = data
-                        .guild_data
-                        .lock()
-                        .unwrap()
-                        .entry(message_component.guild_id.unwrap())
-                        .or_default()
-                        .queues
-                        .clone();
-                    let Some(queue) = queues
-                        .iter()
-                        .filter(|queue| {
-                            data.clone()
-                                .configuration
-                                .get(&queue)
-                                .unwrap()
-                                .queue_messages
-                                .contains(&(
-                                    message_component.channel.clone().unwrap().id,
-                                    message_component.message.id,
-                                ))
-                        })
-                        .last()
-                    else {
+                    let Some(queue) = get_queue(data.clone(), message_component) else {
                         message_component
                             .create_response(
                                 ctx.http(),
@@ -1335,7 +1350,7 @@ async fn handler(
                     message_component.defer_ephemeral(ctx.http()).await?;
                     match try_queue_player(
                         data.clone(),
-                        queue,
+                        &queue,
                         message_component.user.id,
                         ctx.http.clone(),
                         message_component.guild_id.unwrap(),
@@ -1352,14 +1367,14 @@ async fn handler(
                                 )
                                 .await?;
                             data.message_edit_notify
-                                .get_mut(queue)
+                                .get_mut(&queue)
                                 .unwrap()
                                 .notify_one();
                             matchmake(
                                 data.clone(),
                                 ctx.http.clone(),
                                 message_component.guild_id.unwrap(),
-                                queue,
+                                &queue,
                             )
                             .await?;
                         }
@@ -1377,30 +1392,7 @@ async fn handler(
                 if let Some(register_mmr) =
                     message_component.data.custom_id.strip_prefix("register_")
                 {
-                    let queues = data
-                        .clone()
-                        .guild_data
-                        .lock()
-                        .unwrap()
-                        .entry(message_component.guild_id.unwrap())
-                        .or_default()
-                        .queues
-                        .clone();
-                    let Some(queue) = queues
-                        .iter()
-                        .filter(|queue| {
-                            data.clone()
-                                .configuration
-                                .get(&queue)
-                                .unwrap()
-                                .register_messages
-                                .contains(&(
-                                    message_component.channel.clone().unwrap().id,
-                                    message_component.message.id,
-                                ))
-                        })
-                        .last()
-                    else {
+                    let Some(queue) = get_queue(data.clone(), message_component) else {
                         message_component
                             .create_response(
                                 ctx.http(),
@@ -1414,7 +1406,7 @@ async fn handler(
                         return Ok(());
                     };
                     message_component.defer_ephemeral(ctx.http()).await?;
-                    if let Some(role) = data.configuration.get(queue).unwrap().register_role {
+                    if let Some(role) = data.configuration.get(&queue).unwrap().register_role {
                         message_component
                             .member
                             .as_ref()
@@ -1424,13 +1416,13 @@ async fn handler(
                     }
                     let default_uncertainty = data
                         .configuration
-                        .get(queue)
+                        .get(&queue)
                         .unwrap()
                         .default_player_data
                         .rating
                         .uncertainty;
                     data.player_data
-                        .get_mut(queue)
+                        .get_mut(&queue)
                         .unwrap()
                         .entry(message_component.user.id)
                         .or_default()
@@ -1447,30 +1439,7 @@ async fn handler(
                     return Ok(());
                 }
                 if message_component.data.custom_id == "leave_queue" {
-                    let queues = data
-                        .clone()
-                        .guild_data
-                        .lock()
-                        .unwrap()
-                        .get(&message_component.guild_id.unwrap())
-                        .unwrap()
-                        .queues
-                        .clone();
-                    let Some(queue) = queues
-                        .iter()
-                        .filter(|queue| {
-                            data.clone()
-                                .configuration
-                                .get(&queue)
-                                .unwrap()
-                                .queue_messages
-                                .contains(&(
-                                    message_component.channel.clone().unwrap().id,
-                                    message_component.message.id,
-                                ))
-                        })
-                        .last()
-                    else {
+                    let Some(queue) = get_queue(data.clone(), message_component) else {
                         message_component
                             .create_response(
                                 ctx.http(),
@@ -1484,7 +1453,7 @@ async fn handler(
                         return Ok(());
                     };
                     let response =
-                        player_leave_queue(data.clone(), message_component.user.id, true, queue);
+                        player_leave_queue(data.clone(), message_component.user.id, true, &queue);
                     message_component
                         .create_response(
                             ctx.http(),
@@ -1523,30 +1492,7 @@ async fn handler(
                     return Ok(());
                 }
                 if message_component.data.custom_id == "status" {
-                    let queues = data
-                        .clone()
-                        .guild_data
-                        .lock()
-                        .unwrap()
-                        .entry(message_component.guild_id.unwrap())
-                        .or_default()
-                        .queues
-                        .clone();
-                    let Some(queue) = queues
-                        .iter()
-                        .filter(|queue| {
-                            data.clone()
-                                .configuration
-                                .get(&queue)
-                                .unwrap()
-                                .queue_messages
-                                .contains(&(
-                                    message_component.channel.clone().unwrap().id,
-                                    message_component.message.id,
-                                ))
-                        })
-                        .last()
-                    else {
+                    let Some(queue) = get_queue(data.clone(), message_component) else {
                         message_component
                             .create_response(
                                 ctx.http(),
@@ -1560,7 +1506,7 @@ async fn handler(
                         return Ok(());
                     };
                     let was_in_queue = {
-                        let queued_players = data.queued_players.get(queue).unwrap();
+                        let queued_players = data.queued_players.get(&queue).unwrap();
                         queued_players.contains(&message_component.user.id)
                     };
                     let (player_state, q_entry_time) = {
@@ -1627,6 +1573,43 @@ async fn handler(
                     }
                     return Ok(());
                 }
+                if message_component.data.custom_id == "role_select" {
+                    let Some(queue) = get_queue(data.clone(), message_component) else {
+                        message_component
+                            .create_response(
+                                ctx.http(),
+                                CreateInteractionResponse::Message(
+                                    CreateInteractionResponseMessage::new()
+                                        .content("Could not find queue!")
+                                        .ephemeral(true),
+                                ),
+                            )
+                            .await?;
+                        return Ok(());
+                    };
+                    let ComponentInteractionDataKind::StringSelect { values } =
+                        message_component.data.kind.clone()
+                    else {
+                        return Err("Invalid type for role select repsonse".into());
+                    };
+                    {
+                        let mut players_data = data.player_data.get_mut(&queue).unwrap();
+                        let player_data =
+                            players_data.entry(message_component.user.id).or_default();
+                        player_data.player_queueing_config.active_roles = Some(values);
+                    }
+                    message_component
+                        .create_response(
+                            ctx.http(),
+                            CreateInteractionResponse::Message(
+                                CreateInteractionResponseMessage::new()
+                                    .content("Roles configured!")
+                                    .ephemeral(true),
+                            ),
+                        )
+                        .await?;
+                    return Ok(());
+                }
             }
         }
         serenity::FullEvent::Message { new_message } => {
@@ -1677,6 +1660,34 @@ async fn handler(
     Ok(())
 }
 
+fn get_queue(data: Arc<Data>, message_component: &ComponentInteraction) -> Option<QueueUuid> {
+    let queues = data
+        .guild_data
+        .lock()
+        .unwrap()
+        .entry(message_component.guild_id.unwrap())
+        .or_default()
+        .queues
+        .clone();
+    let queue = queues
+        .iter()
+        .filter(|queue| {
+            data.clone()
+                .configuration
+                .get(&queue)
+                .unwrap()
+                .queue_messages
+                .iter()
+                .any(|(message_channel, message_id, _)| {
+                    *message_channel == message_component.channel.clone().unwrap().id
+                        && *message_id == message_component.message.id
+                })
+        })
+        .last()
+        .cloned();
+    queue
+}
+
 async fn update_queue_messages(
     data: Arc<Data>,
     http: Arc<Http>,
@@ -1701,7 +1712,10 @@ async fn update_queue_messages(
         .unwrap()
         .queue_messages
         .clone();
-    for (message_channel, queue_message) in queue_messages {
+    for (message_channel, queue_message, _) in queue_messages
+        .iter()
+        .filter(|(_, _, message_type)| matches!(message_type, QueueMessageType::Queue))
+    {
         message_channel
             .edit_message(
                 http.clone(),
@@ -1908,7 +1922,7 @@ async fn try_matchmaking(
         queued_players.retain(|p| !bans.contains_key(p));
     }
     println!("Trying matchmaking");
-    let members = greedy_matchmaking(data.clone(), queued_players, queue_id).await;
+    let members = greedy_matchmaking(data.clone(), queued_players, queue_id);
     let Some(members) = members else {
         println!("Could not find valid matchmaking");
         let delay = 10.0;
@@ -1936,14 +1950,34 @@ async fn try_matchmaking(
             })
             .collect_vec()
     };
-    let (cost_eval, match_categories, host) = evaluate_cost(
+    let LobbyEvaluation {
+        cost: cost_eval,
+        game_categories: match_categories,
+        lobby_host: host,
+        roles: game_roles,
+    } = evaluate_cost(
         data.clone(),
         &members,
         &player_game_data,
         &global_player_data,
         queue_id,
-    )
-    .await;
+    );
+    let game_roles = game_roles
+        .iter()
+        .map(|team_roles| {
+            team_roles
+                .iter()
+                .map(|game_role| {
+                    config
+                        .roles
+                        .iter()
+                        .find(|role| role.id == *game_role)
+                        .map(|role| role.name.clone())
+                        .unwrap()
+                })
+                .collect_vec()
+        })
+        .collect_vec();
     if cost_eval > config.maximum_queue_cost {
         println!("Best option has cost of {}", cost_eval);
         let delay = (cost_eval - config.maximum_queue_cost) / total_player_count as f32 + 1.0;
@@ -2037,28 +2071,48 @@ async fn try_matchmaking(
                 .map(|host| get_previous_game_members(&data, queue_id, host))
                 .flatten()
             {
-                let sorted_members: Vec<Vec<(UserId, bool)>> = previous_members
+                let sorted_members: Vec<Vec<(UserId, String, bool)>> = previous_members
                     .iter()
-                    .zip(members_copy.iter())
+                    .zip(
+                        members_copy
+                            .iter()
+                            .zip(game_roles.iter())
+                            .map(|(members, roles)| members.iter().zip(roles.iter())),
+                    )
                     .map(|(prev_team, new_team)| {
                         let mut sorted_team = prev_team
                             .iter()
-                            .map(|member| new_team.contains(member).then(|| (member.clone(), true)))
+                            .map(|member| {
+                                new_team
+                                    .clone()
+                                    .find(|(id, _)| id == &member)
+                                    .map(|(id, role)| (id.clone(), role.clone(), true))
+                            })
                             .collect_vec();
                         let mut remaining_members = new_team
-                            .iter()
                             .filter(|member| {
-                                !sorted_team
+                                sorted_team
                                     .iter()
                                     .filter_map(|sorted_member| {
-                                        sorted_member.map(|(sorted_member, _)| sorted_member)
+                                        sorted_member.as_ref().map(
+                                            |(sorted_member, sorted_role, _)| {
+                                                (sorted_member, sorted_role)
+                                            },
+                                        )
                                     })
-                                    .contains(*member)
+                                    .find(|(id, _)| id == &member.0)
+                                    .is_none()
                             })
                             .collect_vec();
                         for member in sorted_team.iter_mut() {
                             if matches!(member, None) {
-                                *member = Some((*remaining_members.pop().unwrap(), false));
+                                let (remaining_member_id, remaining_member_role) =
+                                    remaining_members.pop().unwrap();
+                                *member = Some((
+                                    remaining_member_id.clone(),
+                                    remaining_member_role.clone(),
+                                    false,
+                                ));
                             }
                         }
                         assert!(remaining_members.is_empty());
@@ -2070,21 +2124,27 @@ async fn try_matchmaking(
                 for (team_idx, team) in sorted_members.iter().enumerate() {
                     members_message += format!("## Team {}\n", team_idx + 1).as_str();
                     let team_copy = team.clone();
-                    for (player, unchanged) in team_copy {
+                    for (player, role, unchanged) in team_copy {
                         members_message += format!(
-                            "{} {}\n",
+                            "{} {} {}\n",
                             player.mention(),
+                            role,
                             if unchanged { "" } else { "*" }
                         )
                         .as_str();
                     }
                 }
             } else {
-                for (team_idx, team) in members_copy.iter().enumerate() {
+                for (team_idx, team) in members_copy
+                    .iter()
+                    .zip(game_roles.iter())
+                    .map(|(members, roles)| members.iter().zip(roles.iter()))
+                    .enumerate()
+                {
                     members_message += format!("## Team {}\n", team_idx + 1).as_str();
                     let team_copy = team.clone();
-                    for player in team_copy {
-                        members_message += format!("{}\n", player.mention()).as_str();
+                    for (player, role) in team_copy {
+                        members_message += format!("{} {}\n", player.mention(), role).as_str();
                     }
                 }
             }
@@ -2292,24 +2352,32 @@ fn get_previous_game_members(
     })
 }
 
-async fn evaluate_cost(
+struct LobbyEvaluation {
+    cost: f32,
+    game_categories: HashMap<String, usize>,
+    lobby_host: Option<UserId>,
+    roles: Vec<Vec<String>>,
+}
+
+fn evaluate_cost(
     data: Arc<Data>,
     player_ids: &Vec<Vec<UserId>>,
     player_data: &Vec<Vec<DerivedPlayerData>>,
     global_player_data: &Vec<Vec<GlobalPlayerData>>,
     queue_id: &QueueUuid,
-) -> (f32, HashMap<String, usize>, Option<UserId>) {
-    let (team_size, game_categories, default_player_data, max_lobby_keep_time) = {
+) -> LobbyEvaluation {
+    let (team_size, game_categories, default_player_data, max_lobby_keep_time, role_combinations) = {
         let config = data.configuration.get(&queue_id).unwrap();
         (
             config.team_size,
             config.game_categories.clone(),
             config.default_player_data.clone(),
             config.max_lobby_keep_time.clone(),
+            config.role_combinations.clone(),
         )
     };
 
-    let (host_cost, host) = {
+    let (host_cost, lobby_host) = {
         let historical_matches = data.historical_match_data.lock().unwrap();
         let current_time = std::time::UNIX_EPOCH.elapsed().unwrap().as_secs();
         let costs_and_last_hosts = player_data
@@ -2456,50 +2524,106 @@ async fn evaluate_cost(
             )
         })
         .collect();
-    let now = chrono::offset::Utc::now();
-    (
-        host_cost
-            + player_data
+
+    let mut role_cost = 0.0;
+    let roles = player_data
+        .iter()
+        .map(|team| {
+            let team_roles = team
                 .iter()
-                .flat_map(|team| team.iter())
-                .zip(global_player_data.iter().flat_map(|team| team.iter()))
-                .zip(player_categories.iter())
-                .map(|((player, global_player), player_categories)| {
-                    let queue_config = player
+                .map(|player| {
+                    player
                         .player_queueing_config
-                        .derive(&default_player_data.player_queueing_config);
-                    let time_in_queue = global_player
-                        .queue_enter_time
-                        .map(|queue_time| (now - queue_time).num_seconds())
-                        .unwrap_or(0);
-                    let mut player_cost = 0.0;
-                    player_cost += (mmr_differential - queue_config.acceptable_mmr_differential)
-                        .max(0.0)
-                        * queue_config.cost_per_avg_mmr_differential;
-                    player_cost += (mmr_std_differential
-                        - queue_config.acceptable_mmr_std_differential)
-                        .max(0.0)
-                        * queue_config.cost_per_mmr_std_differential;
-                    player_cost += (mmr_range - queue_config.acceptable_mmr_range).max(0.0)
-                        * queue_config.cost_per_mmr_range;
-                    player_cost += queue_config
-                        .wrong_game_category_cost
-                        .iter()
-                        .filter(|(category, _)| {
-                            !player_categories[*category].contains(&game_categories[*category])
-                        })
-                        .map(|(_, cost)| cost)
-                        .sum::<f32>();
-                    player_cost -= time_in_queue as f32;
-                    player_cost
+                        .active_roles
+                        .as_ref()
+                        .unwrap_or(&default_player_data.player_queueing_config.active_roles)
+                        .clone()
                 })
-                .sum::<f32>(),
+                .collect_vec();
+            for (role_combination, combination_cost) in role_combinations.iter() {
+                let edges = team_roles
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(player_idx, roles)| {
+                        roles
+                            .iter()
+                            .flat_map(|player_role_id| {
+                                role_combination
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, combination_role_id)| {
+                                        player_role_id == *combination_role_id
+                                    })
+                                    .map(|(role_idx, _)| {
+                                        (player_idx, role_idx + team_size as usize)
+                                    })
+                                    .collect_vec()
+                            })
+                            .collect_vec()
+                    })
+                    .collect_vec();
+                let mut correct_edges = matching(&edges);
+                if correct_edges.len() == team_roles.len() {
+                    correct_edges.sort_by_key(|(player_idx, _)| *player_idx);
+                    role_cost += combination_cost;
+                    return correct_edges
+                        .iter()
+                        .map(|(_, role_idx)| role_idx - team_size as usize)
+                        .map(|role_idx| role_combination[role_idx].clone())
+                        .collect_vec();
+                }
+            }
+            role_cost += 10.0;
+            team_roles.iter().map(|_| "".to_string()).collect_vec()
+        })
+        .collect_vec();
+
+    let now = chrono::offset::Utc::now();
+    let cost = host_cost
+        + role_cost
+        + player_data
+            .iter()
+            .flat_map(|team| team.iter())
+            .zip(global_player_data.iter().flat_map(|team| team.iter()))
+            .zip(player_categories.iter())
+            .map(|((player, global_player), player_categories)| {
+                let queue_config = player
+                    .player_queueing_config
+                    .derive(&default_player_data.player_queueing_config);
+                let time_in_queue = global_player
+                    .queue_enter_time
+                    .map(|queue_time| (now - queue_time).num_seconds())
+                    .unwrap_or(0);
+                let mut player_cost = 0.0;
+                player_cost += (mmr_differential - queue_config.acceptable_mmr_differential)
+                    .max(0.0)
+                    * queue_config.cost_per_avg_mmr_differential;
+                player_cost +=
+                    (mmr_std_differential - queue_config.acceptable_mmr_std_differential).max(0.0)
+                        * queue_config.cost_per_mmr_std_differential;
+                player_cost += (mmr_range - queue_config.acceptable_mmr_range).max(0.0)
+                    * queue_config.cost_per_mmr_range;
+                player_cost += queue_config
+                    .wrong_game_category_cost
+                    .iter()
+                    .filter(|(category, _)| {
+                        !player_categories[*category].contains(&game_categories[*category])
+                    })
+                    .map(|(_, cost)| cost)
+                    .sum::<f32>();
+                player_cost -= time_in_queue as f32;
+                player_cost
+            })
+            .sum::<f32>();
+    LobbyEvaluation {
+        cost,
         game_categories,
-        host,
-    )
+        lobby_host,
+        roles,
+    }
 }
 
-async fn greedy_matchmaking(
+fn greedy_matchmaking(
     data: Arc<Data>,
     pool: HashSet<UserId>,
     queue_id: &QueueUuid,
@@ -2580,8 +2704,7 @@ async fn greedy_matchmaking(
                     &global_player_data,
                     queue_id,
                 )
-                .await
-                .0;
+                .cost;
                 if cost < min_cost {
                     min_cost = cost;
                     best_next_result = result_copy;
@@ -2762,7 +2885,7 @@ fn player_leave_queue(
     queue: &QueueUuid,
 ) -> String {
     if queue_group {
-        if let Some(Some(party_members)) = data
+        let possible_party = data
             .global_player_data
             .lock()
             .unwrap()
@@ -2775,8 +2898,8 @@ fn player_leave_queue(
                     .unwrap()
                     .get(&party)
                     .map(|p| p.players.clone())
-            })
-        {
+            });
+        if let Some(Some(party_members)) = possible_party {
             for user in party_members {
                 player_leave_queue(data.clone(), user, false, queue);
             }
@@ -2785,14 +2908,17 @@ fn player_leave_queue(
     }
     let removed = {
         let mut queued_players = data.queued_players.get_mut(queue).unwrap();
-        let mut player_data = data.global_player_data.lock().unwrap();
-        player_data
-            .entry(user.clone())
-            .or_insert(GlobalPlayerData::default())
-            .queue_enter_time = None;
         queued_players.remove(&user)
     };
     if removed {
+        {
+            let mut player_data = data.global_player_data.lock().unwrap();
+            let global_player_data = player_data
+                .entry(user.clone())
+                .or_insert(GlobalPlayerData::default());
+            global_player_data.queue_enter_time = None;
+            global_player_data.queue_state = QueueState::None;
+        }
         data.message_edit_notify
             .get_mut(queue)
             .unwrap()
@@ -3435,6 +3561,7 @@ async fn main() {
                 list_leavers(),
                 force_outcome(),
                 create_queue_message(),
+                create_roles_message(),
                 create_register_message(),
                 no_ping(),
                 player_config(),

@@ -3,14 +3,13 @@ use itertools::Itertools;
 use poise::{
     serenity_prelude::{
         self as serenity, CreateActionRow, CreateAllowedMentions, CreateButton, CreateMessage,
-        EditMember, Mentionable, UserId,
+        CreateSelectMenu, CreateSelectMenuOption, EditMember, Mentionable, UserId,
     },
     CreateReply,
 };
 
 use crate::{
-    apply_match_results, log_match_results, update_bans, BanData, Context, DerivedPlayerData,
-    Error, MatchResult, QueueState,
+    apply_match_results, log_match_results, update_bans, BanData, Context, DerivedPlayerData, Error, MatchResult, QueueMessageType, QueueState
 };
 
 #[poise::command(prefix_command, required_permissions = "MANAGE_CHANNELS")]
@@ -401,7 +400,62 @@ pub async fn create_queue_message(ctx: Context<'_>) -> Result<(), Error> {
             .get_mut(&queue)
             .unwrap()
             .queue_messages
-            .push((ctx.channel_id(), msg));
+            .push((ctx.channel_id(), msg, QueueMessageType::Queue));
+    }
+
+    Ok(())
+}
+
+/// Creates a message players can choose roles with
+#[poise::command(
+    slash_command,
+    prefix_command,
+    default_member_permissions = "MANAGE_CHANNELS"
+)]
+pub async fn create_roles_message(ctx: Context<'_>) -> Result<(), Error> {
+    let queues = ctx
+        .data()
+        .guild_data
+        .lock()
+        .unwrap()
+        .get(&ctx.guild_id().unwrap())
+        .unwrap()
+        .queues
+        .clone();
+    for queue in queues {
+        let roles = ctx.data().configuration.get(&queue).unwrap().roles.clone();
+        let msg = ctx
+            .send(
+                CreateReply::default()
+                    .content("## Role select")
+                    .components(vec![CreateActionRow::SelectMenu(
+                        CreateSelectMenu::new(
+                            "role_select",
+                            serenity::CreateSelectMenuKind::String {
+                                options: roles
+                                    .iter()
+                                    .map(|role| {
+                                        CreateSelectMenuOption::new(role.name.clone(), role.id.clone())
+                                            .description(role.description.clone())
+                                            .default_selection(true)
+                                    })
+                                    .collect(),
+                            },
+                        )
+                        .max_values(roles.len() as u8),
+                    )])
+                    .ephemeral(false),
+            )
+            .await?
+            .into_message()
+            .await?
+            .id;
+        ctx.data()
+            .configuration
+            .get_mut(&queue)
+            .unwrap()
+            .queue_messages
+            .push((ctx.channel_id(), msg, QueueMessageType::Roles));
     }
 
     Ok(())
@@ -419,21 +473,23 @@ pub async fn create_register_message(
     #[rest]
     register_message_data: String,
 ) -> Result<(), Error> {
-    let Ok(buttons_data) = register_message_data.split(",").map(|button_data| {
-        let split_button_data = button_data.split(":").collect_vec();
-        if split_button_data.len() != 2 {
-            return Err(())
-        }
-        let button_name = split_button_data[0];
-        let Ok(button_mmr) = split_button_data[1].parse::<f64>() else {
-            return Err(())
-        };
-        Ok(
-            CreateButton::new(format!("register_{}", button_mmr))
-            .label(button_name)
-            .style(serenity::ButtonStyle::Secondary)
-        )
-    }).collect::<Result<Vec<CreateButton>, ()>>() else {
+    let Ok(buttons_data) = register_message_data
+        .split(",")
+        .map(|button_data| {
+            let split_button_data = button_data.split(":").collect_vec();
+            if split_button_data.len() != 2 {
+                return Err(());
+            }
+            let button_name = split_button_data[0];
+            let Ok(button_mmr) = split_button_data[1].parse::<f64>() else {
+                return Err(());
+            };
+            Ok(CreateButton::new(format!("register_{}", button_mmr))
+                .label(button_name)
+                .style(serenity::ButtonStyle::Secondary))
+        })
+        .collect::<Result<Vec<CreateButton>, ()>>()
+    else {
         ctx.send(
             CreateReply::default()
                 .content("Invalid data")
@@ -442,6 +498,7 @@ pub async fn create_register_message(
         .await?;
         return Ok(());
     };
+    let button_rows = buttons_data.iter().chunks(5).into_iter().map(|row| CreateActionRow::Buttons(row.cloned().collect_vec())).collect_vec();
     let queues = ctx
         .data()
         .guild_data
@@ -456,7 +513,7 @@ pub async fn create_register_message(
             .send(
                 CreateReply::default()
                     .content("## Register for queue")
-                    .components(vec![CreateActionRow::Buttons(buttons_data.clone())])
+                    .components(button_rows.clone())
                     .ephemeral(false),
             )
             .await?
@@ -467,8 +524,8 @@ pub async fn create_register_message(
             .configuration
             .get_mut(&queue)
             .unwrap()
-            .register_messages
-            .push((ctx.channel_id(), msg));
+            .queue_messages
+            .push((ctx.channel_id(), msg, QueueMessageType::Register));
     }
 
     Ok(())

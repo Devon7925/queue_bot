@@ -10,9 +10,10 @@ chrono = "0.4.38"
 itertools = "0.13.0"
 poise = "0.6.1"
 rand = "0.8.5"
-serde = { version = "1.0.204", features = ["rc"] }
-serde_json = "1.0.122"
-skillratings = { version = "0.27.0", features = ["serde"] }
-tokio = { version = "1.21.2", features = ["macros", "rt-multi-thread"] }
-uuid = { version = "1.10.0", features = ["serde", "v4"] }
-dashmap = { version = "6.0.1", features = ["serde"] }
+serde = { version = "1.0.213", features = ["rc"] }
+serde_json = "1.0.132"
+skillratings = { version = "0.27.1", features = ["serde"] }
+tokio = { version = "1.41.0", features = ["macros", "rt-multi-thread"] }
+uuid = { version = "1.11.0", features = ["serde", "v4"] }
+dashmap = { version = "6.1.0", features = ["serde"] }
+hopcroft-karp = "0.2.1"
