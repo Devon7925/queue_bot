@@ -35,6 +35,9 @@ This bot is currently under testing by the Overwatch [6v6 Adjustments](https://g
 
 ## How to Run
 
+* Set the `DISCORD_BOT_TOKEN` environment variable to your bot's token
+    * If you don't have one you can get one via the discord developer portal
+    * You also must invite your bot to your server
 * Clone this repository
 * Install cargo
 * Execute `cargo run`
