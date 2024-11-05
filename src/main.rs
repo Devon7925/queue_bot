@@ -653,30 +653,27 @@ async fn ensure_wants_queue(
     {
         return Ok(true);
     }
-    let mut leaver_message_content =
-        format!("# Are you still wanting to queue {}?", user.mention());
-    leaver_message_content += format!(
-        "\nEnds <t:{}:R>, otherwise you will be kicked from queue",
+    let leaver_message_content =
+        format!("# Are you still wanting to queue {}?\nEnds <t:{}:R>, otherwise you will be kicked from queue", user.mention(), 
         std::time::UNIX_EPOCH.elapsed().unwrap().as_secs()
-            + data
-                .configuration
-                .get(&queue_id)
-                .unwrap()
-                .leaver_verification_time as u64
-    )
-    .as_str();
-    let mut leaver_message = CreateMessage::default().content(leaver_message_content);
-    leaver_message = leaver_message.components(vec![CreateActionRow::Buttons(vec![
-        CreateButton::new(format!("queue_check"))
-            .label("Yes, I'm here.")
+        + data
+            .configuration
+            .get(&queue_id)
+            .unwrap()
+            .leaver_verification_time as u64);
+    let leaver_message = CreateMessage::default()
+        .content(leaver_message_content)
+        .components(vec![CreateActionRow::Buttons(vec![
+            CreateButton::new(format!("queue_check"))
+                .label("Yes, I'm here.")
+                .style(serenity::ButtonStyle::Primary),
+            CreateButton::new(format!(
+                "afk_leave_queue_{}",
+                serde_json::to_string(queue_id).unwrap()
+            ))
+            .label("No, exit queue.")
             .style(serenity::ButtonStyle::Primary),
-        CreateButton::new(format!(
-            "afk_leave_queue_{}",
-            serde_json::to_string(queue_id).unwrap()
-        ))
-        .label("No, exit queue.")
-        .style(serenity::ButtonStyle::Primary),
-    ])]);
+        ])]);
     let Ok(leaver_message) = user.direct_message(http.clone(), leaver_message).await else {
         data.queued_players
             .get_mut(&queue_id)
@@ -752,7 +749,6 @@ async fn handler(
             }
         }
         serenity::FullEvent::VoiceStateUpdate { old, new } => {
-            let mut queues_player_added_to = vec![];
             if let Some(VoiceState {
                 guild_id: Some(guild_id),
                 channel_id: Some(channel_id),
@@ -783,51 +779,42 @@ async fn handler(
                 .or_default()
                 .queues
                 .clone();
-            for queue in queues {
-                let try_queueing = {
-                    let config = data.configuration.get(&queue).unwrap();
-                    if let Some(channel_id) = new.channel_id {
-                        config.queue_channels.contains(&channel_id)
-                    } else {
-                        false
-                    }
-                };
-
-                if try_queueing {
-                    match try_queue_player(
-                        data.clone(),
-                        &queue,
-                        new.user_id,
-                        ctx.http.clone(),
-                        new.guild_id.unwrap(),
-                        true,
-                        false,
-                    )
-                    .await
-                    {
-                        Ok(()) => {
-                            queues_player_added_to.push(queue);
-                            data.message_edit_notify
-                                .get_mut(&queue)
-                                .unwrap()
-                                .notify_one();
-                        }
-                        Err(reason) => {
-                            new.user_id
-                                .direct_message(ctx, CreateMessage::new().content(reason))
-                                .await?;
-                        }
-                    }
-                }
-            }
-            for queue in queues_player_added_to {
-                matchmake(
+            for queue in queues.iter().filter(|queue| {
+                let config = data.configuration.get(&queue).unwrap();
+                new.channel_id
+                    .map(|channel_id| config.queue_channels.contains(&channel_id))
+                    .unwrap_or(false)
+            }) {
+                match try_queue_player(
                     data.clone(),
+                    &queue,
+                    new.user_id,
                     ctx.http.clone(),
                     new.guild_id.unwrap(),
-                    &queue,
+                    true,
+                    false,
                 )
-                .await?;
+                .await
+                {
+                    Ok(()) => {
+                        data.message_edit_notify
+                            .get_mut(&queue)
+                            .unwrap()
+                            .notify_one();
+                        matchmake(
+                            data.clone(),
+                            ctx.http.clone(),
+                            new.guild_id.unwrap(),
+                            &queue,
+                        )
+                        .await?;
+                    }
+                    Err(reason) => {
+                        new.user_id
+                            .direct_message(ctx, CreateMessage::new().content(reason))
+                            .await?;
+                    }
+                }
             }
         }
         serenity::FullEvent::InteractionCreate { interaction } => {
@@ -854,8 +841,7 @@ async fn handler(
                                 .contains(&message_component.user.id),
                         )
                     };
-                    let mut vote_type = VoteType::None;
-                    {
+                    let vote_type = 'vote_type: {
                         if !is_user_in_match {
                             message_component
                                 .create_response(
@@ -899,93 +885,13 @@ async fn handler(
                                     )
                                     .await?;
                                 return Ok(());
-                            } else {
-                                let mut current_content = message_component.message.content.clone();
-                                current_content +=
-                                    format!("\n## Host: {}", message_component.user.id.mention())
-                                        .as_str();
-                                ctx.http
-                                    .clone()
-                                    .get_message(
-                                        message_component.channel_id,
-                                        message_component.message.id,
-                                    )
-                                    .await?
-                                    .edit(
-                                        ctx,
-                                        EditMessage::new()
-                                            .components(vec![])
-                                            .content(current_content),
-                                    )
-                                    .await?;
-                                return Ok(());
                             }
-                        }
-                        let mut match_data = data.match_data.lock().unwrap();
-                        if let Some(map) = message_component.data.custom_id.strip_prefix("map_") {
-                            match_data
-                                .get_mut(&match_number)
-                                .unwrap()
-                                .map_votes
-                                .insert(message_component.user.id, map.to_string());
-                            vote_type = VoteType::Map;
-                        }
-                        if let Some(team_data) =
-                            message_component.data.custom_id.strip_prefix("team_")
-                        {
-                            let team_number: u32 = team_data.parse()?;
-                            let Some(match_data) = match_data.get_mut(&match_number) else {
-                                return Ok(());
-                            };
-                            match_data
-                                .result_votes
-                                .insert(message_component.user.id, MatchResult::Team(team_number));
-                            vote_type = VoteType::Result;
-                        }
-                        if message_component.data.custom_id.eq_ignore_ascii_case("tie") {
-                            match_data
-                                .get_mut(&match_number)
-                                .unwrap()
-                                .result_votes
-                                .insert(message_component.user.id, MatchResult::Tie);
-                            vote_type = VoteType::Result;
-                        }
-                        if message_component
-                            .data
-                            .custom_id
-                            .eq_ignore_ascii_case("cancel")
-                        {
-                            match_data
-                                .get_mut(&match_number)
-                                .unwrap()
-                                .result_votes
-                                .insert(message_component.user.id, MatchResult::Cancel);
-                            vote_type = VoteType::Result;
-                        }
-                    }
-                    if matches!(vote_type, VoteType::Map) {
-                        let mut vote_result = None;
-                        let mut content = {
-                            let match_data = data.match_data.lock().unwrap();
-                            let match_data = match_data.get(&match_number).unwrap();
-                            let mut votes: HashMap<String, u32> = HashMap::new();
-                            for (_user, vote) in match_data.map_votes.iter() {
-                                let current_votes = votes.get(vote).unwrap_or(&0);
-                                votes.insert(vote.clone(), current_votes + 1);
-                            }
-                            let mut content = "# Map Vote".to_string();
-                            if let Some(map_vote_end_time) = match_data.map_vote_end_time {
-                                content += format!("\nEnds <t:{}:R>", map_vote_end_time).as_str();
-                            }
-                            for (vote_type, count) in votes {
-                                content += format!("\n{}: {}", vote_type, count).as_str();
-                                if count >= required_votes {
-                                    vote_result = Some(vote_type);
-                                }
-                            }
-                            content
-                        };
-                        if let Some(vote_result) = vote_result {
+
+                            let current_content = format!(
+                                "{}\n## Host: {}",
+                                message_component.message.content.clone(),
+                                message_component.user.id.mention()
+                            );
                             ctx.http
                                 .clone()
                                 .get_message(
@@ -993,45 +899,160 @@ async fn handler(
                                     message_component.message.id,
                                 )
                                 .await?
-                                .edit(ctx.http.clone(), EditMessage::new().components(vec![]))
+                                .edit(
+                                    ctx,
+                                    EditMessage::new()
+                                        .components(vec![])
+                                        .content(current_content),
+                                )
                                 .await?;
-                            content = format!("# Map: {}", vote_result);
-                        }
-                        ctx.http
-                            .clone()
-                            .get_message(message_component.channel_id, message_component.message.id)
-                            .await?
-                            .edit(ctx.http.clone(), EditMessage::new().content(content))
-                            .await?;
-                    }
-                    if matches!(vote_type, VoteType::Result) {
-                        if {
-                            let match_data = data.match_data.lock().unwrap();
-                            let match_data = match_data.get(&match_number).unwrap();
-                            match_data.resolved
-                        } {
                             return Ok(());
                         }
-                        let mut vote_result = None;
-                        let content = {
-                            let match_data = data.match_data.lock().unwrap();
-                            let mut votes: HashMap<MatchResult, u32> = HashMap::new();
-                            for (_user, vote) in
-                                match_data.get(&match_number).unwrap().result_votes.iter()
-                            {
-                                let current_votes = votes.get(&vote).unwrap_or(&0);
-                                votes.insert(vote.clone(), current_votes + 1);
-                            }
-                            let mut content = String::new();
-                            for (vote_type, count) in votes {
-                                content += format!("{}: {}\n", vote_type, count).as_str();
-                                if count >= required_votes {
-                                    vote_result = Some(vote_type);
-                                }
-                            }
-                            content
+                        let mut match_data = data.match_data.lock().unwrap();
+                        let Some(match_data) = match_data.get_mut(&match_number) else {
+                            eprintln!("Could not find match data for vote!");
+                            break 'vote_type VoteType::None;
                         };
-                        if let Some(vote_result) = vote_result {
+                        if let Some(map) = message_component.data.custom_id.strip_prefix("map_") {
+                            match_data
+                                .map_votes
+                                .insert(message_component.user.id, map.to_string());
+                            break 'vote_type VoteType::Map;
+                        }
+
+                        let match_result = if let Some(team_data) =
+                            message_component.data.custom_id.strip_prefix("team_")
+                        {
+                            Some(MatchResult::Team(team_data.parse()?))
+                        } else if message_component.data.custom_id.eq_ignore_ascii_case("tie") {
+                            Some(MatchResult::Tie)
+                        } else if message_component
+                            .data
+                            .custom_id
+                            .eq_ignore_ascii_case("cancel")
+                        {
+                            Some(MatchResult::Cancel)
+                        } else {
+                            None
+                        };
+                        if let Some(match_result) = match_result {
+                            match_data
+                                .result_votes
+                                .insert(message_component.user.id, match_result);
+                            break 'vote_type VoteType::Result;
+                        }
+                        VoteType::None
+                    };
+
+                    match vote_type {
+                        VoteType::Map => {
+                            let (vote_result, mut content) = {
+                                let match_data = data.match_data.lock().unwrap();
+                                let match_data = match_data.get(&match_number).unwrap();
+
+                                let votes = match_data
+                                    .map_votes
+                                    .iter()
+                                    .map(|(_, vote)| vote)
+                                    .counts()
+                                    .into_iter()
+                                    .sorted_by_key(|(_, count)| *count)
+                                    .rev()
+                                    .collect_vec();
+                                let content = format!(
+                                    "# Map Vote{}{}",
+                                    match_data
+                                        .map_vote_end_time
+                                        .map(|map_vote_end_time| format!(
+                                            "\nEnds <t:{}:R>",
+                                            map_vote_end_time
+                                        ))
+                                        .unwrap_or("".to_string()),
+                                    votes
+                                        .iter()
+                                        .map(|(vote_type, count)| format!(
+                                            "\n{}: {}",
+                                            vote_type, count
+                                        ))
+                                        .join("")
+                                );
+                                (
+                                    votes
+                                        .into_iter()
+                                        .next()
+                                        .filter(|(_, count)| *count >= required_votes as usize)
+                                        .map(|(vote_type, _)| vote_type.clone()),
+                                    content,
+                                )
+                            };
+                            if let Some(vote_result) = vote_result {
+                                ctx.http
+                                    .clone()
+                                    .get_message(
+                                        message_component.channel_id,
+                                        message_component.message.id,
+                                    )
+                                    .await?
+                                    .edit(ctx.http.clone(), EditMessage::new().components(vec![]))
+                                    .await?;
+                                content = format!("# Map: {}", vote_result);
+                            }
+                            ctx.http
+                                .clone()
+                                .get_message(
+                                    message_component.channel_id,
+                                    message_component.message.id,
+                                )
+                                .await?
+                                .edit(ctx.http.clone(), EditMessage::new().content(content))
+                                .await?;
+                        }
+                        VoteType::Result => {
+                            if {
+                                let match_data = data.match_data.lock().unwrap();
+                                let match_data = match_data.get(&match_number).unwrap();
+                                match_data.resolved
+                            } {
+                                return Ok(());
+                            }
+                            let (vote_result, content) = {
+                                let match_data = data.match_data.lock().unwrap();
+                                let votes = match_data
+                                    .get(&match_number)
+                                    .unwrap()
+                                    .result_votes
+                                    .iter()
+                                    .map(|(_, vote)| vote)
+                                    .counts()
+                                    .into_iter()
+                                    .sorted_by_key(|(_, count)| *count)
+                                    .rev()
+                                    .collect_vec();
+                                let content = votes
+                                    .iter()
+                                    .map(|(vote_type, count)| format!("{}: {}\n", vote_type, count))
+                                    .join("");
+                                (
+                                    votes
+                                        .into_iter()
+                                        .next()
+                                        .filter(|(_, count)| *count >= required_votes as usize)
+                                        .map(|(vote_type, _)| vote_type.clone()),
+                                    content,
+                                )
+                            };
+                            let Some(vote_result) = vote_result else {
+                                ctx.http
+                                    .clone()
+                                    .get_message(
+                                        message_component.channel_id,
+                                        message_component.message.id,
+                                    )
+                                    .await?
+                                    .edit(ctx.http.clone(), EditMessage::new().content(content))
+                                    .await?;
+                                return Ok(());
+                            };
                             let post_match_channel = data
                                 .configuration
                                 .get(&queue)
@@ -1046,7 +1067,7 @@ async fn handler(
                                 (match_data.channels.clone(), match_data.members.clone())
                             };
 
-                            apply_match_results(data.clone(), vote_result, &players, queue);
+                            apply_match_results(data.clone(), vote_result.clone(), &players, queue);
 
                             let guild_id = message_component.guild_id.unwrap();
                             for player in players.iter().flat_map(|t| t) {
@@ -1124,16 +1145,9 @@ async fn handler(
                                         .insert(match_number, finished_match);
                                 }
                             }
-                            return Ok(());
                         }
-                        ctx.http
-                            .clone()
-                            .get_message(message_component.channel_id, message_component.message.id)
-                            .await?
-                            .edit(ctx.http.clone(), EditMessage::new().content(content))
-                            .await?;
+                        VoteType::None => {}
                     }
-                    message_component.defer(ctx.http.clone()).await?;
                 }
                 if let Some(party_id) = message_component.data.custom_id.strip_prefix("join_party_")
                 {
@@ -1822,12 +1836,6 @@ fn apply_match_results(
             .as_slice(),
     );
     for (team_idx, team) in players.iter().enumerate() {
-        let result = match result {
-            MatchResult::Team(idx) if idx == team_idx as u32 => 1,
-            MatchResult::Team(_) => 2,
-            MatchResult::Tie => 3,
-            MatchResult::Cancel => panic!("Invalid state"),
-        };
         for (player_idx, player) in team.iter().enumerate() {
             let player = player_data.get_mut(player).unwrap();
             player.rating = Some(
@@ -1839,10 +1847,10 @@ fn apply_match_results(
                     .clone(),
             );
             match result {
-                1 => player.stats.wins += 1,
-                2 => player.stats.losses += 1,
-                3 => player.stats.draws += 1,
-                _ => {}
+                MatchResult::Team(idx) if idx == team_idx as u32 => player.stats.wins += 1,
+                MatchResult::Team(_) => player.stats.losses += 1,
+                MatchResult::Tie => player.stats.draws += 1,
+                MatchResult::Cancel => panic!("Invalid state"),
             }
         }
     }
@@ -2006,7 +2014,7 @@ async fn try_matchmaking(
             }
         }
     }
-    let mut permissions = members
+    let permissions = members
         .iter()
         .flat_map(|t| t)
         .map(|user| PermissionOverwrite {
@@ -2014,30 +2022,31 @@ async fn try_matchmaking(
             allow: Permissions::VIEW_CHANNEL,
             kind: PermissionOverwriteType::Member(user.clone()),
         })
+        .chain([
+            PermissionOverwrite {
+                deny: Permissions::VIEW_CHANNEL,
+                allow: Permissions::empty(),
+                kind: PermissionOverwriteType::Role(guild_id.everyone_role()),
+            },
+            PermissionOverwrite {
+                deny: Permissions::empty(),
+                allow: Permissions::VIEW_CHANNEL,
+                kind: PermissionOverwriteType::Member(cache_http.get_current_user().await?.id),
+            },
+        ])
+        .chain(
+            data.configuration
+                .get(&queue_id)
+                .unwrap()
+                .visability_override_roles
+                .iter()
+                .map(|role| PermissionOverwrite {
+                    deny: Permissions::empty(),
+                    allow: Permissions::VIEW_CHANNEL,
+                    kind: PermissionOverwriteType::Role(role.clone()),
+                }),
+        )
         .collect_vec();
-    permissions.push(PermissionOverwrite {
-        deny: Permissions::VIEW_CHANNEL,
-        allow: Permissions::empty(),
-        kind: PermissionOverwriteType::Role(guild_id.everyone_role()),
-    });
-    permissions.push(PermissionOverwrite {
-        deny: Permissions::empty(),
-        allow: Permissions::VIEW_CHANNEL,
-        kind: PermissionOverwriteType::Member(cache_http.get_current_user().await?.id),
-    });
-    for role in data
-        .configuration
-        .get(&queue_id)
-        .unwrap()
-        .visability_override_roles
-        .iter()
-    {
-        permissions.push(PermissionOverwrite {
-            deny: Permissions::empty(),
-            allow: Permissions::VIEW_CHANNEL,
-            kind: PermissionOverwriteType::Role(role.clone()),
-        })
-    }
     let (match_channel, vc_channels) = future::join(
         CreateChannel::new(format!("match-{}", new_idx))
             .category(category.clone())
@@ -2286,8 +2295,11 @@ async fn try_matchmaking(
             }
             {
                 let mut match_data = data.match_data.lock().unwrap();
-                let mut channels = vec![match_channel.id];
-                channels.extend(vc_channels_copy.iter().map(|c| c.id));
+                let channels = vc_channels_copy
+                    .iter()
+                    .map(|c| c.id)
+                    .chain([match_channel.id])
+                    .collect_vec();
                 match_data.insert(
                     new_id,
                     MatchData {
@@ -2545,28 +2557,18 @@ fn evaluate_cost(
         .collect_vec();
     let game_categories: HashMap<String, usize> = game_categories
         .iter()
-        .map(|(category_name, roles)| {
-            let players_category_values = player_categories
-                .iter()
-                .map(|player_categories| player_categories[category_name].clone())
-                .collect_vec();
-            let mut counts = vec![0; roles.len()];
-            for player_category_values in players_category_values {
-                for category_value in player_category_values {
-                    counts[category_value] += 1;
-                }
-            }
+        .map(|(category_name, _)| {
             (
                 category_name.clone(),
-                if let Some((category, _count)) = counts
+                player_categories
                     .iter()
-                    .enumerate()
+                    .map(|player_categories| player_categories[category_name].clone())
+                    .flatten()
+                    .counts()
+                    .into_iter()
                     .max_by_key(|&(_category, count)| count)
-                {
-                    category
-                } else {
-                    0
-                },
+                    .map(|(category, _count)| category)
+                    .unwrap_or(0),
             )
         })
         .collect();
@@ -2608,9 +2610,11 @@ fn evaluate_cost(
                             .collect_vec()
                     })
                     .collect_vec();
-                let mut correct_edges = matching(&edges);
+                let correct_edges = matching(&edges)
+                    .into_iter()
+                    .sorted_by_key(|(player_idx, _)| *player_idx)
+                    .collect_vec();
                 if correct_edges.len() == team_roles.len().min(role_combination.len()) {
-                    correct_edges.sort_by_key(|(player_idx, _)| *player_idx);
                     role_cost += combination_cost;
                     return correct_edges
                         .iter()
@@ -2640,25 +2644,21 @@ fn evaluate_cost(
                     .queue_enter_time
                     .map(|queue_time| (now - queue_time).num_seconds())
                     .unwrap_or(0);
-                let mut player_cost = 0.0;
-                player_cost += (mmr_differential - queue_config.acceptable_mmr_differential)
-                    .max(0.0)
-                    * queue_config.cost_per_avg_mmr_differential;
-                player_cost +=
-                    (mmr_std_differential - queue_config.acceptable_mmr_std_differential).max(0.0)
-                        * queue_config.cost_per_mmr_std_differential;
-                player_cost += (mmr_range - queue_config.acceptable_mmr_range).max(0.0)
-                    * queue_config.cost_per_mmr_range;
-                player_cost += queue_config
-                    .wrong_game_category_cost
-                    .iter()
-                    .filter(|(category, _)| {
-                        !player_categories[*category].contains(&game_categories[*category])
-                    })
-                    .map(|(_, cost)| cost)
-                    .sum::<f32>();
-                player_cost -= time_in_queue as f32;
-                player_cost
+                (mmr_differential - queue_config.acceptable_mmr_differential).max(0.0)
+                    * queue_config.cost_per_avg_mmr_differential
+                    + (mmr_std_differential - queue_config.acceptable_mmr_std_differential).max(0.0)
+                        * queue_config.cost_per_mmr_std_differential
+                    + (mmr_range - queue_config.acceptable_mmr_range).max(0.0)
+                        * queue_config.cost_per_mmr_range
+                    + queue_config
+                        .wrong_game_category_cost
+                        .iter()
+                        .filter(|(category, _)| {
+                            !player_categories[*category].contains(&game_categories[*category])
+                        })
+                        .map(|(_, cost)| cost)
+                        .sum::<f32>()
+                    - time_in_queue as f32
             })
             .sum::<f32>();
     LobbyEvaluation {
@@ -3422,9 +3422,9 @@ async fn mark_leaver(
         .await?;
         return Ok(());
     }
-    let mut leaver_message_content = format!("# Did you leave {}?", player.mention());
-    leaver_message_content += format!(
-        "\nEnds <t:{}:R>, otherwise user will be reported",
+    let leaver_message_content = format!(
+        "# Did you leave {}?\nEnds <t:{}:R>, otherwise user will be reported",
+        player.mention(),
         std::time::UNIX_EPOCH.elapsed().unwrap().as_secs()
             + ctx
                 .data()
@@ -3432,11 +3432,10 @@ async fn mark_leaver(
                 .get_mut(&match_data.queue)
                 .unwrap()
                 .leaver_verification_time as u64
-    )
-    .as_str();
-    let mut leaver_message = CreateReply::default().content(leaver_message_content);
-    leaver_message =
-        leaver_message.components(vec![CreateActionRow::Buttons(vec![CreateButton::new(
+    );
+    let leaver_message = CreateReply::default()
+        .content(leaver_message_content)
+        .components(vec![CreateActionRow::Buttons(vec![CreateButton::new(
             format!("leaver_check_{}", player.get()).clone(),
         )
         .label("No, I'm here.")
@@ -3517,15 +3516,17 @@ async fn ping_non_voters(ctx: Context<'_>) -> Result<(), Error> {
         return Ok(());
     }
 
-    let mut message_content = format!("# Remember to vote\n");
-    message_content += match_data
-        .members
-        .iter()
-        .flatten()
-        .filter(|member| !match_data.result_votes.contains_key(&member))
-        .map(|member| format!("{}", member.mention()))
-        .join(", ")
-        .as_str();
+    let message_content = format!(
+        "# Remember to vote\n{}",
+        match_data
+            .members
+            .iter()
+            .flatten()
+            .filter(|member| !match_data.result_votes.contains_key(&member))
+            .map(|member| format!("{}", member.mention()))
+            .join(", ")
+            .as_str()
+    );
     ctx.send(CreateReply::default().content(message_content))
         .await?
         .message()

@@ -9,7 +9,8 @@ use poise::{
 };
 
 use crate::{
-    apply_match_results, log_match_results, update_bans, BanData, Context, DerivedPlayerData, Error, MatchResult, QueueMessageType, QueueState
+    apply_match_results, log_match_results, update_bans, BanData, Context, DerivedPlayerData,
+    Error, MatchResult, QueueMessageType, QueueState,
 };
 
 #[poise::command(prefix_command, required_permissions = "MANAGE_CHANNELS")]
@@ -164,18 +165,20 @@ pub async fn list_bans(ctx: Context<'_>) -> Result<(), Error> {
 }
 
 fn get_ban_text(id: &UserId, ban_data: &BanData) -> String {
-    let mut ban = format!("{}", id.mention());
-    if ban_data.shadow_ban {
-        ban += " shadow";
-    }
-    ban += " banned";
-    if let Some(reason) = ban_data.reason.clone() {
-        ban += format!(" for {}", reason).as_str();
-    }
-    if let Some(end_time) = ban_data.end_time {
-        ban += format!(" until <t:{}:f>", end_time.timestamp()).as_str();
-    }
-    ban
+    format!(
+        "{}{} banned{}{}",
+        id.mention(),
+        ban_data.shadow_ban.then(|| " shadow").unwrap_or_default(),
+        ban_data
+            .reason
+            .clone()
+            .map(|reason| format!(" for {}", reason))
+            .unwrap_or_default(),
+        ban_data
+            .end_time
+            .map(|end_time| format!(" until <t:{}:f>", end_time.timestamp()))
+            .unwrap_or_default(),
+    )
 }
 
 /// Gets player info
@@ -435,9 +438,12 @@ pub async fn create_roles_message(ctx: Context<'_>) -> Result<(), Error> {
                                 options: roles
                                     .iter()
                                     .map(|(role_id, role)| {
-                                        CreateSelectMenuOption::new(role.name.clone(), role_id.clone())
-                                            .description(role.description.clone())
-                                            .default_selection(true)
+                                        CreateSelectMenuOption::new(
+                                            role.name.clone(),
+                                            role_id.clone(),
+                                        )
+                                        .description(role.description.clone())
+                                        .default_selection(true)
                                     })
                                     .collect(),
                             },
@@ -498,7 +504,12 @@ pub async fn create_register_message(
         .await?;
         return Ok(());
     };
-    let button_rows = buttons_data.iter().chunks(5).into_iter().map(|row| CreateActionRow::Buttons(row.cloned().collect_vec())).collect_vec();
+    let button_rows = buttons_data
+        .iter()
+        .chunks(5)
+        .into_iter()
+        .map(|row| CreateActionRow::Buttons(row.cloned().collect_vec()))
+        .collect_vec();
     let queues = ctx
         .data()
         .guild_data
