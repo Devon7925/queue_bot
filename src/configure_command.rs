@@ -130,6 +130,22 @@ impl ConfigurationModifiers {
         "Displays or sets cost for not assigning roles",
         min = 0
     );
+    configure_server_parameter!(
+        configure_log_chats,
+        log_chats,
+        bool,
+        "log_chats",
+        "Should log match chats?",
+        "Displays or sets whether to log match chats"
+    );
+    configure_server_parameter!(
+        configure_prevent_recent_maps,
+        prevent_recent_maps,
+        bool,
+        "prevent_recent_maps",
+        "Prevent recent maps?",
+        "Displays or sets whether to prevent recent maps from being played"
+    );
 }
 
 /// Displays or sets queue category
@@ -487,36 +503,6 @@ async fn configure_register_role(
     Ok(())
 }
 
-/// Sets whether or not match chat messages are logged
-#[poise::command(slash_command, prefix_command, rename = "log_chats")]
-async fn configure_log_chats(
-    ctx: Context<'_>,
-    #[description = "Log chats"] new_value: Option<bool>,
-    #[description = "Queue index"]
-    #[min = 0]
-    queue_idx: Option<u32>,
-) -> Result<(), Error> {
-    let queue_uuid = match get_queue_uuid(&ctx, queue_idx) {
-        Ok(queue_uuid) => queue_uuid,
-        Err(error) => {
-            ctx.send(CreateReply::default().content(error).ephemeral(true))
-                .await?;
-            return Ok(());
-        }
-    };
-    let response = if let Some(new_value) = new_value {
-        let mut data_lock = ctx.data().configuration.get_mut(&queue_uuid).unwrap();
-        data_lock.log_chats = new_value;
-        format!("Log chats changed to {}", new_value.to_string())
-    } else {
-        let data_lock = ctx.data().configuration.get(&queue_uuid).unwrap();
-        format!("Log chats is {}", data_lock.log_chats)
-    };
-    ctx.send(CreateReply::default().content(response).ephemeral(true))
-        .await?;
-    Ok(())
-}
-
 /// Configures roles that can see match channels of matches their not in
 #[poise::command(slash_command, prefix_command, rename = "visability_override_roles")]
 async fn configure_visability_override_roles(
@@ -584,7 +570,8 @@ async fn configure_visability_override_roles(
         "ConfigurationModifiers::configure_incorrect_roles_cost",
         "configure_register_role",
         "configure_audit_channel",
-        "configure_log_chats",
+        "ConfigurationModifiers::configure_log_chats",
+        "ConfigurationModifiers::configure_prevent_recent_maps",
         "configure_visability_override_roles",
     )
 )]

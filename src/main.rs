@@ -33,7 +33,7 @@ use poise::{
     },
     CreateReply,
 };
-use rand::Rng;
+use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use skillratings::{
     weng_lin::{WengLin, WengLinConfig, WengLinRating},
@@ -197,6 +197,7 @@ struct QueueConfiguration {
     maps: HashSet<String>,
     map_vote_count: u32,
     map_vote_time: u32,
+    prevent_recent_maps: bool,
     leaver_verification_time: u32,
     default_player_data: PlayerData,
     maximum_queue_cost: f32,
@@ -223,6 +224,7 @@ impl Default for QueueConfiguration {
             maps: HashSet::new(),
             map_vote_count: 0,
             map_vote_time: 0,
+            prevent_recent_maps: false,
             leaver_verification_time: 30,
             default_player_data: PlayerData::default(),
             maximum_queue_cost: 50.0,
@@ -2173,6 +2175,18 @@ async fn try_matchmaking(
                 .await
                 .ok();
             let mut map_vote_end_time = None;
+            let mut map_pool = config.maps.iter().collect_vec();
+            if config.prevent_recent_maps {
+                let previous_maps: HashSet<String> = members_copy
+                    .iter()
+                    .flat_map(|t| t)
+                    .flat_map(|member| get_previous_map(&data, queue_id, *member))
+                    .sorted()
+                    .dedup()
+                    .take(map_pool.len() - config.map_vote_count as usize)
+                    .collect();
+                map_pool.retain(|m| !previous_maps.contains(*m));
+            }
             if config.map_vote_count > 0 {
                 let mut map_vote_message_content = "# Map Vote".to_string();
                 if config.map_vote_time > 0 {
@@ -2185,12 +2199,12 @@ async fn try_matchmaking(
                 }
                 let mut map_vote_message =
                     CreateMessage::default().content(map_vote_message_content);
-                let mut map_pool = config.maps.iter().collect_vec();
-                let mut maps = vec![];
-                for _ in 0..config.map_vote_count {
-                    let num = rand::thread_rng().gen_range(0..map_pool.len());
-                    let rand_map = map_pool.remove(num);
-                    maps.push(rand_map.clone());
+                let vote_maps = map_pool
+                    .choose_multiple(&mut rand::thread_rng(), config.map_vote_count as usize)
+                    .map(|m| *m)
+                    .cloned()
+                    .collect_vec();
+                for rand_map in vote_maps.iter() {
                     map_vote_message = map_vote_message.button(
                         CreateButton::new(format!("map_{}", rand_map).clone())
                             .label(rand_map)
@@ -2210,19 +2224,17 @@ async fn try_matchmaking(
                         }
                         let vote_result = {
                             let match_data = data.match_data.lock().unwrap();
-                            let mut votes: HashMap<String, u32> = HashMap::new();
                             let Some(match_data) = match_data.get(&new_id) else {
                                 return;
                             };
-                            for (_user, vote) in match_data.map_votes.iter() {
-                                let current_votes = votes.get(vote).unwrap_or(&0);
-                                votes.insert(vote.clone(), current_votes + 1);
-                            }
-                            votes
+                            match_data
+                                .map_votes
+                                .iter()
+                                .counts_by(|(_, vote)| vote)
                                 .iter()
                                 .max_by_key(|(_category, vote_count)| *vote_count)
-                                .map(|(category, _vote_count)| category.clone())
-                                .unwrap_or(maps[0].clone())
+                                .map(|(category, _vote_count)| (*category).clone())
+                                .unwrap_or(vote_maps.first().unwrap().clone())
                                 .clone()
                         };
                         let content = format!("# Map: {}", vote_result);
@@ -2237,9 +2249,7 @@ async fn try_matchmaking(
                     });
                 }
             } else if config.maps.len() > 0 {
-                let map_pool = config.maps.iter().collect_vec();
-                let num = rand::thread_rng().gen_range(0..map_pool.len());
-                let chosen_map = map_pool.get(num).unwrap();
+                let chosen_map = map_pool.choose(&mut rand::thread_rng()).unwrap();
                 let map_vote_message =
                     CreateMessage::default().content(format!("# Map: {}", chosen_map));
                 match_channel
@@ -2352,6 +2362,34 @@ fn get_previous_game_members(
     })
 }
 
+fn get_previous_map(data: &Arc<Data>, queue_id: &QueueUuid, player: UserId) -> Option<String> {
+    let Some(player_last_game) = data
+        .player_data
+        .get(queue_id)
+        .unwrap()
+        .get(&player)
+        .unwrap()
+        .game_history
+        .last()
+        .cloned()
+    else {
+        return None;
+    };
+    data.historical_match_data
+        .lock()
+        .unwrap()
+        .get(&player_last_game)
+        .unwrap()
+        .map_votes
+        .iter()
+        .into_group_map_by(|vote| vote.1)
+        .into_iter()
+        .sorted_by_key(|votes| votes.1.len())
+        .map(|votes| votes.0)
+        .next()
+        .cloned()
+}
+
 struct LobbyEvaluation {
     cost: f32,
     game_categories: HashMap<String, usize>,
@@ -2366,7 +2404,14 @@ fn evaluate_cost(
     global_player_data: &Vec<Vec<GlobalPlayerData>>,
     queue_id: &QueueUuid,
 ) -> LobbyEvaluation {
-    let (team_size, game_categories, default_player_data, max_lobby_keep_time, role_combinations, incorrect_roles_cost) = {
+    let (
+        team_size,
+        game_categories,
+        default_player_data,
+        max_lobby_keep_time,
+        role_combinations,
+        incorrect_roles_cost,
+    ) = {
         let config = data.configuration.get(&queue_id).unwrap();
         (
             config.team_size,
