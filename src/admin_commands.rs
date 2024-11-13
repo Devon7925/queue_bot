@@ -2,15 +2,15 @@ use chrono::TimeDelta;
 use itertools::Itertools;
 use poise::{
     serenity_prelude::{
-        self as serenity, CreateActionRow, CreateAllowedMentions, CreateButton, CreateMessage,
-        CreateSelectMenu, CreateSelectMenuOption, EditMember, Mentionable, UserId,
+        self as serenity, CreateActionRow, CreateAllowedMentions, CreateMessage, CreateSelectMenu,
+        CreateSelectMenuOption, EditMember, Mentionable, UserId,
     },
     CreateReply,
 };
 
 use crate::{
-    apply_match_results, log_match_results, update_bans, BanData, Context, DerivedPlayerData,
-    Error, MatchResult, QueueMessageType, QueueState,
+    apply_match_results, log_match_results, update_bans, BanData, ButtonData, Context,
+    DerivedPlayerData, Error, MatchResult, QueueMessageType, QueueState,
 };
 
 #[poise::command(prefix_command, required_permissions = "MANAGE_CHANNELS")]
@@ -382,15 +382,9 @@ pub async fn create_queue_message(ctx: Context<'_>) -> Result<(), Error> {
                 CreateReply::default()
                     .content("## Matchmaking queue")
                     .components(vec![CreateActionRow::Buttons(vec![
-                        CreateButton::new("queue")
-                            .label("Join Queue")
-                            .style(serenity::ButtonStyle::Primary),
-                        CreateButton::new("leave_queue")
-                            .label("Leave Queue")
-                            .style(serenity::ButtonStyle::Danger),
-                        CreateButton::new("status")
-                            .label("Status")
-                            .style(serenity::ButtonStyle::Secondary),
+                        ButtonData::Queue.get_button(),
+                        ButtonData::LeaveQueue.get_button(),
+                        ButtonData::Status.get_button(),
                     ])])
                     .ephemeral(false),
             )
@@ -433,7 +427,7 @@ pub async fn create_roles_message(ctx: Context<'_>) -> Result<(), Error> {
                     .content("## Role select")
                     .components(vec![CreateActionRow::SelectMenu(
                         CreateSelectMenu::new(
-                            "role_select",
+                            ButtonData::RoleSelect.get_id(),
                             serenity::CreateSelectMenuKind::String {
                                 options: roles
                                     .iter()
@@ -490,11 +484,9 @@ pub async fn create_register_message(
             let Ok(button_mmr) = split_button_data[1].parse::<f64>() else {
                 return Err(());
             };
-            Ok(CreateButton::new(format!("register_{}", button_mmr))
-                .label(button_name)
-                .style(serenity::ButtonStyle::Secondary))
+            Ok(ButtonData::Register(button_name.to_string(), button_mmr).get_button())
         })
-        .collect::<Result<Vec<CreateButton>, ()>>()
+        .collect::<Result<Vec<_>, ()>>()
     else {
         ctx.send(
             CreateReply::default()

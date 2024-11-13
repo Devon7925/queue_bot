@@ -17,3 +17,4 @@ tokio = { version = "1.41.0", features = ["macros", "rt-multi-thread"] }
 uuid = { version = "1.11.0", features = ["serde", "v4"] }
 dashmap = { version = "6.1.0", features = ["serde"] }
 hopcroft-karp = "0.2.1"
+ron = "0.8"

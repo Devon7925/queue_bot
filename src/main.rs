@@ -28,10 +28,9 @@ use poise::{
     serenity_prelude::{
         self as serenity, futures::future, Builder, CacheHttp, ChannelId, ChannelType,
         ComponentInteraction, ComponentInteractionDataKind, CreateActionRow, CreateAllowedMentions,
-        CreateButton, CreateChannel, CreateInteractionResponse, CreateInteractionResponseMessage,
-        CreateMessage, EditInteractionResponse, EditMember, EditMessage, GuildId, Http,
-        Mentionable, MessageId, PermissionOverwrite, PermissionOverwriteType, Permissions, RoleId,
-        UserId, VoiceState,
+        CreateChannel, CreateInteractionResponse, CreateInteractionResponseMessage, CreateMessage,
+        EditInteractionResponse, EditMember, EditMessage, GuildId, Http, Mentionable, MessageId,
+        PermissionOverwrite, PermissionOverwriteType, Permissions, RoleId, UserId, VoiceState,
     },
     CreateReply,
 };
@@ -164,12 +163,6 @@ impl Default for GuildData {
 struct QueueGroup {
     players: HashSet<UserId>,
     pending_invites: HashSet<UserId>,
-}
-
-enum VoteType {
-    None,
-    Map,
-    Result,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -417,13 +410,12 @@ impl Default for DerivedPlayerData {
 #[derive(Serialize, Deserialize, Clone)]
 enum QueueState {
     None,
-    Queued,
+    Queued(QueueUuid, DateTime<Utc>),
     InGame,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
 struct GlobalPlayerData {
-    queue_enter_time: Option<DateTime<Utc>>,
     party: Option<GroupUuid>,
     queue_state: QueueState,
 }
@@ -431,7 +423,6 @@ struct GlobalPlayerData {
 impl Default for GlobalPlayerData {
     fn default() -> Self {
         Self {
-            queue_enter_time: None,
             party: None,
             queue_state: QueueState::None,
         }
@@ -571,8 +562,8 @@ async fn try_queue_player(
             .entry(user_id)
             .or_insert(GlobalPlayerData::default());
 
-        global_player_data.queue_enter_time = Some(queue_enter_time.clone());
-        global_player_data.queue_state = QueueState::Queued;
+        global_player_data.queue_state =
+            QueueState::Queued(queue_id.clone(), queue_enter_time.clone());
 
         global_player_data.party
     };
@@ -643,17 +634,20 @@ async fn ensure_wants_queue(
     if !data.queued_players.get(&queue_id).unwrap().contains(user) {
         return Ok(true);
     }
-    if data
+    match data
         .global_player_data
         .lock()
         .unwrap()
         .get(user)
         .unwrap()
-        .queue_enter_time
-        .unwrap()
-        != queue_enter_time
+        .queue_state
     {
-        return Ok(true);
+        QueueState::Queued(_, current_queue_enter_time)
+            if current_queue_enter_time != queue_enter_time =>
+        {
+            return Ok(true);
+        }
+        _ => {}
     }
     let leaver_message_content =
         format!("# Are you still wanting to queue {}?\nEnds <t:{}:R>, otherwise you will be kicked from queue", user.mention(), 
@@ -666,15 +660,8 @@ async fn ensure_wants_queue(
     let leaver_message = CreateMessage::default()
         .content(leaver_message_content)
         .components(vec![CreateActionRow::Buttons(vec![
-            CreateButton::new(format!("queue_check"))
-                .label("Yes, I'm here.")
-                .style(serenity::ButtonStyle::Primary),
-            CreateButton::new(format!(
-                "afk_leave_queue_{}",
-                serde_json::to_string(queue_id).unwrap()
-            ))
-            .label("No, exit queue.")
-            .style(serenity::ButtonStyle::Primary),
+            ButtonData::QueueCheck.get_button(),
+            ButtonData::AfkLeaveQueue(queue_id.clone()).get_button(),
         ])]);
     let Ok(leaver_message) = user.direct_message(http.clone(), leaver_message).await else {
         data.queued_players
@@ -722,6 +709,789 @@ async fn ensure_wants_queue(
     Ok(false)
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+enum ButtonData {
+    JoinParty(GroupUuid),
+    RejectParty(GroupUuid),
+    LeaverCheck(UserId),
+    QueueCheck,
+    Queue,
+    Register(String, f64),
+    LeaveQueue,
+    AfkLeaveQueue(QueueUuid),
+    Status,
+    RoleSelect,
+    VolunteerHost,
+    MapVote(String),
+    ResultVote(MatchResult),
+}
+
+impl ButtonData {
+    fn get_id(&self) -> String {
+        ron::ser::to_string(self).unwrap()
+    }
+
+    fn get_button(&self) -> serenity::CreateButton {
+        use serenity::ButtonStyle;
+        let button = serenity::CreateButton::new(self.get_id());
+        match self {
+            ButtonData::JoinParty(_) => button.label("Join party").style(ButtonStyle::Success),
+            ButtonData::RejectParty(_) => button.label("Reject invite").style(ButtonStyle::Danger),
+            ButtonData::LeaverCheck(_) => button.label("No, I'm here.").style(ButtonStyle::Primary),
+            ButtonData::QueueCheck => button.label("Yes, I'm here.").style(ButtonStyle::Primary),
+            ButtonData::Queue => button.label("Join Queue").style(ButtonStyle::Primary),
+            ButtonData::Register(label, _mmr) => button.label(label).style(ButtonStyle::Secondary),
+            ButtonData::LeaveQueue => button.label("Leave Queue").style(ButtonStyle::Danger),
+            ButtonData::AfkLeaveQueue(_) => {
+                button.label("No, exit queue.").style(ButtonStyle::Primary)
+            }
+            ButtonData::Status => button.label("Status").style(ButtonStyle::Secondary),
+            ButtonData::RoleSelect => panic!("Invalid conversion from role select to button"),
+            ButtonData::VolunteerHost => button
+                .label("Volunteer to host")
+                .style(ButtonStyle::Primary),
+            ButtonData::MapVote(map) => button.label(map).style(ButtonStyle::Secondary),
+            ButtonData::ResultVote(match_result) => match match_result {
+                MatchResult::Team(team) => button
+                    .label(format!("Team {}", team + 1))
+                    .style(ButtonStyle::Primary),
+                MatchResult::Tie => button.label("Tie").style(ButtonStyle::Secondary),
+                MatchResult::Cancel => button.label("Cancel").style(ButtonStyle::Danger),
+            },
+        }
+    }
+
+    async fn handle_interaction(self, message_component: &ComponentInteraction, data: Arc<Data>, ctx: &serenity::Context) -> Result<(), Error> {
+        match self {
+            ButtonData::JoinParty(party_uuid) => {
+                if let Err(e) = {
+                    let mut player_data = data.global_player_data.lock().unwrap();
+                    let player_data = player_data
+                        .entry(message_component.user.id)
+                        .or_insert(GlobalPlayerData::default());
+                    match player_data.queue_state {
+                        QueueState::None => Ok(()),
+                        QueueState::Queued(..) => Err("Cannot join party while queued!"),
+                        QueueState::InGame => Err("Cannot join party while in game!"),
+                    }
+                } {
+                    message_component
+                        .create_response(
+                            ctx,
+                            serenity::CreateInteractionResponse::Message(
+                                CreateInteractionResponseMessage::new()
+                                    .content(format!("{}", e)),
+                            ),
+                        )
+                        .await?;
+                    return Ok(());
+                }
+                let group_members = 'group_members: {
+                    let mut group_data = data.group_data.lock().unwrap();
+                    let party = group_data.get_mut(&party_uuid);
+                    let Some(party) = party else {
+                        break 'group_members Err("Party no longer exists.");
+                    };
+                    if !party.pending_invites.remove(&message_component.user.id) {
+                        break 'group_members Err("Party invite no longer valid.");
+                    }
+                    party.players.insert(message_component.user.id);
+                    Ok(party.players.clone())
+                };
+                let group_members = match group_members {
+                    Ok(group_members) => group_members,
+                    Err(e) => {
+                        message_component
+                            .create_response(
+                                ctx,
+                                serenity::CreateInteractionResponse::Message(
+                                    CreateInteractionResponseMessage::new()
+                                        .content(format!("{}", e)),
+                                ),
+                            )
+                            .await?;
+                        return Ok(());
+                    }
+                };
+                let old_party = {
+                    let mut player_data = data.global_player_data.lock().unwrap();
+                    let player_data = player_data
+                        .entry(message_component.user.id)
+                        .or_insert(GlobalPlayerData::default());
+                    let old_party = player_data.party;
+                    player_data.party = Some(party_uuid);
+                    old_party
+                };
+                if let Some(old_party) = old_party {
+                    if old_party != party_uuid {
+                        leave_party(
+                            data,
+                            &message_component.user.id,
+                            Arc::new(ctx.http()),
+                            old_party,
+                        )
+                        .await?;
+                    }
+                }
+
+                for group_member in group_members {
+                    if group_member == message_component.user.id {
+                        continue;
+                    }
+                    group_member
+                        .direct_message(
+                            ctx,
+                            CreateMessage::new().content(format!(
+                                "{} joined your party!",
+                                message_component.user.id.mention()
+                            )),
+                        )
+                        .await?;
+                }
+                message_component.message.delete(ctx).await?;
+                message_component
+                    .create_response(
+                        ctx,
+                        serenity::CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content(format!("Joined party!"))
+                                .ephemeral(true),
+                        ),
+                    )
+                    .await?;
+                Ok(())
+            }
+            ButtonData::RejectParty(party_uuid) => {
+                let group_members = {
+                    let mut group_data = data.group_data.lock().unwrap();
+                    let party = group_data.get_mut(&party_uuid);
+                    if let Some(party) = party {
+                        party.pending_invites.remove(&message_component.user.id);
+                        Some(party.players.clone())
+                    } else {
+                        None
+                    }
+                };
+                let Some(group_members) = group_members else {
+                    message_component
+                        .create_response(
+                            ctx,
+                            serenity::CreateInteractionResponse::Message(
+                                CreateInteractionResponseMessage::new()
+                                    .content(format!("Party no longer exists.")),
+                            ),
+                        )
+                        .await?;
+                    return Ok(());
+                };
+                for group_member in group_members {
+                    if group_member == message_component.user.id {
+                        continue;
+                    }
+                    group_member
+                        .direct_message(
+                            ctx,
+                            CreateMessage::new().content(format!(
+                                "{} rejected your party invite",
+                                message_component.user.id.mention()
+                            )),
+                        )
+                        .await?;
+                }
+                message_component.message.delete(ctx).await?;
+                message_component
+                    .create_response(
+                        ctx,
+                        serenity::CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content(format!("Rejected party invite."))
+                                .ephemeral(true),
+                        ),
+                    )
+                    .await?;
+                Ok(())
+            }
+            ButtonData::LeaverCheck(player) => {
+                if message_component.user.id != player {
+                    message_component
+                        .create_response(
+                            ctx,
+                            serenity::CreateInteractionResponse::Message(
+                                CreateInteractionResponseMessage::new()
+                                    .content(format!(
+                                        "You aren't the right player silly :P"
+                                    ))
+                                    .ephemeral(true),
+                            ),
+                        )
+                        .await?;
+                    return Ok(());
+                }
+                let (del_future, resp_future) = future::join(
+                    message_component.message.delete(ctx),
+                    message_component.create_response(
+                        ctx,
+                        serenity::CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content(format!("You are no longer marked as a leaver."))
+                                .ephemeral(true),
+                        ),
+                    ),
+                )
+                .await;
+                del_future?;
+                resp_future?;
+                Ok(())
+            }
+            ButtonData::QueueCheck => {
+                message_component.message.delete(ctx).await?;
+                message_component
+                    .create_response(
+                        ctx,
+                        serenity::CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content(format!("You will stay in queue."))
+                                .ephemeral(true),
+                        ),
+                    )
+                    .await?;
+                Ok(())
+            }
+            ButtonData::Queue => {
+                let Some(queue) = get_queue(data.clone(), message_component) else {
+                    message_component
+                        .create_response(
+                            ctx.http(),
+                            CreateInteractionResponse::Message(
+                                CreateInteractionResponseMessage::new()
+                                    .content("Could not find queue to join!")
+                                    .ephemeral(true),
+                            ),
+                        )
+                        .await?;
+                    return Ok(());
+                };
+                message_component.defer_ephemeral(ctx.http()).await?;
+                match try_queue_player(
+                    data.clone(),
+                    &queue,
+                    message_component.user.id,
+                    ctx.http.clone(),
+                    message_component.guild_id.unwrap(),
+                    true,
+                    false,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        message_component
+                            .edit_response(
+                                ctx.http(),
+                                EditInteractionResponse::new().content("Joined queue!"),
+                            )
+                            .await?;
+                        data.message_edit_notify
+                            .get_mut(&queue)
+                            .unwrap()
+                            .notify_one();
+                        matchmake(
+                            data.clone(),
+                            ctx.http.clone(),
+                            message_component.guild_id.unwrap(),
+                            &queue,
+                        )
+                        .await?;
+                    }
+                    Err(reason) => {
+                        message_component
+                            .edit_response(
+                                ctx.http(),
+                                EditInteractionResponse::new().content(reason),
+                            )
+                            .await?;
+                    }
+                }
+                Ok(())
+            }
+            ButtonData::Register(_, register_mmr) => {
+                let Some(queue) = get_queue(data.clone(), message_component) else {
+                    message_component
+                        .create_response(
+                            ctx.http(),
+                            CreateInteractionResponse::Message(
+                                CreateInteractionResponseMessage::new()
+                                    .content("Could not find queue to register for!")
+                                    .ephemeral(true),
+                            ),
+                        )
+                        .await?;
+                    return Ok(());
+                };
+                message_component.defer_ephemeral(ctx.http()).await?;
+                if let Some(role) = data.configuration.get(&queue).unwrap().register_role {
+                    message_component
+                        .member
+                        .as_ref()
+                        .unwrap()
+                        .add_role(ctx.http(), role)
+                        .await?;
+                }
+                let default_uncertainty = data
+                    .configuration
+                    .get(&queue)
+                    .unwrap()
+                    .default_player_data
+                    .rating
+                    .uncertainty;
+                data.player_data
+                    .get_mut(&queue)
+                    .unwrap()
+                    .entry(message_component.user.id)
+                    .or_default()
+                    .rating = Some(WengLinRating {
+                    rating: register_mmr,
+                    uncertainty: default_uncertainty,
+                });
+                message_component
+                    .edit_response(
+                        ctx.http(),
+                        EditInteractionResponse::new().content("Registered!"),
+                    )
+                    .await?;
+                Ok(())
+            }
+            ButtonData::LeaveQueue => {
+                let Some(queue) = get_queue(data.clone(), message_component) else {
+                    message_component
+                        .create_response(
+                            ctx.http(),
+                            CreateInteractionResponse::Message(
+                                CreateInteractionResponseMessage::new()
+                                    .content("Could not find queue to join!")
+                                    .ephemeral(true),
+                            ),
+                        )
+                        .await?;
+                    return Ok(());
+                };
+                let response = player_leave_queue(
+                    data.clone(),
+                    message_component.user.id,
+                    true,
+                    &queue,
+                );
+                message_component
+                    .create_response(
+                        ctx.http(),
+                        CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content(response)
+                                .ephemeral(true),
+                        ),
+                    )
+                    .await?;
+                Ok(())
+            }
+            ButtonData::AfkLeaveQueue(queue_uuid) => {
+                let response = player_leave_queue(
+                    data.clone(),
+                    message_component.user.id,
+                    true,
+                    &queue_uuid,
+                );
+                message_component
+                    .create_response(
+                        ctx.http(),
+                        CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content(response)
+                                .ephemeral(true),
+                        ),
+                    )
+                    .await?;
+                message_component.message.delete(ctx.http()).await?;
+                Ok(())
+            }
+            ButtonData::Status => {
+                let Some(queue) = get_queue(data.clone(), message_component) else {
+                    message_component
+                        .create_response(
+                            ctx.http(),
+                            CreateInteractionResponse::Message(
+                                CreateInteractionResponseMessage::new()
+                                    .content("Could not find queue!")
+                                    .ephemeral(true),
+                            ),
+                        )
+                        .await?;
+                    return Ok(());
+                };
+                let player_state = {
+                    let mut global_data = data.global_player_data.lock().unwrap();
+                    let player_data =
+                        global_data.entry(message_component.user.id).or_default();
+                    player_data.queue_state.clone()
+                };
+                let response = match player_state {
+                    QueueState::None => "You are not in queue".to_string(),
+                    QueueState::Queued(id, q_entry_time) if id == queue => format!(
+                        "You'e been in queue since <t:{}:R>.",
+                        q_entry_time.timestamp()
+                    ),
+                    QueueState::Queued(..) => {
+                        "You are queued in a different queue.".to_string()
+                    }
+                    QueueState::InGame => "You are in a game.".to_string(),
+                };
+                message_component
+                    .create_response(
+                        ctx.http(),
+                        CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content(response)
+                                .ephemeral(true),
+                        ),
+                    )
+                    .await?;
+                Ok(())
+            }
+            ButtonData::RoleSelect => {
+                let Some(queue) = get_queue(data.clone(), message_component) else {
+                    message_component
+                        .create_response(
+                            ctx.http(),
+                            CreateInteractionResponse::Message(
+                                CreateInteractionResponseMessage::new()
+                                    .content("Could not find queue!")
+                                    .ephemeral(true),
+                            ),
+                        )
+                        .await?;
+                    return Ok(());
+                };
+                let ComponentInteractionDataKind::StringSelect { values } =
+                    message_component.data.kind.clone()
+                else {
+                    return Err("Invalid type for role select repsonse".into());
+                };
+                {
+                    let mut players_data = data.player_data.get_mut(&queue).unwrap();
+                    let player_data =
+                        players_data.entry(message_component.user.id).or_default();
+                    player_data.player_queueing_config.active_roles = Some(values);
+                }
+                message_component
+                    .create_response(
+                        ctx.http(),
+                        CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content("Roles configured!")
+                                .ephemeral(true),
+                        ),
+                    )
+                    .await?;
+                Ok(())
+            }
+            ButtonData::VolunteerHost => {
+                let match_number = {
+                    let match_channels = data.match_channels.lock().unwrap();
+                    match_channels.get(&message_component.channel_id).cloned()
+                };
+                let Some(match_number) = match_number else {
+                    return Err("Invalid state for volunteer host interaction".into());
+                };
+                let match_data = {
+                    let match_data = data.match_data.lock().unwrap();
+                    let Some(match_data) = match_data.get(&match_number) else {
+                        return Ok(());
+                    };
+                    match_data.clone()
+                };
+                let already_hosted = 'host_button_block: {
+                    if match_data.host.is_some() {
+                        break 'host_button_block true;
+                    }
+                    let mut match_data = data.match_data.lock().unwrap();
+                    match_data.get_mut(&match_number).unwrap().host =
+                        Some(message_component.user.id);
+                    false
+                };
+                if already_hosted {
+                    message_component
+                        .create_response(
+                            ctx,
+                            serenity::CreateInteractionResponse::Message(
+                                CreateInteractionResponseMessage::new()
+                                    .content(format!(
+                                        "There is already a host for this lobby."
+                                    ))
+                                    .ephemeral(true),
+                            ),
+                        )
+                        .await?;
+                    return Ok(());
+                }
+
+                let current_content = format!(
+                    "{}\n## Host: {}",
+                    message_component.message.content.clone(),
+                    message_component.user.id.mention()
+                );
+                ctx.http
+                    .clone()
+                    .get_message(message_component.channel_id, message_component.message.id)
+                    .await?
+                    .edit(
+                        ctx,
+                        EditMessage::new()
+                            .components(vec![])
+                            .content(current_content),
+                    )
+                    .await?;
+                Ok(())
+            }
+            ButtonData::MapVote(map) => {
+                let match_number = {
+                    let match_channels = data.match_channels.lock().unwrap();
+                    match_channels.get(&message_component.channel_id).cloned()
+                };
+                let Some(match_number) = match_number else {
+                    return Err("Invalid state for volunteer host interaction".into());
+                };
+
+                let (vote_result, mut content) = {
+                    let mut match_data = data.match_data.lock().unwrap();
+                    let Some(match_data) = match_data.get_mut(&match_number) else {
+                        return Ok(());
+                    };
+                    let required_votes = {
+                        let config = data.configuration.get(&match_data.queue).unwrap();
+                        config.team_count * config.team_size / 2 + 1
+                    };
+                    match_data
+                        .map_votes
+                        .insert(message_component.user.id, map.to_string());
+
+                    let votes = match_data
+                        .map_votes
+                        .iter()
+                        .map(|(_, vote)| vote)
+                        .counts()
+                        .into_iter()
+                        .sorted_by_key(|(_, count)| *count)
+                        .rev()
+                        .collect_vec();
+                    let content = format!(
+                        "# Map Vote{}{}",
+                        match_data
+                            .map_vote_end_time
+                            .map(|map_vote_end_time| format!(
+                                "\nEnds <t:{}:R>",
+                                map_vote_end_time
+                            ))
+                            .unwrap_or("".to_string()),
+                        votes
+                            .iter()
+                            .map(|(vote_type, count)| format!("\n{}: {}", vote_type, count))
+                            .join("")
+                    );
+                    (
+                        votes
+                            .into_iter()
+                            .next()
+                            .filter(|(_, count)| *count >= required_votes as usize)
+                            .map(|(vote_type, _)| vote_type.clone()),
+                        content,
+                    )
+                };
+                if let Some(vote_result) = vote_result {
+                    ctx.http
+                        .clone()
+                        .get_message(
+                            message_component.channel_id,
+                            message_component.message.id,
+                        )
+                        .await?
+                        .edit(ctx.http.clone(), EditMessage::new().components(vec![]))
+                        .await?;
+                    content = format!("# Map: {}", vote_result);
+                }
+                ctx.http
+                    .clone()
+                    .get_message(message_component.channel_id, message_component.message.id)
+                    .await?
+                    .edit(ctx.http.clone(), EditMessage::new().content(content))
+                    .await?;
+                Ok(())
+            }
+            ButtonData::ResultVote(result) => {
+                let match_number = {
+                    let match_channels = data.match_channels.lock().unwrap();
+                    match_channels.get(&message_component.channel_id).cloned()
+                };
+                let Some(match_number) = match_number else {
+                    return Err("Invalid state for volunteer host interaction".into());
+                };
+                let (vote_result, content) = {
+                    let mut match_data = data.match_data.lock().unwrap();
+                    let Some(match_data) = match_data.get_mut(&match_number) else {
+                        return Ok(());
+                    };
+                    let required_votes = {
+                        let config = data.configuration.get(&match_data.queue).unwrap();
+                        config.team_count * config.team_size / 2 + 1
+                    };
+                    match_data
+                        .result_votes
+                        .insert(message_component.user.id, result);
+                    if match_data.resolved {
+                        return Ok(());
+                    }
+                    let votes = match_data
+                        .result_votes
+                        .iter()
+                        .map(|(_, vote)| vote)
+                        .counts()
+                        .into_iter()
+                        .sorted_by_key(|(_, count)| *count)
+                        .rev()
+                        .collect_vec();
+                    let content = votes
+                        .iter()
+                        .map(|(vote_type, count)| format!("{}: {}\n", vote_type, count))
+                        .join("");
+                    (
+                        votes
+                            .into_iter()
+                            .next()
+                            .filter(|(_, count)| *count >= required_votes as usize)
+                            .map(|(vote_type, _)| vote_type.clone()),
+                        content,
+                    )
+                };
+                let Some(vote_result) = vote_result else {
+                    ctx.http
+                        .clone()
+                        .get_message(
+                            message_component.channel_id,
+                            message_component.message.id,
+                        )
+                        .await?
+                        .edit(ctx.http.clone(), EditMessage::new().content(content))
+                        .await?;
+                    return Ok(());
+                };
+                let (channels, players, queue_id, post_match_channel) = {
+                    let mut match_data = data.match_data.lock().unwrap();
+                    let Some(match_data) = match_data.get_mut(&match_number) else {
+                        return Ok(());
+                    };
+                    let post_match_channel = data
+                        .configuration
+                        .get(&match_data.queue)
+                        .unwrap()
+                        .post_match_channel
+                        .clone();
+                    match_data.resolved = true;
+                    log_match_results(data.clone(), &vote_result, &match_data);
+                    (
+                        match_data.channels.clone(),
+                        match_data.members.clone(),
+                        match_data.queue.clone(),
+                        post_match_channel,
+                    )
+                };
+                apply_match_results(data.clone(), vote_result.clone(), &players, queue_id);
+
+                let guild_id = message_component.guild_id.unwrap();
+                for player in players.iter().flat_map(|t| t) {
+                    data.global_player_data
+                        .lock()
+                        .unwrap()
+                        .get_mut(player)
+                        .unwrap()
+                        .queue_state = QueueState::None;
+                }
+                data.message_edit_notify
+                    .get_mut(&queue_id)
+                    .unwrap()
+                    .notify_one();
+                if let Some(post_match_channel) = post_match_channel {
+                    future::join_all(
+                        players
+                            .iter()
+                            .flat_map(|t| t)
+                            .filter(|player| {
+                                if let Some(Some(current_vc)) = guild_id
+                                    .to_guild_cached(&ctx.cache)
+                                    .unwrap()
+                                    .voice_states
+                                    .get(player)
+                                    .map(|p| p.channel_id)
+                                {
+                                    channels.contains(&current_vc)
+                                } else {
+                                    false
+                                }
+                            })
+                            .map(|player| async {
+                                ctx.http
+                                    .get_member(guild_id, *player)
+                                    .await?
+                                    .edit(
+                                        ctx.http.clone(),
+                                        EditMember::new().voice_channel(post_match_channel),
+                                    )
+                                    .await?;
+                                Ok::<(), Error>(())
+                            }),
+                    )
+                    .await
+                    .into_iter()
+                    .collect::<Result<(), _>>()
+                    .ok();
+                }
+                {
+                    let mut match_channels = data.match_channels.lock().unwrap();
+                    for channel in channels.iter() {
+                        match_channels.remove(&channel);
+                    }
+                }
+                future::join_all(
+                    channels
+                        .iter()
+                        .map(|channel| ctx.http.delete_channel(*channel, None)),
+                )
+                .await;
+                {
+                    let mut match_data = data.match_data.lock().unwrap();
+                    let finished_match = match_data.remove(&match_number);
+                    if let Some(mut finished_match) = finished_match {
+                        finished_match.match_end_time =
+                            Some(std::time::UNIX_EPOCH.elapsed().unwrap().as_secs());
+                        let mut user_data =
+                            data.player_data.get_mut(&finished_match.queue).unwrap();
+                        for user in
+                            finished_match.members.iter().flat_map(|team| team.iter())
+                        {
+                            user_data
+                                .entry(*user)
+                                .or_default()
+                                .game_history
+                                .push(match_number);
+                        }
+                        data.historical_match_data
+                            .lock()
+                            .unwrap()
+                            .insert(match_number, finished_match);
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 async fn handler(
     ctx: &serenity::Context,
     event: &serenity::FullEvent,
@@ -751,37 +1521,35 @@ async fn handler(
             }
         }
         serenity::FullEvent::VoiceStateUpdate { old, new } => {
+            let guild_queues = data
+                .guild_data
+                .lock()
+                .unwrap()
+                .entry(new.guild_id.unwrap().clone())
+                .or_default()
+                .queues
+                .clone();
             if let Some(VoiceState {
-                guild_id: Some(guild_id),
                 channel_id: Some(channel_id),
                 user_id,
                 ..
             }) = old
             {
-                for queue in data
-                    .guild_data
-                    .lock()
-                    .unwrap()
-                    .entry(guild_id.clone())
-                    .or_default()
-                    .queues
-                    .clone()
-                {
-                    let config = data.configuration.get(&queue).unwrap().clone();
-                    if config.queue_channels.contains(&channel_id) {
+                guild_queues
+                    .iter()
+                    .filter(|queue| {
+                        data.configuration
+                            .get(&queue)
+                            .unwrap()
+                            .queue_channels
+                            .clone()
+                            .contains(channel_id)
+                    })
+                    .for_each(|queue| {
                         player_leave_queue(data.clone(), user_id.clone(), true, &queue);
-                    }
-                }
+                    });
             }
-            let queues = data
-                .guild_data
-                .lock()
-                .unwrap()
-                .entry(new.guild_id.unwrap())
-                .or_default()
-                .queues
-                .clone();
-            for queue in queues.iter().filter(|queue| {
+            for queue in guild_queues.iter().filter(|queue| {
                 let config = data.configuration.get(&queue).unwrap();
                 new.channel_id
                     .map(|channel_id| config.queue_channels.contains(&channel_id))
@@ -822,833 +1590,48 @@ async fn handler(
         serenity::FullEvent::InteractionCreate { interaction } => {
             if let Some(message_component) = interaction.as_message_component() {
                 log_interaction(message_component);
-                let match_number = {
-                    let match_channels = data.match_channels.lock().unwrap();
-                    match_channels.get(&message_component.channel_id).cloned()
+                let Ok(message_component_data): Result<ButtonData, ron::de::SpannedError> =
+                    ron::de::from_str(message_component.data.custom_id.as_str())
+                else {
+                    eprintln!("Invalid button data: {}", message_component.data.custom_id);
+                    return Ok(());
                 };
-                if let Some(match_number) = match_number {
-                    let (required_votes, is_user_in_match, match_data) = {
-                        let match_data = data.match_data.lock().unwrap();
-                        let Some(match_data) = match_data.get(&match_number) else {
-                            return Ok(());
-                        };
-                        let config = data.configuration.get(&match_data.queue).unwrap();
-                        (
-                            config.team_count * config.team_size / 2 + 1,
-                            match_data
-                                .members
-                                .iter()
-                                .flatten()
-                                .contains(&message_component.user.id),
-                            match_data.clone(),
-                        )
-                    };
-                    let vote_type = 'vote_type: {
-                        if !is_user_in_match {
-                            message_component
-                                .create_response(
-                                    ctx,
-                                    serenity::CreateInteractionResponse::Message(
-                                        CreateInteractionResponseMessage::new()
-                                            .content(format!(
-                                                "You cannot vote in a game you're not in."
-                                            ))
-                                            .ephemeral(true),
-                                    ),
-                                )
-                                .await?;
-                            return Ok(());
-                        }
-                        if message_component
-                            .data
-                            .custom_id
-                            .eq_ignore_ascii_case("volunteer_host")
-                        {
-                            let already_hosted = 'host_button_block: {
-                                if match_data.host.is_some() {
-                                    break 'host_button_block true;
-                                }
-                                let mut match_data = data.match_data.lock().unwrap();
-                                match_data.get_mut(&match_number).unwrap().host =
-                                    Some(message_component.user.id);
-                                false
-                            };
-                            if already_hosted {
-                                message_component
-                                    .create_response(
-                                        ctx,
-                                        serenity::CreateInteractionResponse::Message(
-                                            CreateInteractionResponseMessage::new()
-                                                .content(format!(
-                                                    "There is already a host for this lobby."
-                                                ))
-                                                .ephemeral(true),
-                                        ),
-                                    )
-                                    .await?;
-                                return Ok(());
-                            }
-
-                            let current_content = format!(
-                                "{}\n## Host: {}",
-                                message_component.message.content.clone(),
-                                message_component.user.id.mention()
-                            );
-                            ctx.http
-                                .clone()
-                                .get_message(
-                                    message_component.channel_id,
-                                    message_component.message.id,
-                                )
-                                .await?
-                                .edit(
-                                    ctx,
-                                    EditMessage::new()
-                                        .components(vec![])
-                                        .content(current_content),
-                                )
-                                .await?;
-                            return Ok(());
-                        }
-                        let mut match_data = data.match_data.lock().unwrap();
-                        let match_data = match_data.get_mut(&match_number).unwrap();
-                        if let Some(map) = message_component.data.custom_id.strip_prefix("map_") {
-                            match_data
-                                .map_votes
-                                .insert(message_component.user.id, map.to_string());
-                            break 'vote_type VoteType::Map;
-                        }
-
-                        let match_result = if let Some(team_data) =
-                            message_component.data.custom_id.strip_prefix("team_")
-                        {
-                            Some(MatchResult::Team(team_data.parse()?))
-                        } else if message_component.data.custom_id.eq_ignore_ascii_case("tie") {
-                            Some(MatchResult::Tie)
-                        } else if message_component
-                            .data
-                            .custom_id
-                            .eq_ignore_ascii_case("cancel")
-                        {
-                            Some(MatchResult::Cancel)
-                        } else {
-                            None
-                        };
-                        if let Some(match_result) = match_result {
-                            match_data
-                                .result_votes
-                                .insert(message_component.user.id, match_result);
-                            break 'vote_type VoteType::Result;
-                        }
-                        VoteType::None
-                    };
-
-                    match vote_type {
-                        VoteType::Map => {
-                            let (vote_result, mut content) = {
-                                let votes = match_data
-                                    .map_votes
-                                    .iter()
-                                    .map(|(_, vote)| vote)
-                                    .counts()
-                                    .into_iter()
-                                    .sorted_by_key(|(_, count)| *count)
-                                    .rev()
-                                    .collect_vec();
-                                let content = format!(
-                                    "# Map Vote{}{}",
-                                    match_data
-                                        .map_vote_end_time
-                                        .map(|map_vote_end_time| format!(
-                                            "\nEnds <t:{}:R>",
-                                            map_vote_end_time
-                                        ))
-                                        .unwrap_or("".to_string()),
-                                    votes
-                                        .iter()
-                                        .map(|(vote_type, count)| format!(
-                                            "\n{}: {}",
-                                            vote_type, count
-                                        ))
-                                        .join("")
-                                );
-                                (
-                                    votes
-                                        .into_iter()
-                                        .next()
-                                        .filter(|(_, count)| *count >= required_votes as usize)
-                                        .map(|(vote_type, _)| vote_type.clone()),
-                                    content,
-                                )
-                            };
-                            if let Some(vote_result) = vote_result {
-                                ctx.http
-                                    .clone()
-                                    .get_message(
-                                        message_component.channel_id,
-                                        message_component.message.id,
-                                    )
-                                    .await?
-                                    .edit(ctx.http.clone(), EditMessage::new().components(vec![]))
-                                    .await?;
-                                content = format!("# Map: {}", vote_result);
-                            }
-                            ctx.http
-                                .clone()
-                                .get_message(
-                                    message_component.channel_id,
-                                    message_component.message.id,
-                                )
-                                .await?
-                                .edit(ctx.http.clone(), EditMessage::new().content(content))
-                                .await?;
-                        }
-                        VoteType::Result => {
-                            if match_data.resolved {
-                                return Ok(());
-                            }
-                            let (vote_result, content) = {
-                                let votes = match_data
-                                    .result_votes
-                                    .iter()
-                                    .map(|(_, vote)| vote)
-                                    .counts()
-                                    .into_iter()
-                                    .sorted_by_key(|(_, count)| *count)
-                                    .rev()
-                                    .collect_vec();
-                                let content = votes
-                                    .iter()
-                                    .map(|(vote_type, count)| format!("{}: {}\n", vote_type, count))
-                                    .join("");
-                                (
-                                    votes
-                                        .into_iter()
-                                        .next()
-                                        .filter(|(_, count)| *count >= required_votes as usize)
-                                        .map(|(vote_type, _)| vote_type.clone()),
-                                    content,
-                                )
-                            };
-                            let Some(vote_result) = vote_result else {
-                                ctx.http
-                                    .clone()
-                                    .get_message(
-                                        message_component.channel_id,
-                                        message_component.message.id,
-                                    )
-                                    .await?
-                                    .edit(ctx.http.clone(), EditMessage::new().content(content))
-                                    .await?;
-                                return Ok(());
-                            };
-                            let post_match_channel = data
-                                .configuration
-                                .get(&match_data.queue)
-                                .unwrap()
-                                .post_match_channel
-                                .clone();
-                            let (channels, players) = {
-                                let mut match_data = data.match_data.lock().unwrap();
-                                let match_data = match_data.get_mut(&match_number).unwrap();
-                                match_data.resolved = true;
-                                log_match_results(data.clone(), &vote_result, &match_data);
-                                (match_data.channels.clone(), match_data.members.clone())
-                            };
-
-                            apply_match_results(
-                                data.clone(),
-                                vote_result.clone(),
-                                &players,
-                                match_data.queue,
-                            );
-
-                            let guild_id = message_component.guild_id.unwrap();
-                            for player in players.iter().flat_map(|t| t) {
-                                data.global_player_data
-                                    .lock()
-                                    .unwrap()
-                                    .get_mut(player)
-                                    .unwrap()
-                                    .queue_state = QueueState::None;
-                            }
-                            data.message_edit_notify
-                                .get_mut(&match_data.queue)
-                                .unwrap()
-                                .notify_one();
-                            if let Some(post_match_channel) = post_match_channel {
-                                future::join_all(
-                                    players
-                                        .iter()
-                                        .flat_map(|t| t)
-                                        .filter(|player| {
-                                            if let Some(Some(current_vc)) = guild_id
-                                                .to_guild_cached(&ctx.cache)
-                                                .unwrap()
-                                                .voice_states
-                                                .get(player)
-                                                .map(|p| p.channel_id)
-                                            {
-                                                channels.contains(&current_vc)
-                                            } else {
-                                                false
-                                            }
-                                        })
-                                        .map(|player| async {
-                                            ctx.http
-                                                .get_member(guild_id, *player)
-                                                .await?
-                                                .edit(
-                                                    ctx.http.clone(),
-                                                    EditMember::new()
-                                                        .voice_channel(post_match_channel),
-                                                )
-                                                .await?;
-                                            Ok::<(), Error>(())
-                                        }),
-                                )
-                                .await
-                                .into_iter()
-                                .collect::<Result<(), _>>()
-                                .ok();
-                            }
-                            {
-                                let mut match_channels = data.match_channels.lock().unwrap();
-                                for channel in channels.iter() {
-                                    match_channels.remove(&channel);
-                                }
-                            }
-                            future::join_all(
-                                channels
-                                    .iter()
-                                    .map(|channel| ctx.http.delete_channel(*channel, None)),
-                            )
-                            .await;
-                            {
-                                let mut match_data = data.match_data.lock().unwrap();
-                                let finished_match = match_data.remove(&match_number);
-                                if let Some(mut finished_match) = finished_match {
-                                    finished_match.match_end_time =
-                                        Some(std::time::UNIX_EPOCH.elapsed().unwrap().as_secs());
-                                    let mut user_data =
-                                        data.player_data.get_mut(&finished_match.queue).unwrap();
-                                    for user in
-                                        finished_match.members.iter().flat_map(|team| team.iter())
-                                    {
-                                        user_data
-                                            .entry(*user)
-                                            .or_default()
-                                            .game_history
-                                            .push(match_number);
-                                    }
-                                    data.historical_match_data
-                                        .lock()
-                                        .unwrap()
-                                        .insert(match_number, finished_match);
-                                }
-                            }
-                        }
-                        VoteType::None => {}
-                    }
-                }
-                if let Some(party_id) = message_component.data.custom_id.strip_prefix("join_party_")
-                {
-                    if let Err(e) = {
-                        let mut player_data = data.global_player_data.lock().unwrap();
-                        let player_data = player_data
-                            .entry(message_component.user.id)
-                            .or_insert(GlobalPlayerData::default());
-                        match player_data.queue_state {
-                            QueueState::None => Ok(()),
-                            QueueState::Queued => Err("Cannot join party while queued!"),
-                            QueueState::InGame => Err("Cannot join party while in game!"),
-                        }
-                    } {
-                        message_component
-                            .create_response(
-                                ctx,
-                                serenity::CreateInteractionResponse::Message(
-                                    CreateInteractionResponseMessage::new()
-                                        .content(format!("{}", e)),
-                                ),
-                            )
-                            .await?;
-                        return Ok(());
-                    }
-                    let party_uuid = serde_json::from_str::<GroupUuid>(party_id).unwrap();
-                    let group_members = 'group_members: {
-                        let mut group_data = data.group_data.lock().unwrap();
-                        let party = group_data.get_mut(&party_uuid);
-                        let Some(party) = party else {
-                            break 'group_members Err("Party no longer exists.");
-                        };
-                        if !party.pending_invites.remove(&message_component.user.id) {
-                            break 'group_members Err("Party invite no longer valid.");
-                        }
-                        party.players.insert(message_component.user.id);
-                        Ok(party.players.clone())
-                    };
-                    let group_members = match group_members {
-                        Ok(group_members) => group_members,
-                        Err(e) => {
-                            message_component
-                                .create_response(
-                                    ctx,
-                                    serenity::CreateInteractionResponse::Message(
-                                        CreateInteractionResponseMessage::new()
-                                            .content(format!("{}", e)),
-                                    ),
-                                )
-                                .await?;
-                            return Ok(());
-                        }
-                    };
-                    let old_party = {
-                        let mut player_data = data.global_player_data.lock().unwrap();
-                        let player_data = player_data
-                            .entry(message_component.user.id)
-                            .or_insert(GlobalPlayerData::default());
-                        let old_party = player_data.party;
-                        player_data.party = Some(party_uuid);
-                        old_party
-                    };
-                    if let Some(old_party) = old_party {
-                        if old_party != party_uuid {
-                            leave_party(
-                                data,
-                                &message_component.user.id,
-                                Arc::new(ctx.http()),
-                                old_party,
-                            )
-                            .await?;
-                        }
-                    }
-
-                    for group_member in group_members {
-                        if group_member == message_component.user.id {
-                            continue;
-                        }
-                        group_member
-                            .direct_message(
-                                ctx,
-                                CreateMessage::new().content(format!(
-                                    "{} joined your party!",
-                                    message_component.user.id.mention()
-                                )),
-                            )
-                            .await?;
-                    }
-                    message_component.message.delete(ctx).await?;
-                    message_component
-                        .create_response(
-                            ctx,
-                            serenity::CreateInteractionResponse::Message(
-                                CreateInteractionResponseMessage::new()
-                                    .content(format!("Joined party!"))
-                                    .ephemeral(true),
-                            ),
-                        )
-                        .await?;
-                    return Ok(());
-                }
-                if let Some(party_id) = message_component
-                    .data
-                    .custom_id
-                    .strip_prefix("reject_party_")
-                {
-                    let group_members = {
-                        let mut group_data = data.group_data.lock().unwrap();
-                        let party = group_data
-                            .get_mut(&serde_json::from_str::<GroupUuid>(party_id).unwrap());
-                        if let Some(party) = party {
-                            party.pending_invites.remove(&message_component.user.id);
-                            Some(party.players.clone())
-                        } else {
-                            None
-                        }
-                    };
-                    let Some(group_members) = group_members else {
-                        message_component
-                            .create_response(
-                                ctx,
-                                serenity::CreateInteractionResponse::Message(
-                                    CreateInteractionResponseMessage::new()
-                                        .content(format!("Party no longer exists.")),
-                                ),
-                            )
-                            .await?;
-                        return Ok(());
-                    };
-                    for group_member in group_members {
-                        if group_member == message_component.user.id {
-                            continue;
-                        }
-                        group_member
-                            .direct_message(
-                                ctx,
-                                CreateMessage::new().content(format!(
-                                    "{} rejected your party invite",
-                                    message_component.user.id.mention()
-                                )),
-                            )
-                            .await?;
-                    }
-                    message_component.message.delete(ctx).await?;
-                    message_component
-                        .create_response(
-                            ctx,
-                            serenity::CreateInteractionResponse::Message(
-                                CreateInteractionResponseMessage::new()
-                                    .content(format!("Rejected party invite."))
-                                    .ephemeral(true),
-                            ),
-                        )
-                        .await?;
-                    return Ok(());
-                }
-                if let Some(non_leaver_id) = message_component
-                    .data
-                    .custom_id
-                    .strip_prefix("leaver_check_")
-                {
-                    let player = UserId::new(non_leaver_id.parse::<u64>().unwrap());
-                    if message_component.user.id != player {
-                        message_component
-                            .create_response(
-                                ctx,
-                                serenity::CreateInteractionResponse::Message(
-                                    CreateInteractionResponseMessage::new()
-                                        .content(format!("You aren't the right player silly :P"))
-                                        .ephemeral(true),
-                                ),
-                            )
-                            .await?;
-                        return Ok(());
-                    }
-                    let (del_future, resp_future) = future::join(
-                        message_component.message.delete(ctx),
-                        message_component.create_response(
-                            ctx,
-                            serenity::CreateInteractionResponse::Message(
-                                CreateInteractionResponseMessage::new()
-                                    .content(format!("You are no longer marked as a leaver."))
-                                    .ephemeral(true),
-                            ),
-                        ),
-                    )
-                    .await;
-                    del_future?;
-                    resp_future?;
-                    return Ok(());
-                }
-                if message_component.data.custom_id == "queue_check" {
-                    message_component.message.delete(ctx).await?;
-                    message_component
-                        .create_response(
-                            ctx,
-                            serenity::CreateInteractionResponse::Message(
-                                CreateInteractionResponseMessage::new()
-                                    .content(format!("You will stay in queue."))
-                                    .ephemeral(true),
-                            ),
-                        )
-                        .await?;
-                    return Ok(());
-                }
-                if message_component.data.custom_id == "queue" {
-                    let Some(queue) = get_queue(data.clone(), message_component) else {
-                        message_component
-                            .create_response(
-                                ctx.http(),
-                                CreateInteractionResponse::Message(
-                                    CreateInteractionResponseMessage::new()
-                                        .content("Could not find queue to join!")
-                                        .ephemeral(true),
-                                ),
-                            )
-                            .await?;
-                        return Ok(());
-                    };
-                    message_component.defer_ephemeral(ctx.http()).await?;
-                    match try_queue_player(
-                        data.clone(),
-                        &queue,
-                        message_component.user.id,
-                        ctx.http.clone(),
-                        message_component.guild_id.unwrap(),
-                        true,
-                        false,
-                    )
-                    .await
-                    {
-                        Ok(()) => {
-                            message_component
-                                .edit_response(
-                                    ctx.http(),
-                                    EditInteractionResponse::new().content("Joined queue!"),
-                                )
-                                .await?;
-                            data.message_edit_notify
-                                .get_mut(&queue)
-                                .unwrap()
-                                .notify_one();
-                            matchmake(
-                                data.clone(),
-                                ctx.http.clone(),
-                                message_component.guild_id.unwrap(),
-                                &queue,
-                            )
-                            .await?;
-                        }
-                        Err(reason) => {
-                            message_component
-                                .edit_response(
-                                    ctx.http(),
-                                    EditInteractionResponse::new().content(reason),
-                                )
-                                .await?;
-                        }
-                    }
-                    return Ok(());
-                }
-                if let Some(register_mmr) =
-                    message_component.data.custom_id.strip_prefix("register_")
-                {
-                    let Some(queue) = get_queue(data.clone(), message_component) else {
-                        message_component
-                            .create_response(
-                                ctx.http(),
-                                CreateInteractionResponse::Message(
-                                    CreateInteractionResponseMessage::new()
-                                        .content("Could not find queue to register for!")
-                                        .ephemeral(true),
-                                ),
-                            )
-                            .await?;
-                        return Ok(());
-                    };
-                    message_component.defer_ephemeral(ctx.http()).await?;
-                    if let Some(role) = data.configuration.get(&queue).unwrap().register_role {
-                        message_component
-                            .member
-                            .as_ref()
-                            .unwrap()
-                            .add_role(ctx.http(), role)
-                            .await?;
-                    }
-                    let default_uncertainty = data
-                        .configuration
-                        .get(&queue)
-                        .unwrap()
-                        .default_player_data
-                        .rating
-                        .uncertainty;
-                    data.player_data
-                        .get_mut(&queue)
-                        .unwrap()
-                        .entry(message_component.user.id)
-                        .or_default()
-                        .rating = Some(WengLinRating {
-                        rating: register_mmr.parse::<f64>().unwrap(),
-                        uncertainty: default_uncertainty,
-                    });
-                    message_component
-                        .edit_response(
-                            ctx.http(),
-                            EditInteractionResponse::new().content("Registered!"),
-                        )
-                        .await?;
-                    return Ok(());
-                }
-                if message_component.data.custom_id == "leave_queue" {
-                    let Some(queue) = get_queue(data.clone(), message_component) else {
-                        message_component
-                            .create_response(
-                                ctx.http(),
-                                CreateInteractionResponse::Message(
-                                    CreateInteractionResponseMessage::new()
-                                        .content("Could not find queue to join!")
-                                        .ephemeral(true),
-                                ),
-                            )
-                            .await?;
-                        return Ok(());
-                    };
-                    let response =
-                        player_leave_queue(data.clone(), message_component.user.id, true, &queue);
-                    message_component
-                        .create_response(
-                            ctx.http(),
-                            CreateInteractionResponse::Message(
-                                CreateInteractionResponseMessage::new()
-                                    .content(response)
-                                    .ephemeral(true),
-                            ),
-                        )
-                        .await?;
-                    return Ok(());
-                }
-                if let Some(queue_id) = message_component
-                    .data
-                    .custom_id
-                    .strip_prefix("afk_leave_queue_")
-                {
-                    let queue_uuid = serde_json::from_str::<QueueUuid>(queue_id)?;
-                    let response = player_leave_queue(
-                        data.clone(),
-                        message_component.user.id,
-                        true,
-                        &queue_uuid,
-                    );
-                    message_component
-                        .create_response(
-                            ctx.http(),
-                            CreateInteractionResponse::Message(
-                                CreateInteractionResponseMessage::new()
-                                    .content(response)
-                                    .ephemeral(true),
-                            ),
-                        )
-                        .await?;
-                    message_component.message.delete(ctx.http()).await?;
-                    return Ok(());
-                }
-                if message_component.data.custom_id == "status" {
-                    let Some(queue) = get_queue(data.clone(), message_component) else {
-                        message_component
-                            .create_response(
-                                ctx.http(),
-                                CreateInteractionResponse::Message(
-                                    CreateInteractionResponseMessage::new()
-                                        .content("Could not find queue to join!")
-                                        .ephemeral(true),
-                                ),
-                            )
-                            .await?;
-                        return Ok(());
-                    };
-                    let was_in_queue = {
-                        let queued_players = data.queued_players.get(&queue).unwrap();
-                        queued_players.contains(&message_component.user.id)
-                    };
-                    let (player_state, q_entry_time) = {
-                        let mut global_data = data.global_player_data.lock().unwrap();
-                        let player_data = global_data.entry(message_component.user.id).or_default();
-                        (
-                            player_data.queue_state.clone(),
-                            player_data.queue_enter_time.clone(),
-                        )
-                    };
-                    if was_in_queue {
-                        message_component
-                            .create_response(
-                                ctx.http(),
-                                CreateInteractionResponse::Message(
-                                    CreateInteractionResponseMessage::new()
-                                        .content(format!(
-                                            "You'e been in queue since <t:{}:R>.",
-                                            q_entry_time.unwrap().timestamp()
-                                        ))
-                                        .ephemeral(true),
-                                ),
-                            )
-                            .await?;
-                    } else {
-                        let response = match player_state {
-                            QueueState::None => "You are not in queue",
-                            QueueState::Queued => "You are queued in a different queue.",
-                            QueueState::InGame => "You are in a game.",
-                        };
-                        message_component
-                            .create_response(
-                                ctx.http(),
-                                CreateInteractionResponse::Message(
-                                    CreateInteractionResponseMessage::new()
-                                        .content(response)
-                                        .ephemeral(true),
-                                ),
-                            )
-                            .await?;
-                    }
-                    return Ok(());
-                }
-                if message_component.data.custom_id == "role_select" {
-                    let Some(queue) = get_queue(data.clone(), message_component) else {
-                        message_component
-                            .create_response(
-                                ctx.http(),
-                                CreateInteractionResponse::Message(
-                                    CreateInteractionResponseMessage::new()
-                                        .content("Could not find queue!")
-                                        .ephemeral(true),
-                                ),
-                            )
-                            .await?;
-                        return Ok(());
-                    };
-                    let ComponentInteractionDataKind::StringSelect { values } =
-                        message_component.data.kind.clone()
-                    else {
-                        return Err("Invalid type for role select repsonse".into());
-                    };
-                    {
-                        let mut players_data = data.player_data.get_mut(&queue).unwrap();
-                        let player_data =
-                            players_data.entry(message_component.user.id).or_default();
-                        player_data.player_queueing_config.active_roles = Some(values);
-                    }
-                    message_component
-                        .create_response(
-                            ctx.http(),
-                            CreateInteractionResponse::Message(
-                                CreateInteractionResponseMessage::new()
-                                    .content("Roles configured!")
-                                    .ephemeral(true),
-                            ),
-                        )
-                        .await?;
-                    return Ok(());
-                }
+                return message_component_data.handle_interaction(message_component, data, ctx).await
             }
         }
         serenity::FullEvent::Message { new_message } => {
-            let Some(guild_id) = new_message.guild_id else {
-                return Ok(());
-            };
-            for queue in data
-                .guild_data
+            let Some(match_id) = data
+                .match_channels
                 .lock()
                 .unwrap()
-                .entry(guild_id)
-                .or_default()
-                .queues
-                .iter()
-            {
-                if data.configuration.get(queue).unwrap().log_chats {
-                    let Some(match_id) = data
-                        .match_channels
-                        .lock()
-                        .unwrap()
-                        .get(&new_message.channel_id)
-                        .cloned()
-                    else {
-                        continue;
-                    };
-                    fs::create_dir_all("match_logs")?;
-                    let mut file = OpenOptions::new()
-                        .append(true)
-                        .create(true)
-                        .open(format!("match_logs/match-{}.log", match_id))
-                        .unwrap();
-                    if let Err(e) = writeln!(
-                        file,
-                        "{}:{}",
-                        new_message.author.mention(),
-                        new_message.content.clone(),
-                    ) {
-                        eprintln!("Couldn't write to file: {}", e);
-                    }
-                }
+                .get(&new_message.channel_id)
+                .cloned()
+            else {
+                return Ok(());
+            };
+            let queue_id = data
+                .match_data
+                .lock()
+                .unwrap()
+                .get(&match_id)
+                .unwrap()
+                .queue;
+            if !data.configuration.get(&queue_id).unwrap().log_chats {
+                return Ok(());
+            }
+            fs::create_dir_all("match_logs")?;
+            let mut file = OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(format!("match_logs/match-{}.log", match_id))
+                .unwrap();
+            if let Err(e) = writeln!(
+                file,
+                "{}:{}",
+                new_message.author.mention(),
+                new_message.content.clone(),
+            ) {
+                eprintln!("Couldn't write to file: {}", e);
             }
         }
         serenity::FullEvent::Ratelimit { .. } => {
@@ -1991,7 +1974,6 @@ async fn try_matchmaking(
                     .unwrap()
                     .remove(player);
                 let global_data = global_data.get_mut(player).unwrap();
-                global_data.queue_enter_time = None;
                 global_data.queue_state = QueueState::InGame;
             }
         }
@@ -2152,11 +2134,7 @@ async fn try_matchmaking(
                 )
                 .content(members_message);
             if host.is_none() {
-                message = message.button(
-                    CreateButton::new("volunteer_host")
-                        .label("Volunteer to host")
-                        .style(serenity::ButtonStyle::Primary),
-                );
+                message = message.button(ButtonData::VolunteerHost.get_button());
             }
             let members_message_id = match_channel
                 .send_message(cache_http_copy.clone(), message)
@@ -2196,11 +2174,8 @@ async fn try_matchmaking(
                     .cloned()
                     .collect_vec();
                 for rand_map in vote_maps.iter() {
-                    map_vote_message = map_vote_message.button(
-                        CreateButton::new(format!("map_{}", rand_map).clone())
-                            .label(rand_map)
-                            .style(serenity::ButtonStyle::Secondary),
-                    );
+                    map_vote_message =
+                        map_vote_message.button(ButtonData::MapVote(rand_map.clone()).get_button());
                 }
                 let mut map_message = match_channel
                     .send_message(cache_http_copy.clone(), map_vote_message)
@@ -2249,26 +2224,15 @@ async fn try_matchmaking(
             }
             let mut result_message = CreateMessage::default();
             for i in 0..team_count {
-                result_message = result_message.button(
-                    CreateButton::new(format!("team_{}", i))
-                        .label(format!("Team {}", i + 1))
-                        .style(serenity::ButtonStyle::Primary),
-                )
+                result_message =
+                    result_message.button(ButtonData::ResultVote(MatchResult::Team(i)).get_button())
             }
             match_channel
                 .send_message(
                     cache_http_copy.clone(),
                     result_message
-                        .button(
-                            CreateButton::new("tie")
-                                .label("Tie")
-                                .style(serenity::ButtonStyle::Secondary),
-                        )
-                        .button(
-                            CreateButton::new("cancel")
-                                .label("Cancel")
-                                .style(serenity::ButtonStyle::Danger),
-                        ),
+                        .button(ButtonData::ResultVote(MatchResult::Tie).get_button())
+                        .button(ButtonData::ResultVote(MatchResult::Cancel).get_button()),
                 )
                 .await?;
             {
@@ -2618,10 +2582,10 @@ fn evaluate_cost(
                 let queue_config = player
                     .player_queueing_config
                     .derive(&default_player_data.player_queueing_config);
-                let time_in_queue = global_player
-                    .queue_enter_time
-                    .map(|queue_time| (now - queue_time).num_seconds())
-                    .unwrap_or(0);
+                let time_in_queue = match global_player.queue_state {
+                    QueueState::None | QueueState::InGame => 0,
+                    QueueState::Queued(_, queue_time) => (now - queue_time).num_seconds(),
+                };
                 (mmr_differential - queue_config.acceptable_mmr_differential).max(0.0)
                     * queue_config.cost_per_avg_mmr_differential
                     + (mmr_std_differential - queue_config.acceptable_mmr_std_differential).max(0.0)
@@ -2940,7 +2904,6 @@ fn player_leave_queue(
             let global_player_data = player_data
                 .entry(user.clone())
                 .or_insert(GlobalPlayerData::default());
-            global_player_data.queue_enter_time = None;
             global_player_data.queue_state = QueueState::None;
         }
         data.message_edit_notify
@@ -3177,11 +3140,9 @@ async fn mark_leaver(
     );
     let leaver_message = CreateReply::default()
         .content(leaver_message_content)
-        .components(vec![CreateActionRow::Buttons(vec![CreateButton::new(
-            format!("leaver_check_{}", player.get()).clone(),
-        )
-        .label("No, I'm here.")
-        .style(serenity::ButtonStyle::Primary)])]);
+        .components(vec![CreateActionRow::Buttons(vec![
+            ButtonData::LeaverCheck(player).get_button(),
+        ])]);
     let leaver_message = ctx.send(leaver_message).await?.message().await?.id;
     {
         let data = ctx.data().clone();

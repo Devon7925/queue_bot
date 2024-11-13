@@ -2,13 +2,13 @@ use std::{collections::HashSet, sync::Arc};
 
 use itertools::Itertools;
 use poise::{
-    serenity_prelude::{
-        self as serenity, CacheHttp, CreateButton, CreateMessage, Mentionable, UserId,
-    },
+    serenity_prelude::{CacheHttp, CreateMessage, Mentionable, UserId},
     CreateReply,
 };
 
-use crate::{Context, Data, Error, GlobalPlayerData, GroupUuid, QueueGroup, QueueState};
+use crate::{
+    ButtonData, Context, Data, Error, GlobalPlayerData, GroupUuid, QueueGroup, QueueState,
+};
 
 /// Invites player to party
 #[poise::command(slash_command, prefix_command, rename = "invite")]
@@ -25,26 +25,18 @@ async fn party_invite(
         .or_default()
         .queue_state
         .clone();
-    match queue_state {
-        QueueState::Queued => {
-            ctx.send(
-                CreateReply::default()
-                    .content(format!("Cannot invite players to party while in queue"))
-                    .ephemeral(true),
-            )
-            .await?;
-            return Ok(());
-        }
-        QueueState::InGame => {
-            ctx.send(
-                CreateReply::default()
-                    .content(format!("Cannot invite players to party while in game"))
-                    .ephemeral(true),
-            )
-            .await?;
-            return Ok(());
-        }
-        QueueState::None => {}
+    if let Some(failure_message) = match queue_state {
+        QueueState::Queued(..) => Some(format!("Cannot invite players to party while in queue")),
+        QueueState::InGame => Some(format!("Cannot invite players to party while in game")),
+        QueueState::None => None,
+    } {
+        ctx.send(
+            CreateReply::default()
+                .content(failure_message)
+                .ephemeral(true),
+        )
+        .await?;
+        return Ok(());
     }
 
     let party = {
@@ -77,22 +69,8 @@ async fn party_invite(
                         .map(|p| format!("{}", p.mention()))
                         .join(", ")
                 ))
-                .button(
-                    CreateButton::new(format!(
-                        "join_party_{}",
-                        serde_json::to_string(&party).unwrap()
-                    ))
-                    .label("Join party")
-                    .style(serenity::ButtonStyle::Success),
-                )
-                .button(
-                    CreateButton::new(format!(
-                        "reject_party_{}",
-                        serde_json::to_string(&party).unwrap()
-                    ))
-                    .label("Reject invite")
-                    .style(serenity::ButtonStyle::Danger),
-                ),
+                .button(ButtonData::JoinParty(party).get_button())
+                .button(ButtonData::RejectParty(party).get_button()),
         )
         .await
     else {
