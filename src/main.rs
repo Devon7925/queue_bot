@@ -761,7 +761,12 @@ impl ButtonData {
         }
     }
 
-    async fn handle_interaction(self, message_component: &ComponentInteraction, data: Arc<Data>, ctx: &serenity::Context) -> Result<(), Error> {
+    async fn handle_interaction(
+        self,
+        message_component: &ComponentInteraction,
+        data: Arc<Data>,
+        ctx: &serenity::Context,
+    ) -> Result<(), Error> {
         match self {
             ButtonData::JoinParty(party_uuid) => {
                 if let Err(e) = {
@@ -779,8 +784,7 @@ impl ButtonData {
                         .create_response(
                             ctx,
                             serenity::CreateInteractionResponse::Message(
-                                CreateInteractionResponseMessage::new()
-                                    .content(format!("{}", e)),
+                                CreateInteractionResponseMessage::new().content(format!("{}", e)),
                             ),
                         )
                         .await?;
@@ -918,9 +922,7 @@ impl ButtonData {
                             ctx,
                             serenity::CreateInteractionResponse::Message(
                                 CreateInteractionResponseMessage::new()
-                                    .content(format!(
-                                        "You aren't the right player silly :P"
-                                    ))
+                                    .content(format!("You aren't the right player silly :P"))
                                     .ephemeral(true),
                             ),
                         )
@@ -1027,15 +1029,6 @@ impl ButtonData {
                         .await?;
                     return Ok(());
                 };
-                message_component.defer_ephemeral(ctx.http()).await?;
-                if let Some(role) = data.configuration.get(&queue).unwrap().register_role {
-                    message_component
-                        .member
-                        .as_ref()
-                        .unwrap()
-                        .add_role(ctx.http(), role)
-                        .await?;
-                }
                 let default_uncertainty = data
                     .configuration
                     .get(&queue)
@@ -1052,12 +1045,24 @@ impl ButtonData {
                     rating: register_mmr,
                     uncertainty: default_uncertainty,
                 });
-                message_component
-                    .edit_response(
-                        ctx.http(),
-                        EditInteractionResponse::new().content("Registered!"),
-                    )
-                    .await?;
+                message_component.create_response(ctx.http(), CreateInteractionResponse::Message(CreateInteractionResponseMessage::new().content("Registered!"))).await?;
+                if let Some(role) = data.configuration.get(&queue).unwrap().register_role {
+                    if let Err(_) = message_component
+                        .member
+                        .as_ref()
+                        .unwrap()
+                        .add_role(ctx.http(), role)
+                        .await
+                    {
+                        eprintln!("Could not add register role to user");
+                        message_component
+                            .edit_response(
+                                ctx.http(),
+                                EditInteractionResponse::new().content("Could not add register role!"),
+                            )
+                            .await?;
+                    }
+                }
                 Ok(())
             }
             ButtonData::LeaveQueue => {
@@ -1074,12 +1079,8 @@ impl ButtonData {
                         .await?;
                     return Ok(());
                 };
-                let response = player_leave_queue(
-                    data.clone(),
-                    message_component.user.id,
-                    true,
-                    &queue,
-                );
+                let response =
+                    player_leave_queue(data.clone(), message_component.user.id, true, &queue);
                 message_component
                     .create_response(
                         ctx.http(),
@@ -1093,12 +1094,8 @@ impl ButtonData {
                 Ok(())
             }
             ButtonData::AfkLeaveQueue(queue_uuid) => {
-                let response = player_leave_queue(
-                    data.clone(),
-                    message_component.user.id,
-                    true,
-                    &queue_uuid,
-                );
+                let response =
+                    player_leave_queue(data.clone(), message_component.user.id, true, &queue_uuid);
                 message_component
                     .create_response(
                         ctx.http(),
@@ -1128,8 +1125,7 @@ impl ButtonData {
                 };
                 let player_state = {
                     let mut global_data = data.global_player_data.lock().unwrap();
-                    let player_data =
-                        global_data.entry(message_component.user.id).or_default();
+                    let player_data = global_data.entry(message_component.user.id).or_default();
                     player_data.queue_state.clone()
                 };
                 let response = match player_state {
@@ -1138,9 +1134,7 @@ impl ButtonData {
                         "You'e been in queue since <t:{}:R>.",
                         q_entry_time.timestamp()
                     ),
-                    QueueState::Queued(..) => {
-                        "You are queued in a different queue.".to_string()
-                    }
+                    QueueState::Queued(..) => "You are queued in a different queue.".to_string(),
                     QueueState::InGame => "You are in a game.".to_string(),
                 };
                 message_component
@@ -1176,8 +1170,7 @@ impl ButtonData {
                 };
                 {
                     let mut players_data = data.player_data.get_mut(&queue).unwrap();
-                    let player_data =
-                        players_data.entry(message_component.user.id).or_default();
+                    let player_data = players_data.entry(message_component.user.id).or_default();
                     player_data.player_queueing_config.active_roles = Some(values);
                 }
                 message_component
@@ -1222,9 +1215,7 @@ impl ButtonData {
                             ctx,
                             serenity::CreateInteractionResponse::Message(
                                 CreateInteractionResponseMessage::new()
-                                    .content(format!(
-                                        "There is already a host for this lobby."
-                                    ))
+                                    .content(format!("There is already a host for this lobby."))
                                     .ephemeral(true),
                             ),
                         )
@@ -1285,10 +1276,7 @@ impl ButtonData {
                         "# Map Vote{}{}",
                         match_data
                             .map_vote_end_time
-                            .map(|map_vote_end_time| format!(
-                                "\nEnds <t:{}:R>",
-                                map_vote_end_time
-                            ))
+                            .map(|map_vote_end_time| format!("\nEnds <t:{}:R>", map_vote_end_time))
                             .unwrap_or("".to_string()),
                         votes
                             .iter()
@@ -1307,10 +1295,7 @@ impl ButtonData {
                 if let Some(vote_result) = vote_result {
                     ctx.http
                         .clone()
-                        .get_message(
-                            message_component.channel_id,
-                            message_component.message.id,
-                        )
+                        .get_message(message_component.channel_id, message_component.message.id)
                         .await?
                         .edit(ctx.http.clone(), EditMessage::new().components(vec![]))
                         .await?;
@@ -1372,10 +1357,7 @@ impl ButtonData {
                 let Some(vote_result) = vote_result else {
                     ctx.http
                         .clone()
-                        .get_message(
-                            message_component.channel_id,
-                            message_component.message.id,
-                        )
+                        .get_message(message_component.channel_id, message_component.message.id)
                         .await?
                         .edit(ctx.http.clone(), EditMessage::new().content(content))
                         .await?;
@@ -1471,9 +1453,7 @@ impl ButtonData {
                             Some(std::time::UNIX_EPOCH.elapsed().unwrap().as_secs());
                         let mut user_data =
                             data.player_data.get_mut(&finished_match.queue).unwrap();
-                        for user in
-                            finished_match.members.iter().flat_map(|team| team.iter())
-                        {
+                        for user in finished_match.members.iter().flat_map(|team| team.iter()) {
                             user_data
                                 .entry(*user)
                                 .or_default()
@@ -1596,7 +1576,9 @@ async fn handler(
                     eprintln!("Invalid button data: {}", message_component.data.custom_id);
                     return Ok(());
                 };
-                return message_component_data.handle_interaction(message_component, data, ctx).await
+                return message_component_data
+                    .handle_interaction(message_component, data, ctx)
+                    .await;
             }
         }
         serenity::FullEvent::Message { new_message } => {
